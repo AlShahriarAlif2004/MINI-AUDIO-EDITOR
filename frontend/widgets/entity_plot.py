@@ -3,6 +3,9 @@ from PySide6.QtCore import Signal
 from PySide6.QtWidgets import QWidget, QVBoxLayout, QLabel, QScrollArea
 
 from backend.workspace_model import Entity
+from backend.audio_clip import AudioClip
+from backend.discrete_signal import Discrete_Signal
+
 from frontend.widgets.waveform_player import PlaybackGroup, WaveformPlayer
 
 
@@ -23,7 +26,9 @@ class _SegmentCanvas(QWidget):
 class EntityPlotView(QWidget):
 
     entity_modified = Signal()
-    segment_selected = Signal(object, object, float, float)  # entity, channel_index, start, end
+    entity_trimmed = Signal()
+    trim_cancelled = Signal()
+    segment_selected = Signal(object, object, float, float)
     segment_deselected = Signal()
     """
     Shown when an entity tab is active: a 'Channels' section (one scrolling
@@ -39,7 +44,102 @@ class EntityPlotView(QWidget):
         self._group = PlaybackGroup.get_instance()
         self._players = []
         self._selected_player = None
+        self._trim_player = None
+        self._trim_range = None
         self._build_ui()
+
+    def _lock_selection(self, locked: bool):
+        for player in self._players:
+            player.set_segment_locked(locked)
+
+    def begin_trim(self) -> bool:
+        if self._selected_player is None or self._selected_player.channel_index is not None:
+            return False
+        segment = self._selected_player.selected_segment
+        if segment is None:
+            return False
+
+        self._trim_player = self._selected_player
+        self._trim_range = segment
+        for player in self._players:
+            player.enter_trim_preview(*segment)
+        self._lock_selection(True)
+        return True
+
+    def cancel_trim(self):
+        if self._trim_player is not None:
+            for player in self._players:
+                player.exit_trim_preview()
+        self._trim_player = None
+        self._trim_range = None
+        self._lock_selection(False)
+        self.clear_all_selection()
+
+    def apply_trim(self):
+        if self._trim_player is None or self._trim_range is None:
+            return
+        start, end = self._trim_range
+        self._perform_trim(start, end)
+        self._trim_player = None
+        self._trim_range = None
+        self._lock_selection(False)
+        self.clear_all_selection()
+        self.entity_modified.emit()
+        self.entity_trimmed.emit()
+
+    def _perform_trim(self, start, end):
+        clip = self._entity.clip
+        remove_start_idx = clip.get_index(start)
+        remove_end_idx = clip.get_index(end)
+
+        new_channels = []
+        for ch in clip.channels:
+            before = None
+            after = None
+
+            if remove_start_idx > ch.start_index:
+                before = ch.trim(ch.start_index, remove_start_idx - 1)
+            if remove_end_idx < ch.end_index():
+                after = ch.trim(remove_end_idx + 1, ch.end_index())
+
+            if before is not None and after is not None:
+                new_channels.append(before.concatenate(after))
+            elif before is not None:
+                new_channels.append(before)
+            elif after is not None:
+                new_channels.append(after)
+            else:
+                # the whole channel was inside the selection — keep a single
+                # silent sample so the clip never collapses to zero length
+                new_channels.append(Discrete_Signal(
+                    np.zeros(1, dtype=ch.samples.dtype), ch.sample_rate, ch.start_index
+                ))
+
+        self._entity.clip = AudioClip(new_channels, name=clip.name)
+
+        removed_span = end - start
+
+        def _shift_time(t):
+            if t <= start:
+                return t
+            if t >= end:
+                return t - removed_span
+            return None  # fell inside the removed span — drop it
+
+        self._entity.divisions = [
+            t for t in (_shift_time(d) for d in self._entity.divisions) if t is not None
+        ]
+        for ch_idx in list(self._entity.channel_markers.keys()):
+            self._entity.channel_markers[ch_idx] = [
+                t for t in (_shift_time(m) for m in self._entity.channel_markers[ch_idx])
+                if t is not None
+            ]
+
+    def _on_canvas_clicked(self):
+        self.clear_all_selection()
+        if self._trim_player is not None:
+            self.cancel_trim()
+            self.trim_cancelled.emit()
 
     def _build_ui(self):
         outer_layout = QVBoxLayout(self)
@@ -53,7 +153,7 @@ class EntityPlotView(QWidget):
         layout = QVBoxLayout(container)
         layout.setContentsMargins(12, 12, 12, 12)
         layout.setSpacing(16)
-        container.clicked_empty.connect(self.clear_all_selection)
+        container.clicked_empty.connect(self._on_canvas_clicked)
 
         clip = self._entity.clip
         num_channels = clip.num_channels
@@ -110,6 +210,7 @@ class EntityPlotView(QWidget):
         scroll.setWidget(container)
 
     def shutdown(self):
+        self.cancel_trim()
         for player in self._players:
             player.force_idle()
         self.clear_all_selection()

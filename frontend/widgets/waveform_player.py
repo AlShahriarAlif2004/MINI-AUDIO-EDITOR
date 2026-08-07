@@ -80,6 +80,10 @@ class _PlaybackEngine:
     def total_frames(self):
         return self._audio_data.shape[0]
 
+    @property
+    def audio_data(self):
+        return self._audio_data
+
     def start_or_resume(self):
         remaining = self._audio_data[self._played_frames:]
         if len(remaining) == 0:
@@ -334,6 +338,12 @@ class WaveformPlayer(QWidget):
         self._entered_clip_from_pause = False
         self._edit_mode = False 
         self._selected_segment = None
+        self._segment_locked = False
+
+        self._trim_mode = False
+        self._trim_engine = None
+        self._trim_start = None
+        self._trim_end = None
 
         self._timer = QTimer(self)
         self._timer.setInterval(_TICK_MS)
@@ -370,8 +380,10 @@ class WaveformPlayer(QWidget):
         self._plot.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
         self._plot.setMinimumHeight(150)
 
+        self._curve_items = []
         for samples, color, _label in self._series:
-            self._plot.plot(self._times, samples, pen=pg.mkPen(color=color, width=1))
+            curve = self._plot.plot(self._times, samples, pen=pg.mkPen(color=color, width=1))
+            self._curve_items.append(curve)
 
         self._playhead = pg.InfiniteLine(angle=90, pen=pg.mkPen(color="#ff4d4d", width=1.5))
         self._playhead.setVisible(False)
@@ -411,6 +423,13 @@ class WaveformPlayer(QWidget):
         self._selection_region.setVisible(False)
         self._plot.addItem(self._selection_region)
 
+        self._trim_playhead = pg.InfiniteLine(angle=90, movable=False,
+                                               pen=pg.mkPen(color="#ff4d4d", width=2))
+        self._trim_playhead.addMarker('^', position=0.0, size=14)
+        self._trim_playhead.addMarker('v', position=1.0, size=14)
+        self._trim_playhead.setVisible(False)
+        self._plot.addItem(self._trim_playhead)
+
         layout.addWidget(self._plot)
 
         controls = QHBoxLayout()
@@ -447,10 +466,12 @@ class WaveformPlayer(QWidget):
         playing = self._state == self.STATE_PLAYING
         paused = self._state == self.STATE_PAUSED
         self._plot.drag_enabled = playing or paused
-        self._play_btn.setVisible(not playing and not self._edit_mode)
+
+        show_playback_controls = self._trim_mode or not self._edit_mode
+        self._play_btn.setVisible(not playing and show_playback_controls)
         self._play_btn.setText("▶ Resume" if paused else "▶ Play")
-        self._pause_btn.setVisible(playing)
-        self._reset_btn.setVisible(playing or paused)
+        self._pause_btn.setVisible(playing and show_playback_controls)
+        self._reset_btn.setVisible((playing or paused) and show_playback_controls)
 
     def _add_marker_line(self, t):
         line = pg.InfiniteLine(pos=t, angle=90, pen=pg.mkPen(color="#ffffff", width=1))
@@ -460,6 +481,10 @@ class WaveformPlayer(QWidget):
     @property
     def channel_index(self):
         return self._channel_index
+
+    @property
+    def selected_segment(self):
+        return self._selected_segment
 
     def _boundary_times(self):
         return sorted({self._start_time, self._end_time,
@@ -490,7 +515,13 @@ class WaveformPlayer(QWidget):
         self.segment_deselected.emit(self)
 
     def _refresh_segment_mode(self):
-        enabled = self._edit_mode and self._state == self.STATE_STOPPED and not self._clip_mode
+        enabled = (
+            self._edit_mode
+            and self._state == self.STATE_STOPPED
+            and not self._clip_mode
+            and not self._trim_mode
+            and not self._segment_locked
+        )
         self._plot.set_segment_mode(
             enabled,
             boundaries_getter=self._boundary_times,
@@ -499,6 +530,105 @@ class WaveformPlayer(QWidget):
         )
         if not enabled:
             self._hover_region.setVisible(False)
+
+    def set_segment_locked(self, locked: bool):
+        self._segment_locked = locked
+        self._refresh_segment_mode()
+
+    def _preview_slice_indices(self, start, end):
+        start_idx = int(np.searchsorted(self._times, start, side="left"))
+        end_idx = int(np.searchsorted(self._times, end, side="right"))
+        if end_idx <= start_idx:
+            end_idx = start_idx + 1
+        return start_idx, end_idx
+
+    def enter_trim_preview(self, start, end):
+        start_idx, end_idx = self._preview_slice_indices(start, end)
+
+        self._trim_mode = True
+
+        keep_mask = np.ones(len(self._times), dtype=bool)
+        keep_mask[start_idx:end_idx] = False
+
+        dt = 1.0 / self._sample_rate
+        kept_count = int(keep_mask.sum())
+        preview_times = self._start_time + np.arange(max(kept_count, 1)) * dt
+
+        self._trim_start = self._start_time
+        self._trim_end = float(preview_times[-1])
+
+        for curve, (samples, _color, _label) in zip(self._curve_items, self._series):
+            kept_samples = samples[keep_mask]
+            if len(kept_samples) == 0:
+                kept_samples = np.zeros(1, dtype=samples.dtype)
+            curve.setData(preview_times, kept_samples)
+
+        removed_span = end - start
+
+        def _shift(t):
+            if t <= start:
+                return t
+            if t >= end:
+                return t - removed_span
+            return None  # was inside the removed span
+
+        self._start_boundary.setPos(self._trim_start)
+        self._start_boundary.setVisible(True)
+        self._end_boundary.setPos(self._trim_end)
+        self._end_boundary.setVisible(True)
+
+        for line, original_t in zip(self._marker_lines, self._entity.markers_for(self._channel_index)):
+            shifted = _shift(original_t)
+            if shifted is None:
+                line.setVisible(False)
+            else:
+                line.setPos(shifted)
+                line.setVisible(True)
+
+        self._hover_region.setVisible(False)
+        self._selection_region.setVisible(False)
+
+        preview_audio = self._engine.audio_data[keep_mask]
+        if len(preview_audio) == 0:
+            preview_audio = np.zeros(
+                (1,) + self._engine.audio_data.shape[1:], dtype=self._engine.audio_data.dtype
+            )
+        self._trim_engine = _PlaybackEngine(preview_audio, self._sample_rate)
+
+        self._trim_playhead.setPos(self._trim_start)
+        self._trim_playhead.setVisible(False)
+        self._plot.setXRange(self._trim_start, max(self._trim_end, self._trim_start + 0.001), padding=0.02)
+
+        self._refresh_segment_mode()
+        self._update_button_visibility()
+
+    def exit_trim_preview(self):
+        if not self._trim_mode:
+            return
+        if self._state != self.STATE_STOPPED:
+            self._do_reset()
+
+        self._trim_mode = False
+        self._trim_engine = None
+        self._trim_start = None
+        self._trim_end = None
+        self._trim_playhead.setVisible(False)
+
+        for curve, (samples, _color, _label) in zip(self._curve_items, self._series):
+            curve.setData(self._times, samples)
+
+        self._start_boundary.setPos(self._start_time)
+        self._start_boundary.setVisible(True)
+        self._end_boundary.setPos(self._end_time)
+        self._end_boundary.setVisible(True)
+
+        for line, original_t in zip(self._marker_lines, self._entity.markers_for(self._channel_index)):
+            line.setPos(original_t)
+            line.setVisible(True)
+
+        self._show_overview()
+        self._refresh_segment_mode()
+        self._update_button_visibility()
 
     def _update_clip_related_visibility(self):
         self._clip_btn.setVisible(not self._clip_mode and not self._edit_mode)
@@ -599,6 +729,8 @@ class WaveformPlayer(QWidget):
     def force_idle(self):
         if self._clip_mode:
             self._exit_clip_mode()
+        if self._trim_mode:
+            self.exit_trim_preview()
         if self._state != self.STATE_STOPPED:
             self._do_reset()
         self.clear_selection()
@@ -626,39 +758,51 @@ class WaveformPlayer(QWidget):
 
     def _on_play_clicked(self):
         if not self._group.request_play(self):
-            return  # another plot is active; must be reset first
+            return
         self._state = self.STATE_PLAYING
-        self._engine.start_or_resume()
+        (self._trim_engine if self._trim_mode else self._engine).start_or_resume()
         self._timer.start()
         self._update_button_visibility()
-        self._refresh_clip_enabled() 
+        self._refresh_clip_enabled()
 
     def _on_pause_clicked(self):
-        self._engine.pause()
+        (self._trim_engine if self._trim_mode else self._engine).pause()
         self._timer.stop()
         self._state = self.STATE_PAUSED
-        self._show_window_centered_at(self._current_center_time())
+        if not self._trim_mode:
+            self._show_window_centered_at(self._current_center_time())
         self._update_button_visibility()
-        self._refresh_clip_enabled() 
+        self._refresh_clip_enabled()
 
     def _on_reset_clicked(self):
         self._do_reset()
 
     def _do_reset(self):
-        self._engine.stop()
+        (self._trim_engine if self._trim_mode else self._engine).stop()
         self._timer.stop()
         self._state = self.STATE_STOPPED
-        self._show_overview()
+        if self._trim_mode:
+            self._trim_playhead.setPos(self._trim_start)
+            self._trim_playhead.setVisible(False)
+        else:
+            self._show_overview()
         self._update_button_visibility()
         self._group.release(self)
-        self._refresh_clip_enabled()  
+        self._refresh_clip_enabled()
 
     def _on_tick(self):
-        if self._engine.is_finished():
-            self._do_reset()  # "finished" collapses back to the initial Play-only state
+        engine = self._trim_engine if self._trim_mode else self._engine
+        if engine.is_finished():
+            self._do_reset()
             return
 
-        current_time = self._start_time + self._engine.current_frame() / self._sample_rate
+        if self._trim_mode:
+            current_time = self._trim_start + engine.current_frame() / self._sample_rate
+            self._trim_playhead.setPos(current_time)
+            self._trim_playhead.setVisible(True)
+            return
+
+        current_time = self._start_time + engine.current_frame() / self._sample_rate
         self._show_window_centered_at(current_time)
 
         if self._is_driver:
@@ -673,37 +817,46 @@ class WaveformPlayer(QWidget):
     def _on_drag_start(self):
         if self._state not in (self.STATE_PLAYING, self.STATE_PAUSED):
             return
-
         self._drag_was_playing = (self._state == self.STATE_PLAYING)
         if self._drag_was_playing:
-            # Freeze audio for the duration of the drag — cheap, no stream
-            # churn per mouse-move. self._engine.seek() below becomes a
-            # pure bookkeeping update once segment_start is None.
             self._timer.stop()
-            self._engine.pause()
+            (self._trim_engine if self._trim_mode else self._engine).pause()
 
     def _on_seek(self, dt):
         if self._state not in (self.STATE_PLAYING, self.STATE_PAUSED):
             return
 
+        if self._trim_mode:
+            current = self._trim_start + self._trim_engine.current_frame() / self._sample_rate
+            new_time = max(self._trim_start, min(current + dt, self._trim_end))
+            frame = int(round((new_time - self._trim_start) * self._sample_rate))
+            self._trim_engine.seek(frame)
+            self._trim_playhead.setPos(new_time)
+            self._trim_playhead.setVisible(True)
+            return
+
         old_center = self._current_center_time()
         new_time = self._clamp_time(old_center + dt)
-        actual_dt = new_time - old_center   # the delta actually applied, after clamping
+        actual_dt = new_time - old_center
 
         frame = int(round((new_time - self._start_time) * self._sample_rate))
-        self._engine.seek(frame)          # cheap: no audio restart mid-drag
+        self._engine.seek(frame)
         self._show_window_centered_at(new_time)
 
         if self._clip_mode and self._divisor_time is not None:
-            # Keep the divisor visually fixed on screen: move it in data-time
-            # by the same amount the view center moved, and never let it
-            # leave the clip's valid range.
             self._divisor_time = self._clamp_time(self._divisor_time + actual_dt)
             self._divisor_line.setPos(self._divisor_time)
 
         if self._is_driver:
             self._group.broadcast_position(new_time)
 
+    def _on_drag_end(self):
+        if self._state not in (self.STATE_PLAYING, self.STATE_PAUSED):
+            return
+        if getattr(self, "_drag_was_playing", False):
+            (self._trim_engine if self._trim_mode else self._engine).start_or_resume()
+            self._timer.start()
+        self._drag_was_playing = False
     def _on_drag_end(self):
         if self._state not in (self.STATE_PLAYING, self.STATE_PAUSED):
             return

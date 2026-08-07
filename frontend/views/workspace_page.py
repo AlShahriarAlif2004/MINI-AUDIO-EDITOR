@@ -23,7 +23,8 @@ from frontend.widgets.entity_plot import EntityPlotView
 class WorkspacePage(QWidget):
     """VSCode-like workspace editor shell."""
 
-    _SELECTED_BTN_STYLE = "QToolButton { background-color: #2f81f7; color: white; font-weight: 600; }"  # <-- added
+    _SELECTED_BTN_STYLE = "QToolButton { background-color: #2f81f7; color: white; font-weight: 600; }"
+    _SELECTED_OPTION_STYLE = "background-color: #2f81f7; color: white; font-weight: 600;"
 
     new_workspace_requested = Signal()
     open_workspace_requested = Signal()
@@ -33,6 +34,8 @@ class WorkspacePage(QWidget):
         super().__init__(parent)
         self._workspace: Workspace | None = None
         self._mode = "file"
+        self._trim_active = False
+        self._trim_active_view = None
         self._build_ui()
 
     def _build_ui(self):
@@ -94,9 +97,30 @@ class WorkspacePage(QWidget):
         self._segment_label.setStyleSheet("font-weight: 600;")
         edit_options_layout.addWidget(self._segment_label)
 
+        self._segment_buttons = {}
+
         for label in ("Trim", "Time Scale", "Vertical Scale", "Reverse", "Shift",
                       "Fade In", "Fade Out", "Concatenate"):
-            edit_options_layout.addWidget(QPushButton(label))  # wired up later
+            btn = QPushButton(label)
+            edit_options_layout.addWidget(btn)
+            self._segment_buttons[label] = btn
+
+            if label == "Trim":
+                self._trim_btn = btn
+                btn.clicked.connect(self._on_trim_clicked)
+
+                self._trim_panel = QWidget()
+                trim_panel_layout = QHBoxLayout(self._trim_panel)
+                trim_panel_layout.setContentsMargins(16, 0, 0, 0)
+                trim_panel_layout.setSpacing(6)
+                self._trim_apply_btn = QPushButton("Apply")
+                self._trim_cancel_btn = QPushButton("Cancel")
+                self._trim_apply_btn.clicked.connect(self._on_trim_apply_clicked)
+                self._trim_cancel_btn.clicked.connect(self._on_trim_cancel_clicked)
+                trim_panel_layout.addWidget(self._trim_apply_btn)
+                trim_panel_layout.addWidget(self._trim_cancel_btn)
+                self._trim_panel.setVisible(False)
+                edit_options_layout.addWidget(self._trim_panel)
 
         edit_options_layout.addStretch()
         self._edit_options_panel.setVisible(False)
@@ -179,10 +203,12 @@ class WorkspacePage(QWidget):
         if mode == self._mode:
             return
 
+        self._cancel_trim_if_active()
         self._clear_all_plot_selections()
 
         if mode == "edit":
             self._force_idle_all_players()
+        ...
 
         self._mode = mode
 
@@ -278,10 +304,66 @@ class WorkspacePage(QWidget):
     def _on_segment_selected(self, entity, channel_index, start, end):
         label = "Overall" if channel_index is None else f"Channel {channel_index + 1}"
         self._segment_label.setText(f"{label}: {start:.2f}s – {end:.2f}s")
+        self._trim_btn.setVisible(channel_index is None)
         self._edit_options_panel.setVisible(True)
+
+    def _current_entity_view(self):
+        widget = self._content_stack.currentWidget()
+        return widget if hasattr(widget, "begin_trim") else None
+
+    def _collapse_trim_ui(self):
+        self._trim_active = False
+        self._trim_active_view = None
+        self._trim_btn.setStyleSheet("")
+        self._trim_panel.setVisible(False)
+
+    def _cancel_trim_if_active(self):
+        if self._trim_active and self._trim_active_view is not None:
+            view = self._trim_active_view
+            self._collapse_trim_ui()
+            view.cancel_trim()
+
+    def _on_trim_cancelled_externally(self):
+        if self._trim_active:
+            self._collapse_trim_ui()
+
+    def _on_trim_clicked(self):
+        if self._trim_active:
+            return
+        view = self._current_entity_view()
+        if view is None or not view.begin_trim():
+            return
+        self._trim_active = True
+        self._trim_active_view = view
+        self._trim_btn.setStyleSheet(self._SELECTED_OPTION_STYLE)
+        self._trim_panel.setVisible(True)
+
+    def _on_trim_apply_clicked(self):
+        if not self._trim_active or self._trim_active_view is None:
+            return
+        view = self._trim_active_view
+        self._collapse_trim_ui()
+        view.apply_trim()
+
+    def _on_trim_cancel_clicked(self):
+        if not self._trim_active or self._trim_active_view is None:
+            return
+        view = self._trim_active_view
+        self._collapse_trim_ui()
+        view.cancel_trim()
 
     def _on_segment_deselected(self):
         self._edit_options_panel.setVisible(False)
+
+    def _make_entity_view(self, entity: Entity) -> EntityPlotView:
+        entity_view = EntityPlotView(entity)
+        entity_view.entity_modified.connect(self._on_entity_modified)
+        entity_view.segment_selected.connect(self._on_segment_selected)
+        entity_view.segment_deselected.connect(self._on_segment_deselected)
+        entity_view.entity_trimmed.connect(lambda: self._rebuild_entity_tab(entity))
+        entity_view.trim_cancelled.connect(self._on_trim_cancelled_externally)
+        entity_view.set_edit_mode(self._mode == "edit")
+        return entity_view
 
     def _open_entity_tab(self, entity: Entity):
         index = self._find_entity_tab(entity.id)
@@ -292,30 +374,49 @@ class WorkspacePage(QWidget):
         index = self._tab_bar.addTab(entity.name)
         self._tab_bar.setTabData(index, entity.id)
 
-        entity_view = EntityPlotView(entity)
-        entity_view.entity_modified.connect(self._on_entity_modified)
-        entity_view.segment_selected.connect(self._on_segment_selected)
-        entity_view.segment_deselected.connect(self._on_segment_deselected)
-        entity_view.set_edit_mode(self._mode == "edit")
+        entity_view = self._make_entity_view(entity)
         self._content_stack.addWidget(entity_view)
         self._tab_bar.setCurrentIndex(index)
         self._content_stack.setCurrentWidget(entity_view)
 
+    def _rebuild_entity_tab(self, entity: Entity):
+        index = self._find_entity_tab(entity.id)
+        if index == -1:
+            return
+        widget_index = index + 1
+        old_widget = self._content_stack.widget(widget_index)
+        was_current = (self._tab_bar.currentIndex() == index)
+
+        if old_widget is self._trim_active_view:
+            self._collapse_trim_ui()
+
+        self._content_stack.removeWidget(old_widget)
+        old_widget.deleteLater()
+
+        entity_view = self._make_entity_view(entity)
+        self._content_stack.insertWidget(widget_index, entity_view)
+        if was_current:
+            self._content_stack.setCurrentWidget(entity_view)
+
     def _close_tab(self, index: int):
         widget_index = index + 1
         widget = self._content_stack.widget(widget_index)
+        if widget is self._trim_active_view:
+            self._collapse_trim_ui()
         if widget:
-            widget.shutdown()          # <-- release any playback/clip locks first
+            widget.shutdown()
             self._content_stack.removeWidget(widget)
             widget.deleteLater()
         self._tab_bar.removeTab(index)
 
     def _on_tab_changed(self, index: int):
+        self._cancel_trim_if_active()
         self._clear_all_plot_selections()
 
         if index < 0:
             self._content_stack.setCurrentWidget(self._empty_label)
             return
+        ...
 
         widget_index = index + 1  # index 0 is the empty label
         if widget_index < self._content_stack.count():
