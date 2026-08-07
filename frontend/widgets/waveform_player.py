@@ -3,7 +3,7 @@ import time
 import numpy as np
 import pyqtgraph as pg
 import sounddevice as sd
-from PySide6.QtCore import QObject, QTimer, Signal
+from PySide6.QtCore import QObject, QTimer, Signal, Qt
 from PySide6.QtWidgets import QWidget, QVBoxLayout, QHBoxLayout, QPushButton, QSizePolicy
 
 
@@ -93,6 +93,61 @@ class _PlaybackEngine:
     def is_finished(self):
         return self.current_frame() >= self.total_frames
 
+    def seek(self, frame):
+        frame = max(0, min(frame, self.total_frames))
+        was_playing = self._segment_start is not None
+        sd.stop()
+        self._played_frames = frame
+        if was_playing:
+            self.start_or_resume()
+        else:
+            self._segment_start = None
+
+class _DraggablePlotWidget(pg.PlotWidget):
+    """PlotWidget supporting relative (grab-and-drag) seeking, like dragging
+    an image: cursor movement distance == content movement distance."""
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.drag_enabled = False
+        self.on_seek = None          # callback(time_delta: float) — relative!
+        self._dragging = False
+        self._last_x = None
+        self._pixels_per_second = None
+
+    def _compute_pixels_per_second(self):
+        view_range = self.getPlotItem().vb.viewRange()[0]  # [xmin, xmax]
+        span = view_range[1] - view_range[0]
+        width = max(1, self.width())
+        return width / span if span > 0 else 1.0
+
+    def mousePressEvent(self, event):
+        if self.drag_enabled and event.button() == Qt.LeftButton:
+            self._dragging = True
+            self._last_x = event.pos().x()
+            self._pixels_per_second = self._compute_pixels_per_second()
+            event.accept()
+            return
+        super().mousePressEvent(event)
+
+    def mouseMoveEvent(self, event):
+        if self.drag_enabled and self._dragging:
+            dx = event.pos().x() - self._last_x
+            self._last_x = event.pos().x()
+            if self.on_seek and self._pixels_per_second:
+                dt = -dx / self._pixels_per_second
+                self.on_seek(dt)
+            event.accept()
+            return
+        super().mouseMoveEvent(event)
+
+    def mouseReleaseEvent(self, event):
+        if self.drag_enabled and event.button() == Qt.LeftButton:
+            self._dragging = False
+            self._last_x = None
+            event.accept()
+            return
+        super().mouseReleaseEvent(event)
 
 class WaveformPlayer(QWidget):
     """One waveform plot with its own Play/Pause/Reset + a disabled Clip button."""
@@ -146,7 +201,8 @@ class WaveformPlayer(QWidget):
         layout.setContentsMargins(0, 0, 0, 0)
         layout.setSpacing(4)
 
-        self._plot = pg.PlotWidget()
+        self._plot = _DraggablePlotWidget()
+        self._plot.on_seek = self._on_seek
         self._plot.setBackground(None)
         self._plot.showGrid(x=True, y=True, alpha=0.3)
         self._plot.setYRange(-1.05, 1.05)
@@ -189,6 +245,7 @@ class WaveformPlayer(QWidget):
     def _update_button_visibility(self):
         playing = self._state == self.STATE_PLAYING
         paused = self._state == self.STATE_PAUSED
+        self._plot.drag_enabled = playing or paused
         self._play_btn.setVisible(not playing)
         self._play_btn.setText("▶ Resume" if paused else "▶ Play")
         self._pause_btn.setVisible(playing)
@@ -242,6 +299,24 @@ class WaveformPlayer(QWidget):
 
         if self._is_driver:
             self._group.broadcast_position(current_time)
+
+    def _current_center_time(self):
+        return self._start_time + self._engine.current_frame() / self._sample_rate
+
+    def _clamp_time(self, t):
+        return max(self._start_time, min(t, self._end_time))
+
+    def _on_seek(self, dt):
+        if self._state not in (self.STATE_PLAYING, self.STATE_PAUSED):
+            return
+
+        new_time = self._clamp_time(self._current_center_time() + dt)
+        frame = int(round((new_time - self._start_time) * self._sample_rate))
+        self._engine.seek(frame)
+        self._show_window_centered_at(new_time)
+
+        if self._is_driver:
+            self._group.broadcast_position(new_time)
 
     # ---------- following another player's broadcast ----------
 
