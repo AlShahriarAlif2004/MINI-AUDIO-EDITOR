@@ -27,6 +27,7 @@ class EntityPlotView(QWidget):
 
     entity_modified = Signal()
     entity_trimmed = Signal()
+    entity_timescaled = Signal()
     trim_cancelled = Signal()
     segment_selected = Signal(object, object, float, float)
     segment_deselected = Signal()
@@ -46,7 +47,12 @@ class EntityPlotView(QWidget):
         self._selected_player = None
         self._trim_player = None
         self._trim_range = None
+        self._timescale_preview_active = False
         self._build_ui()
+
+    @property
+    def entity(self) -> Entity:
+        return self._entity
 
     def _lock_selection(self, locked: bool):
         for player in self._players:
@@ -67,13 +73,16 @@ class EntityPlotView(QWidget):
         return True
 
     def cancel_trim(self):
+        """Exit trim preview, restore original graph, keep selection."""
         if self._trim_player is not None:
             for player in self._players:
                 player.exit_trim_preview()
         self._trim_player = None
         self._trim_range = None
         self._lock_selection(False)
-        self.clear_all_selection()
+        # Restore selection highlight (don't clear the selection)
+        if self._selected_player is not None:
+            self._selected_player.restore_selection_visual()
 
     def apply_trim(self):
         if self._trim_player is None or self._trim_range is None:
@@ -83,9 +92,66 @@ class EntityPlotView(QWidget):
         self._trim_player = None
         self._trim_range = None
         self._lock_selection(False)
-        self.clear_all_selection()
+        self.clear_all_selection()   # apply clears selection
         self.entity_modified.emit()
         self.entity_trimmed.emit()
+
+    # ------------------------------------------------------------------
+    # Time-scale preview
+    # ------------------------------------------------------------------
+
+    def begin_timescale(self) -> bool:
+        """Enter timescale preview. Only valid when the overall plot is selected."""
+        if self._selected_player is None or self._selected_player.channel_index is not None:
+            return False
+        self._timescale_preview_active = True
+        for player in self._players:
+            player.enter_timescale_preview(1.0)
+        self._lock_selection(True)
+        return True
+
+    def update_timescale_preview(self, factor: float):
+        """Update the live preview as the factor changes."""
+        if not self._timescale_preview_active:
+            return
+        for player in self._players:
+            player.update_timescale_preview(factor)
+
+    def cancel_timescale(self):
+        """Exit timescale preview, restore graph, keep selection."""
+        if not self._timescale_preview_active:
+            return
+        self._timescale_preview_active = False
+        for player in self._players:
+            player.exit_timescale_preview()
+        self._lock_selection(False)
+        # Restore selection highlight
+        if self._selected_player is not None:
+            self._selected_player.restore_selection_visual()
+
+    def apply_timescale(self, factor: float):
+        """Apply timescale permanently, exit preview, clear selection, rebuild."""
+        if not self._timescale_preview_active:
+            return
+        self._timescale_preview_active = False
+        for player in self._players:
+            player.exit_timescale_preview()
+        self._perform_timescale(factor)
+        self._lock_selection(False)
+        self.clear_all_selection()   # apply clears selection
+        self.entity_modified.emit()
+        self.entity_timescaled.emit()
+
+    def _perform_timescale(self, factor: float):
+        clip = self._entity.clip
+        new_channels = [ch.time_scale(factor) for ch in clip.channels]
+        self._entity.clip = AudioClip(new_channels, name=clip.name)
+        # Rescale marker/division timestamps proportionally
+        self._entity.divisions = [t * factor for t in self._entity.divisions]
+        for ch_idx in list(self._entity.channel_markers.keys()):
+            self._entity.channel_markers[ch_idx] = [
+                t * factor for t in self._entity.channel_markers[ch_idx]
+            ]
 
     def _perform_trim(self, start, end):
         clip = self._entity.clip
@@ -136,6 +202,10 @@ class EntityPlotView(QWidget):
             ]
 
     def _on_canvas_clicked(self):
+        # While Trim / Time Scale is expanded, empty-space clicks must do
+        # nothing — only the panel's own Apply/Cancel can end it.
+        if self._trim_player is not None or self._timescale_preview_active:
+            return
         self.clear_all_selection()
         if self._trim_player is not None:
             self.cancel_trim()
@@ -211,6 +281,7 @@ class EntityPlotView(QWidget):
 
     def shutdown(self):
         self.cancel_trim()
+        self.cancel_timescale()
         for player in self._players:
             player.force_idle()
         self.clear_all_selection()

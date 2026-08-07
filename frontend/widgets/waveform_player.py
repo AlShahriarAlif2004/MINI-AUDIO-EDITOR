@@ -345,6 +345,8 @@ class WaveformPlayer(QWidget):
         self._trim_start = None
         self._trim_end = None
 
+        self._timescale_mode = False
+
         self._timer = QTimer(self)
         self._timer.setInterval(_TICK_MS)
         self._timer.timeout.connect(self._on_tick)
@@ -467,7 +469,7 @@ class WaveformPlayer(QWidget):
         paused = self._state == self.STATE_PAUSED
         self._plot.drag_enabled = playing or paused
 
-        show_playback_controls = self._trim_mode or not self._edit_mode
+        show_playback_controls = True          # ← was: self._trim_mode or not self._edit_mode
         self._play_btn.setVisible(not playing and show_playback_controls)
         self._play_btn.setText("▶ Resume" if paused else "▶ Play")
         self._pause_btn.setVisible(playing and show_playback_controls)
@@ -520,6 +522,7 @@ class WaveformPlayer(QWidget):
             and self._state == self.STATE_STOPPED
             and not self._clip_mode
             and not self._trim_mode
+            and not self._timescale_mode
             and not self._segment_locked
         )
         self._plot.set_segment_mode(
@@ -630,6 +633,50 @@ class WaveformPlayer(QWidget):
         self._refresh_segment_mode()
         self._update_button_visibility()
 
+    # ------------------------------------------------------------------
+    # Timescale preview
+    # ------------------------------------------------------------------
+
+    def enter_timescale_preview(self, factor: float):
+        """Show a scaled version of the waveform (time-axis only) as a preview."""
+        self._timescale_mode = True
+        self._hover_region.setVisible(False)
+        self._update_timescale_display(factor)
+        self._refresh_segment_mode()
+
+    def update_timescale_preview(self, factor: float):
+        """Refresh the preview whenever the factor spinbox changes."""
+        if self._timescale_mode:
+            self._update_timescale_display(factor)
+
+    def _update_timescale_display(self, factor: float):
+        factor = max(0.1, float(factor))
+        start = self._start_time
+        preview_times = start + (self._times - start) * factor
+        for curve, (samples, _color, _label) in zip(self._curve_items, self._series):
+            curve.setData(preview_times, samples)
+        preview_end = float(preview_times[-1]) if len(preview_times) > 0 else start + 0.001
+        self._end_boundary.setPos(preview_end)
+        self._plot.setXRange(start, max(preview_end, start + 0.001), padding=0.02)
+
+    def exit_timescale_preview(self):
+        """Restore the original waveform display."""
+        if not self._timescale_mode:
+            return
+        self._timescale_mode = False
+        for curve, (samples, _color, _label) in zip(self._curve_items, self._series):
+            curve.setData(self._times, samples)
+        self._start_boundary.setPos(self._start_time)
+        self._end_boundary.setPos(self._end_time)
+        self._show_overview()
+        self._refresh_segment_mode()
+
+    def restore_selection_visual(self):
+        """Re-show the selection highlight after exiting a preview mode."""
+        if self._selected_segment is not None:
+            self._selection_region.setRegion(self._selected_segment)
+            self._selection_region.setVisible(True)
+
     def _update_clip_related_visibility(self):
         self._clip_btn.setVisible(not self._clip_mode and not self._edit_mode)
         self._divide_btn.setVisible(self._clip_mode)
@@ -731,6 +778,8 @@ class WaveformPlayer(QWidget):
             self._exit_clip_mode()
         if self._trim_mode:
             self.exit_trim_preview()
+        if self._timescale_mode:
+            self.exit_timescale_preview()
         if self._state != self.STATE_STOPPED:
             self._do_reset()
         self.clear_selection()
@@ -770,7 +819,11 @@ class WaveformPlayer(QWidget):
         self._timer.stop()
         self._state = self.STATE_PAUSED
         if not self._trim_mode:
-            self._show_window_centered_at(self._current_center_time())
+            if self._edit_mode:
+                self._playhead.setPos(self._current_center_time())
+                self._playhead.setVisible(True)
+            else:
+                self._show_window_centered_at(self._current_center_time())
         self._update_button_visibility()
         self._refresh_clip_enabled()
 
@@ -803,7 +856,12 @@ class WaveformPlayer(QWidget):
             return
 
         current_time = self._start_time + engine.current_frame() / self._sample_rate
-        self._show_window_centered_at(current_time)
+
+        if self._edit_mode:
+            self._playhead.setPos(current_time)
+            self._playhead.setVisible(True)
+        else:
+            self._show_window_centered_at(current_time)
 
         if self._is_driver:
             self._group.broadcast_position(current_time)
@@ -841,7 +899,12 @@ class WaveformPlayer(QWidget):
 
         frame = int(round((new_time - self._start_time) * self._sample_rate))
         self._engine.seek(frame)
-        self._show_window_centered_at(new_time)
+
+        if self._edit_mode:
+            self._playhead.setPos(new_time)
+            self._playhead.setVisible(True)
+        else:
+            self._show_window_centered_at(new_time)
 
         if self._clip_mode and self._divisor_time is not None:
             self._divisor_time = self._clamp_time(self._divisor_time + actual_dt)
@@ -870,8 +933,12 @@ class WaveformPlayer(QWidget):
 
     def _on_driver_position(self, t):
         if self._group.active_player is self:
-            return  # I'm the one driving; I already updated myself in _on_tick
-        self._show_window_centered_at(t)
+            return
+        if self._edit_mode:
+            self._playhead.setPos(t)
+            self._playhead.setVisible(True)
+        else:
+            self._show_window_centered_at(t)
 
     def _on_group_active_changed(self, active_player):
         if active_player is None:
