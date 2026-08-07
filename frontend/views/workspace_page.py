@@ -85,6 +85,23 @@ class WorkspacePage(QWidget):
         self._tree.entity_clicked.connect(self._open_entity_tab)
         sidebar_layout.addWidget(self._tree)
 
+        self._edit_options_panel = QWidget()
+        edit_options_layout = QVBoxLayout(self._edit_options_panel)
+        edit_options_layout.setContentsMargins(4, 4, 4, 4)
+        edit_options_layout.setSpacing(6)
+
+        self._segment_label = QLabel("No selection")
+        self._segment_label.setStyleSheet("font-weight: 600;")
+        edit_options_layout.addWidget(self._segment_label)
+
+        for label in ("Trim", "Time Scale", "Vertical Scale", "Reverse", "Shift",
+                      "Fade In", "Fade Out", "Concatenate"):
+            edit_options_layout.addWidget(QPushButton(label))  # wired up later
+
+        edit_options_layout.addStretch()
+        self._edit_options_panel.setVisible(False)
+        sidebar_layout.addWidget(self._edit_options_panel)
+
         splitter.addWidget(sidebar)
 
         editor = QWidget()
@@ -151,9 +168,18 @@ class WorkspacePage(QWidget):
             if hasattr(widget, "shutdown"):
                 widget.shutdown()
 
+    def _clear_all_plot_selections(self):
+        self._edit_options_panel.setVisible(False)
+        for i in range(1, self._content_stack.count()):
+            widget = self._content_stack.widget(i)
+            if hasattr(widget, "clear_all_selection"):
+                widget.clear_all_selection()
+
     def _set_mode(self, mode):
         if mode == self._mode:
             return
+
+        self._clear_all_plot_selections()
 
         if mode == "edit":
             self._force_idle_all_players()
@@ -249,6 +275,14 @@ class WorkspacePage(QWidget):
         if self._workspace:
             self._workspace.mark_dirty()
 
+    def _on_segment_selected(self, entity, channel_index, start, end):
+        label = "Overall" if channel_index is None else f"Channel {channel_index + 1}"
+        self._segment_label.setText(f"{label}: {start:.2f}s – {end:.2f}s")
+        self._edit_options_panel.setVisible(True)
+
+    def _on_segment_deselected(self):
+        self._edit_options_panel.setVisible(False)
+
     def _open_entity_tab(self, entity: Entity):
         index = self._find_entity_tab(entity.id)
         if index != -1:
@@ -260,6 +294,8 @@ class WorkspacePage(QWidget):
 
         entity_view = EntityPlotView(entity)
         entity_view.entity_modified.connect(self._on_entity_modified)
+        entity_view.segment_selected.connect(self._on_segment_selected)
+        entity_view.segment_deselected.connect(self._on_segment_deselected)
         entity_view.set_edit_mode(self._mode == "edit")
         self._content_stack.addWidget(entity_view)
         self._tab_bar.setCurrentIndex(index)
@@ -275,6 +311,8 @@ class WorkspacePage(QWidget):
         self._tab_bar.removeTab(index)
 
     def _on_tab_changed(self, index: int):
+        self._clear_all_plot_selections()
+
         if index < 0:
             self._content_stack.setCurrentWidget(self._empty_label)
             return

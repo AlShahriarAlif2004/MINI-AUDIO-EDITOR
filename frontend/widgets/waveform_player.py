@@ -140,6 +140,18 @@ class _DraggablePlotWidget(pg.PlotWidget):
         self._divisor_setter = None
         self._time_to_pixel = None
         self._dragging_divisor = False
+        self._clip_mode = False
+        self._clip_allow_graph_drag = False
+        self._divisor_getter = None
+        self._divisor_setter = None
+        self._time_to_pixel = None
+        self._dragging_divisor = False
+
+        self._segment_mode = False
+        self._segment_boundaries_getter = None
+        self._on_segment_hover = None
+        self._on_segment_click = None
+        self.setMouseTracking(True)
 
     def set_clip_mode(self, enabled, allow_graph_drag=False,
                        divisor_getter=None, divisor_setter=None, time_to_pixel=None):
@@ -150,6 +162,26 @@ class _DraggablePlotWidget(pg.PlotWidget):
         self._time_to_pixel = time_to_pixel
         self._dragging_divisor = False
         self._dragging = False
+
+    def set_segment_mode(self, enabled, boundaries_getter=None, on_hover=None, on_click=None):
+        self._segment_mode = enabled
+        self._segment_boundaries_getter = boundaries_getter
+        self._on_segment_hover = on_hover
+        self._on_segment_click = on_click
+
+    def _segment_at_pixel(self, event_pos):
+        if not self._segment_boundaries_getter:
+            return None
+        boundaries = self._segment_boundaries_getter()
+        if len(boundaries) < 2:
+            return None
+        view_box = self.getPlotItem().vb
+        scene_pos = self.mapToScene(event_pos)
+        t = view_box.mapSceneToView(scene_pos).x()
+        for i in range(len(boundaries) - 1):
+            if boundaries[i] <= t <= boundaries[i + 1]:
+                return i, boundaries[i], boundaries[i + 1]
+        return None
 
     def _compute_pixels_per_second(self):
         view_range = self.getPlotItem().vb.viewRange()[0]
@@ -186,6 +218,14 @@ class _DraggablePlotWidget(pg.PlotWidget):
                 self.on_drag_start()
             event.accept()
             return
+
+        if self._segment_mode and event.button() == Qt.LeftButton:
+            result = self._segment_at_pixel(event.pos())
+            if result and self._on_segment_click:
+                self._on_segment_click(result[0], result[1], result[2])
+            event.accept()
+            return
+
         super().mousePressEvent(event)
 
     def mouseMoveEvent(self, event):
@@ -214,6 +254,15 @@ class _DraggablePlotWidget(pg.PlotWidget):
                 self.on_seek(-dx / self._pixels_per_second)
             event.accept()
             return
+
+        if self._segment_mode:
+            result = self._segment_at_pixel(event.pos())
+            if self._on_segment_hover:
+                self._on_segment_hover(result[1] if result else None,
+                                        result[2] if result else None)
+            event.accept()
+            return
+
         super().mouseMoveEvent(event)
 
     def mouseReleaseEvent(self, event):
@@ -238,6 +287,11 @@ class _DraggablePlotWidget(pg.PlotWidget):
             return
         super().mouseReleaseEvent(event)
 
+    def leaveEvent(self, event):
+        if self._segment_mode and self._on_segment_hover:
+            self._on_segment_hover(None, None)
+        super().leaveEvent(event)
+
 
 class WaveformPlayer(QWidget):
     STATE_STOPPED = "stopped"
@@ -245,6 +299,8 @@ class WaveformPlayer(QWidget):
     STATE_PAUSED = "paused"
 
     marker_added = Signal()
+    segment_selected = Signal(object, float, float)   # self, start_time, end_time
+    segment_deselected = Signal(object)
 
     def __init__(
         self,
@@ -277,6 +333,7 @@ class WaveformPlayer(QWidget):
         self._divisor_time = None
         self._entered_clip_from_pause = False
         self._edit_mode = False 
+        self._selected_segment = None
 
         self._timer = QTimer(self)
         self._timer.setInterval(_TICK_MS)
@@ -292,6 +349,7 @@ class WaveformPlayer(QWidget):
         self._on_group_active_changed(self._group.active_player)
         self._on_group_clip_active_changed(self._group.clip_active_player)
         self._refresh_clip_enabled()
+        self._refresh_segment_mode()
 
     # ---------- UI ----------
 
@@ -336,6 +394,22 @@ class WaveformPlayer(QWidget):
         self._divisor_line.addMarker('v', position=1.0, size=14)  # inverse triangle at top, pointing down (inward)
         self._divisor_line.setVisible(False)
         self._plot.addItem(self._divisor_line)
+
+        self._hover_region = pg.LinearRegionItem(
+            values=(0, 0), brush=pg.mkBrush(255, 255, 255, 40),
+            pen=pg.mkPen(None), movable=False,
+        )
+        self._hover_region.setZValue(-10)
+        self._hover_region.setVisible(False)
+        self._plot.addItem(self._hover_region)
+
+        self._selection_region = pg.LinearRegionItem(
+            values=(0, 0), brush=pg.mkBrush(79, 195, 247, 70),
+            pen=pg.mkPen(None), movable=False,
+        )
+        self._selection_region.setZValue(-9)
+        self._selection_region.setVisible(False)
+        self._plot.addItem(self._selection_region)
 
         layout.addWidget(self._plot)
 
@@ -382,6 +456,49 @@ class WaveformPlayer(QWidget):
         line = pg.InfiniteLine(pos=t, angle=90, pen=pg.mkPen(color="#ffffff", width=1))
         self._plot.addItem(line)
         self._marker_lines.append(line)
+
+    @property
+    def channel_index(self):
+        return self._channel_index
+
+    def _boundary_times(self):
+        return sorted({self._start_time, self._end_time,
+                        *self._entity.markers_for(self._channel_index)})
+
+    def _on_segment_hover(self, start, end):
+        if start is None or self._selected_segment == (start, end):
+            self._hover_region.setVisible(False)
+            return
+        self._hover_region.setRegion((start, end))
+        self._hover_region.setVisible(True)
+
+    def _on_segment_click(self, index, start, end):
+        self.select_segment(start, end)
+
+    def select_segment(self, start, end):
+        self._selected_segment = (start, end)
+        self._selection_region.setRegion((start, end))
+        self._selection_region.setVisible(True)
+        self._hover_region.setVisible(False)
+        self.segment_selected.emit(self, start, end)
+
+    def clear_selection(self):
+        if self._selected_segment is None:
+            return
+        self._selected_segment = None
+        self._selection_region.setVisible(False)
+        self.segment_deselected.emit(self)
+
+    def _refresh_segment_mode(self):
+        enabled = self._edit_mode and self._state == self.STATE_STOPPED and not self._clip_mode
+        self._plot.set_segment_mode(
+            enabled,
+            boundaries_getter=self._boundary_times,
+            on_hover=self._on_segment_hover,
+            on_click=self._on_segment_click,
+        )
+        if not enabled:
+            self._hover_region.setVisible(False)
 
     def _update_clip_related_visibility(self):
         self._clip_btn.setVisible(not self._clip_mode and not self._edit_mode)
@@ -480,18 +597,19 @@ class WaveformPlayer(QWidget):
         self._exit_clip_mode()
 
     def force_idle(self):
-        """Reset this player to a released, idle state regardless of its
-        current state — used when its tab is closing, so it doesn't leave
-        a stale lock in the shared PlaybackGroup."""
         if self._clip_mode:
             self._exit_clip_mode()
         if self._state != self.STATE_STOPPED:
             self._do_reset()
+        self.clear_selection()
 
     def set_edit_mode(self, enabled: bool):
         self._edit_mode = enabled
         self._update_button_visibility()
         self._update_clip_related_visibility()
+        self._refresh_segment_mode()
+        if not enabled:
+            self.clear_selection()
 
     # ---------- view helpers ----------
 

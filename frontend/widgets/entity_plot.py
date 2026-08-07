@@ -8,10 +8,23 @@ from frontend.widgets.waveform_player import PlaybackGroup, WaveformPlayer
 
 _CHANNEL_COLORS = ["#4fc3f7", "#ff8a65", "#81c784", "#ba68c8", "#ffd54f", "#a1887f"]
 
+class _SegmentCanvas(QWidget):
+    """Container that holds the per-channel/overall plots. A click that
+    lands on empty space (not on a plot itself) clears the current
+    segment selection — the plots consume their own clicks, so this
+    only fires for gaps, labels, and margins."""
+
+    clicked_empty = Signal()
+
+    def mousePressEvent(self, event):
+        self.clicked_empty.emit()
+        super().mousePressEvent(event)
 
 class EntityPlotView(QWidget):
 
     entity_modified = Signal()
+    segment_selected = Signal(object, object, float, float)  # entity, channel_index, start, end
+    segment_deselected = Signal()
     """
     Shown when an entity tab is active: a 'Channels' section (one scrolling
     waveform per channel, skipped for mono clips) and an 'Overall' section
@@ -25,6 +38,7 @@ class EntityPlotView(QWidget):
         self._entity = entity
         self._group = PlaybackGroup.get_instance()
         self._players = []
+        self._selected_player = None
         self._build_ui()
 
     def _build_ui(self):
@@ -35,10 +49,11 @@ class EntityPlotView(QWidget):
         scroll.setWidgetResizable(True)
         outer_layout.addWidget(scroll)
 
-        container = QWidget()
+        container = _SegmentCanvas()
         layout = QVBoxLayout(container)
         layout.setContentsMargins(12, 12, 12, 12)
         layout.setSpacing(16)
+        container.clicked_empty.connect(self.clear_all_selection)
 
         clip = self._entity.clip
         num_channels = clip.num_channels
@@ -63,6 +78,8 @@ class EntityPlotView(QWidget):
                 )
                 layout.addWidget(player)
                 player.marker_added.connect(self.entity_modified.emit)
+                player.segment_selected.connect(self._on_segment_selected)
+                player.segment_deselected.connect(self._on_segment_deselected)
                 self._players.append(player)
 
         overall_label = QLabel("Overall")
@@ -85,18 +102,32 @@ class EntityPlotView(QWidget):
         )
         layout.addWidget(overall_player)
         overall_player.marker_added.connect(self.entity_modified.emit)
+        overall_player.segment_selected.connect(self._on_segment_selected)
+        overall_player.segment_deselected.connect(self._on_segment_deselected)
         self._players.append(overall_player)
 
         layout.addStretch()
         scroll.setWidget(container)
 
     def shutdown(self):
-        """Force every plot in this tab back to idle/released state.
-        Must be called before the tab is closed, otherwise a lingering
-        active/clip-mode lock in PlaybackGroup can block every other
-        player until the app restarts."""
         for player in self._players:
             player.force_idle()
+        self.clear_all_selection()
+
+    def _on_segment_selected(self, player, start, end):
+        if self._selected_player is not None and self._selected_player is not player:
+            self._selected_player.clear_selection()
+        self._selected_player = player
+        self.segment_selected.emit(self._entity, player.channel_index, start, end)
+
+    def _on_segment_deselected(self, player):
+        if self._selected_player is player:
+            self._selected_player = None
+            self.segment_deselected.emit()
+
+    def clear_all_selection(self):
+        if self._selected_player is not None:
+            self._selected_player.clear_selection()
 
     def set_edit_mode(self, enabled: bool):
         """Hide/show each plot's Play and Clip controls when the workspace
