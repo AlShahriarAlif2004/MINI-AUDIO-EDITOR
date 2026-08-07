@@ -1,6 +1,6 @@
 from PySide6.QtCore import Qt, Signal
 from PySide6.QtGui import QMouseEvent
-from PySide6.QtWidgets import QTreeWidget, QTreeWidgetItem
+from PySide6.QtWidgets import QTreeWidget, QTreeWidgetItem, QStyleFactory
 
 from backend.workspace_model import Entity, Folder, WorkspaceItem
 
@@ -13,6 +13,7 @@ class SidebarTree(QTreeWidget):
 
     def __init__(self, parent=None):
         super().__init__(parent)
+        self.setStyle(QStyleFactory.create("Fusion"))
         self.setHeaderHidden(True)
         self.setIndentation(16)
         self.setExpandsOnDoubleClick(False)

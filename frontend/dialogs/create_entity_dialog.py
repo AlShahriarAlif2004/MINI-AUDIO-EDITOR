@@ -48,10 +48,10 @@ class CreateEntityDialog(QDialog):
         file_row = QHBoxLayout()
         self._file_edit = QLineEdit()
         self._file_edit.setPlaceholderText("Path to audio file")
-        browse_btn = QPushButton("Browse…")
-        browse_btn.clicked.connect(self._browse_file)
+        self._browse_btn = QPushButton("Browse…")
+        self._browse_btn.clicked.connect(self._browse_file)
         file_row.addWidget(self._file_edit)
-        file_row.addWidget(browse_btn)
+        file_row.addWidget(self._browse_btn)
         layout.addLayout(file_row)
 
         self._entity_combo = QComboBox()
@@ -84,8 +84,10 @@ class CreateEntityDialog(QDialog):
 
     def _update_source_enabled(self):
         from_file = self._from_file_radio.isChecked()
-        self._file_edit.setEnabled(from_file)
-        self._entity_combo.setEnabled(not from_file)
+        self._file_edit.setVisible(from_file)
+        self._browse_btn.setVisible(from_file)
+        self._entity_combo.setVisible(not from_file)
+        self.adjustSize()
 
     def _browse_file(self):
         path, _ = QFileDialog.getOpenFileName(

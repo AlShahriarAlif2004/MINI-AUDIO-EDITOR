@@ -2,7 +2,6 @@ from PySide6.QtCore import Qt, Signal
 from PySide6.QtWidgets import (
     QDialog,
     QHBoxLayout,
-    QInputDialog,
     QLabel,
     QMenu,
     QPushButton,
@@ -16,6 +15,7 @@ from PySide6.QtWidgets import (
 
 from backend.workspace_model import Entity, Folder, Workspace
 from frontend.dialogs.create_entity_dialog import CreateEntityDialog
+from frontend.dialogs.create_folder_dialog import CreateFolderDialog
 from frontend.widgets.sidebar_tree import SidebarTree
 
 
@@ -29,8 +29,6 @@ class WorkspacePage(QWidget):
     def __init__(self, parent=None):
         super().__init__(parent)
         self._workspace: Workspace | None = None
-        self._entity_tabs: dict[str, int] = {}  # entity.id -> tab index
-        self._tab_entities: dict[int, Entity] = {}  # tab index -> entity
         self._build_ui()
 
     def _build_ui(self):
@@ -42,7 +40,8 @@ class WorkspacePage(QWidget):
         top_bar.setContentsMargins(8, 6, 8, 6)
 
         self._menu_btn = QToolButton()
-        self._menu_btn.setText("Menu")
+        self._menu_btn.setText("File")
+        self._menu_btn.setFixedWidth(70)
         self._menu_btn.setPopupMode(QToolButton.InstantPopup)
         menu = QMenu(self._menu_btn)
         menu.addAction("New", self.new_workspace_requested.emit)
@@ -81,8 +80,26 @@ class WorkspacePage(QWidget):
         editor_layout.setSpacing(0)
 
         self._tab_bar = QTabBar()
-        self._tab_bar.setTabsClosable(False)
+        self._tab_bar.setTabsClosable(True)
+        self._tab_bar.setExpanding(False)
+        self._tab_bar.setElideMode(Qt.TextElideMode.ElideRight)
         self._tab_bar.currentChanged.connect(self._on_tab_changed)
+        self._tab_bar.tabCloseRequested.connect(self._close_tab)
+        self._tab_bar.setStyleSheet("""
+            QTabBar::tab {
+                padding: 6px 12px;
+                min-width: 80px;
+                max-width: 160px;
+            }
+            QTabBar::close-button {
+                subcontrol-position: right;
+                margin-left: 4px;
+            }
+            QTabBar::close-button:hover {
+                background-color: rgba(128, 128, 128, 0.2);
+                border-radius: 2px;
+            }
+        """)
         editor_layout.addWidget(self._tab_bar)
 
         self._content_stack = QStackedWidget()
@@ -111,9 +128,9 @@ class WorkspacePage(QWidget):
         while self._tab_bar.count() > 0:
             self._tab_bar.removeTab(0)
         while self._content_stack.count() > 1:
-            self._content_stack.removeWidget(self._content_stack.widget(1))
-        self._entity_tabs.clear()
-        self._tab_entities.clear()
+            widget = self._content_stack.widget(1)
+            self._content_stack.removeWidget(widget)
+            widget.deleteLater()
 
     def _target_folder(self) -> Folder | None:
         if not self._workspace:
@@ -130,11 +147,11 @@ class WorkspacePage(QWidget):
         if parent is None:
             return
 
-        name, ok = QInputDialog.getText(self, "New Folder", "Folder name:")
-        if not ok:
+        dialog = CreateFolderDialog(self._workspace, self)
+        if dialog.exec() != QDialog.DialogCode.Accepted:
             return
 
-        name = name.strip()
+        name = dialog.folder_name()
         if not name or parent.find_child_by_name(name):
             return
 
@@ -163,19 +180,33 @@ class WorkspacePage(QWidget):
         self._tree.populate(self._workspace.root)
         self._open_entity_tab(entity)
 
+    def _find_entity_tab(self, entity_id: str) -> int:
+        for i in range(self._tab_bar.count()):
+            if self._tab_bar.tabData(i) == entity_id:
+                return i
+        return -1
+
     def _open_entity_tab(self, entity: Entity):
-        if entity.id in self._entity_tabs:
-            self._tab_bar.setCurrentIndex(self._entity_tabs[entity.id])
+        index = self._find_entity_tab(entity.id)
+        if index != -1:
+            self._tab_bar.setCurrentIndex(index)
             return
 
         index = self._tab_bar.addTab(entity.name)
+        self._tab_bar.setTabData(index, entity.id)
+
         placeholder = QLabel(f"Entity: {entity.name}")
         placeholder.setAlignment(Qt.AlignCenter)
         self._content_stack.addWidget(placeholder)
-
-        self._entity_tabs[entity.id] = index
-        self._tab_entities[index] = entity
         self._tab_bar.setCurrentIndex(index)
+
+    def _close_tab(self, index: int):
+        widget_index = index + 1
+        widget = self._content_stack.widget(widget_index)
+        if widget:
+            self._content_stack.removeWidget(widget)
+            widget.deleteLater()
+        self._tab_bar.removeTab(index)
 
     def _on_tab_changed(self, index: int):
         if index < 0:
