@@ -49,6 +49,7 @@ class WorkspacePage(QWidget):
         menu.addSeparator()
         menu.addAction("Exit", self.exit_requested.emit)
         self._menu_btn.setMenu(menu)
+        self._menu_btn.setStyleSheet("QToolButton::menu-indicator { image: none; width: 0px; }")
         top_bar.addWidget(self._menu_btn)
         top_bar.addStretch()
         root_layout.addLayout(top_bar)
@@ -90,6 +91,11 @@ class WorkspacePage(QWidget):
                 padding: 6px 12px;
                 min-width: 80px;
                 max-width: 160px;
+            }
+            QTabBar::tab:selected {
+                background-color: #2f81f7;
+                color: white;
+                font-weight: 600;
             }
             QTabBar::close-button {
                 subcontrol-position: right;

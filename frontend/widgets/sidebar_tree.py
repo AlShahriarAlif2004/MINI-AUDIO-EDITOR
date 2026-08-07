@@ -29,15 +29,19 @@ class SidebarTree(QTreeWidget):
         tree_item.setData(0, Qt.UserRole, item)
 
         if isinstance(item, Folder):
-            tree_item.setChildIndicatorPolicy(
-                QTreeWidgetItem.ChildIndicatorPolicy.ShowIndicator
-            )
-            for child in item.children:
-                tree_item.addChild(self._make_item(child))
-        else:
-            tree_item.setChildIndicatorPolicy(
-                QTreeWidgetItem.ChildIndicatorPolicy.DontShowIndicatorWhenChildless
-            )
+            if item.children:
+                for child in item.children:
+                    tree_item.addChild(self._make_item(child))
+            else:
+                # Hidden placeholder so the expand arrow always shows,
+                # even for an empty folder. It never renders since it's
+                # hidden, but its presence makes childCount() > 0, which
+                # is what actually drives the branch indicator reliably
+                # (unlike ChildIndicatorPolicy.ShowIndicator, which some
+                # styles — Fusion included — ignore for zero-child items).
+                placeholder = QTreeWidgetItem([""])
+                placeholder.setHidden(True)
+                tree_item.addChild(placeholder)
 
         return tree_item
 
@@ -68,5 +72,11 @@ class SidebarTree(QTreeWidget):
                 self.folder_clicked.emit(data)
                 event.accept()
                 return
+
+        if item is None and event.button() == Qt.LeftButton:
+            # Clicked empty space — deselect so new items land in root,
+            # matching VSCode behavior.
+            self.clearSelection()
+            self.setCurrentItem(None)
 
         super().mouseReleaseEvent(event)
