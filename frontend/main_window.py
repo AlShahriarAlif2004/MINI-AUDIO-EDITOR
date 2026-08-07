@@ -1,26 +1,95 @@
-from PySide6.QtWidgets import QMainWindow, QStackedWidget
+from PySide6.QtGui import QCloseEvent
+from PySide6.QtWidgets import QMainWindow, QMessageBox, QStackedWidget
+
+from backend.workspace_model import Workspace
 from frontend.views.home_page import HomePage
+from frontend.views.workspace_page import WorkspacePage
+from frontend.workspace_io import create_workspace, open_workspace
 
 
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
         self.setWindowTitle("Mini Audio Editor")
-        self.resize(480, 360)  # small size for the home page
+
+        self._current_workspace: Workspace | None = None
 
         self.stack = QStackedWidget()
         self.setCentralWidget(self.stack)
 
         self.home_page = HomePage()
+        self.workspace_page = WorkspacePage()
         self.stack.addWidget(self.home_page)
+        self.stack.addWidget(self.workspace_page)
 
         self.home_page.new_workspace_requested.connect(self._on_new_workspace)
         self.home_page.open_workspace_requested.connect(self._on_open_workspace)
 
+        self.workspace_page.new_workspace_requested.connect(self._on_new_workspace)
+        self.workspace_page.open_workspace_requested.connect(self._on_open_workspace)
+        self.workspace_page.exit_requested.connect(self._on_exit_workspace)
+
     def _on_new_workspace(self):
-        # placeholder — next step will add the "name your workspace" flow
-        print("New Workspace clicked")
+        if not self._confirm_leave_workspace():
+            return
+
+        workspace = create_workspace(self)
+        if workspace:
+            self._enter_workspace(workspace)
 
     def _on_open_workspace(self):
-        # placeholder — next step will add the folder/file picker
-        print("Open Workspace clicked")
+        if not self._confirm_leave_workspace():
+            return
+
+        workspace = open_workspace(self)
+        if workspace:
+            self._enter_workspace(workspace)
+
+    def _on_exit_workspace(self):
+        if not self._confirm_leave_workspace():
+            return
+        self._leave_workspace()
+
+    def _enter_workspace(self, workspace: Workspace):
+        self._current_workspace = workspace
+        self.workspace_page.set_workspace(workspace)
+        self.stack.setCurrentWidget(self.workspace_page)
+        self.setWindowTitle(f"Mini Audio Editor — {workspace.name}")
+
+    def _leave_workspace(self):
+        self._current_workspace = None
+        self.stack.setCurrentWidget(self.home_page)
+        self.setWindowTitle("Mini Audio Editor")
+
+    def _confirm_leave_workspace(self) -> bool:
+        """Prompt to save if the current workspace has unsaved changes."""
+        if self._current_workspace is None or not self._current_workspace.dirty:
+            return True
+
+        reply = QMessageBox.question(
+            self,
+            "Save Workspace",
+            "Save changes before leaving?",
+            QMessageBox.Save | QMessageBox.Discard | QMessageBox.Cancel,
+            QMessageBox.Save,
+        )
+
+        if reply == QMessageBox.Cancel:
+            return False
+        if reply == QMessageBox.Save:
+            try:
+                self._current_workspace.save()
+            except OSError as exc:
+                QMessageBox.critical(
+                    self,
+                    "Save Failed",
+                    f"Could not save workspace:\n{exc}",
+                )
+                return False
+        return True
+
+    def closeEvent(self, event: QCloseEvent):
+        if not self._confirm_leave_workspace():
+            event.ignore()
+            return
+        super().closeEvent(event)

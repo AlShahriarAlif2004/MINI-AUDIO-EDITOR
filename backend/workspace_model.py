@@ -156,6 +156,8 @@ class Workspace:
         if not self.path:
             raise ValueError("Workspace has no path; cannot save.")
 
+        self.name = os.path.basename(os.path.normpath(self.path))
+
         os.makedirs(self.path, exist_ok=True)
         assets_dir = os.path.join(self.path, "assets")
         os.makedirs(assets_dir, exist_ok=True)
