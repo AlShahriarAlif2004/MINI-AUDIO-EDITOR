@@ -17,6 +17,7 @@ from backend.workspace_model import Entity, Folder, Workspace
 from frontend.dialogs.create_entity_dialog import CreateEntityDialog
 from frontend.dialogs.create_folder_dialog import CreateFolderDialog
 from frontend.widgets.sidebar_tree import SidebarTree
+from frontend.widgets.entity_plot import EntityPlotView
 
 
 class WorkspacePage(QWidget):
@@ -201,10 +202,10 @@ class WorkspacePage(QWidget):
         index = self._tab_bar.addTab(entity.name)
         self._tab_bar.setTabData(index, entity.id)
 
-        placeholder = QLabel(f"Entity: {entity.name}")
-        placeholder.setAlignment(Qt.AlignCenter)
-        self._content_stack.addWidget(placeholder)
+        entity_view = EntityPlotView(entity)
+        self._content_stack.addWidget(entity_view)
         self._tab_bar.setCurrentIndex(index)
+        self._content_stack.setCurrentWidget(entity_view)
 
     def _close_tab(self, index: int):
         widget_index = index + 1

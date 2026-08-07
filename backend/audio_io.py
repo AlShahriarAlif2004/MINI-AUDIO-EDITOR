@@ -3,6 +3,7 @@ import wave
 from abc import ABC, abstractmethod
 from backend.discrete_signal import Discrete_Signal
 from backend.audio_clip import AudioClip
+import soundfile as sf
 
 class AudioClipIO(ABC):
     @staticmethod
@@ -17,69 +18,37 @@ class AudioClipIO(ABC):
 
 class WavIO(AudioClipIO):
 
-    _DTYPE_BY_WIDTH = {
-        1: np.uint8,   # WAV 8-bit is unsigned
-        2: np.int16,
-        4: np.int32,
+    _SUBTYPE_BY_WIDTH = {
+        1: "PCM_U8",
+        2: "PCM_16",
+        3: "PCM_24",
+        4: "PCM_32",
     }
 
     @staticmethod
     def load(path) -> AudioClip:
-        with wave.open(path, "rb") as wf:
-            n_channels = wf.getnchannels()
-            sample_width = wf.getsampwidth()
-            sample_rate = wf.getframerate()
-            n_frames = wf.getnframes()
-
-            raw = wf.readframes(n_frames)
-
-        if sample_width not in WavIO._DTYPE_BY_WIDTH:
-            raise ValueError(f"Unsupported WAV sample width: {sample_width} bytes")
-
-        dtype = WavIO._DTYPE_BY_WIDTH[sample_width]
-        data = np.frombuffer(raw, dtype=dtype)
-
-        # de-interleave: [L0,R0,L1,R1,...] -> per-channel arrays
-        data = data.reshape(-1, n_channels)
-
-        # normalize to float64 in [-1, 1]
-        if dtype == np.uint8:
-            float_data = (data.astype(np.float64) - 128) / 128.0
-        else:
-            max_val = float(np.iinfo(dtype).max)
-            float_data = data.astype(np.float64) / max_val
+        # always_2d=True gives shape (frames, channels) even for mono
+        data, sample_rate = sf.read(path, dtype="float64", always_2d=True)
 
         channels = []
-        for c in range(n_channels):
+        for c in range(data.shape[1]):
             channels.append(
-                Discrete_Signal(float_data[:, c], sample_rate, start_index=0)
+                Discrete_Signal(data[:, c], sample_rate, start_index=0)
             )
 
         return AudioClip(channels, name=None)
 
     @staticmethod
     def unload(clip: AudioClip, path, sample_width=2):
-        if sample_width not in WavIO._DTYPE_BY_WIDTH:
+        if sample_width not in WavIO._SUBTYPE_BY_WIDTH:
             raise ValueError(f"Unsupported WAV sample width: {sample_width} bytes")
 
-        dtype = WavIO._DTYPE_BY_WIDTH[sample_width]
+        subtype = WavIO._SUBTYPE_BY_WIDTH[sample_width]
 
         stacked = np.stack([ch.samples for ch in clip.channels], axis=1)
         stacked = np.clip(stacked, -1.0, 1.0)
 
-        if dtype == np.uint8:
-            int_data = (stacked * 128 + 128).astype(dtype)
-        else:
-            max_val = float(np.iinfo(dtype).max)
-            int_data = (stacked * max_val).astype(dtype)
-
-        interleaved = int_data.reshape(-1)
-
-        with wave.open(path, "wb") as wf:
-            wf.setnchannels(clip.num_channels)
-            wf.setsampwidth(sample_width)
-            wf.setframerate(clip.sample_rate)
-            wf.writeframes(interleaved.tobytes())
+        sf.write(path, stacked, clip.sample_rate, subtype=subtype)
 
 class MP3IO(AudioClipIO):
     """
