@@ -193,6 +193,10 @@ class WorkspacePage(QWidget):
                 return i
         return -1
 
+    def _on_entity_modified(self):
+        if self._workspace:
+            self._workspace.mark_dirty()
+
     def _open_entity_tab(self, entity: Entity):
         index = self._find_entity_tab(entity.id)
         if index != -1:
@@ -203,6 +207,7 @@ class WorkspacePage(QWidget):
         self._tab_bar.setTabData(index, entity.id)
 
         entity_view = EntityPlotView(entity)
+        entity_view.entity_modified.connect(self._on_entity_modified)
         self._content_stack.addWidget(entity_view)
         self._tab_bar.setCurrentIndex(index)
         self._content_stack.setCurrentWidget(entity_view)

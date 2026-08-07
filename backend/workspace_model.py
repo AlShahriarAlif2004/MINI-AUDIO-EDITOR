@@ -65,10 +65,13 @@ class Folder(WorkspaceItem):
 class Entity(WorkspaceItem):
     """Wraps an AudioClip plus time-division boundaries."""
 
-    def __init__(self, name, clip, divisions=None, parent=None, id=None):
+    def __init__(self, name, clip, divisions=None, channel_markers=None, parent=None, id=None):
         super().__init__(name, parent)
         self.clip = clip
-        self.divisions = sorted(divisions) if divisions else []
+        self.divisions = sorted(divisions) if divisions else []          # Overall plot markers
+        self.channel_markers = {                                        # per-channel markers
+            int(k): sorted(v) for k, v in (channel_markers or {}).items()
+        }
         self.id = id or uuid.uuid4().hex
 
     @classmethod
@@ -78,7 +81,12 @@ class Entity(WorkspaceItem):
 
     @classmethod
     def from_entity(cls, other, new_name):
-        return cls(new_name, other.clip.copy(), divisions=list(other.divisions))
+        return cls(
+            new_name,
+            other.clip.copy(),
+            divisions=list(other.divisions),
+            channel_markers={k: list(v) for k, v in other.channel_markers.items()},
+        )
 
     def get_segments(self):
         """Return list of (start_time, end_time) tuples covering the whole clip."""
@@ -104,6 +112,7 @@ class Entity(WorkspaceItem):
             "name": self.name,
             "id": self.id,
             "divisions": list(self.divisions),
+            "channel_markers": {str(k): list(v) for k, v in self.channel_markers.items()},
         }
 
     @classmethod
@@ -123,8 +132,31 @@ class Entity(WorkspaceItem):
             data["name"],
             clip,
             divisions=data.get("divisions", []),
+            channel_markers=data.get("channel_markers", {}),
             id=entity_id,
         )
+
+    def add_channel_marker(self, channel_index, time):
+        start_time = self.clip.get_time(self.clip.start_index)
+        end_time = self.clip.get_time(self.clip.end_index())
+        if not (start_time < time < end_time):
+            return
+        markers = self.channel_markers.setdefault(channel_index, [])
+        if time not in markers:
+            markers.append(time)
+            markers.sort()
+
+    def markers_for(self, channel_index):
+        """channel_index=None means the Overall plot."""
+        if channel_index is None:
+            return self.divisions
+        return self.channel_markers.get(channel_index, [])
+
+    def add_marker(self, channel_index, time):
+        if channel_index is None:
+            self.add_division(time)
+        else:
+            self.add_channel_marker(channel_index, time)
 
 
 class Workspace:

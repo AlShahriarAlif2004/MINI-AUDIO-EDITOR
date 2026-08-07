@@ -1,4 +1,5 @@
 import numpy as np
+from PySide6.QtCore import Signal
 from PySide6.QtWidgets import QWidget, QVBoxLayout, QLabel, QScrollArea
 
 from backend.workspace_model import Entity
@@ -9,6 +10,8 @@ _CHANNEL_COLORS = ["#4fc3f7", "#ff8a65", "#81c784", "#ba68c8", "#ffd54f", "#a188
 
 
 class EntityPlotView(QWidget):
+
+    entity_modified = Signal()
     """
     Shown when an entity tab is active: a 'Channels' section (one scrolling
     waveform per channel, skipped for mono clips) and an 'Overall' section
@@ -53,9 +56,12 @@ class EntityPlotView(QWidget):
                     sample_rate=channel.sample_rate,
                     audio_data=channel.samples.astype(np.float32),
                     group=self._group,
+                    entity=self._entity,
+                    channel_index=i,
                     is_driver=False,
                 )
                 layout.addWidget(player)
+                player.marker_added.connect(self.entity_modified.emit)
 
         overall_label = QLabel("Overall")
         overall_label.setStyleSheet("font-size: 16px; font-weight: 600;")
@@ -71,9 +77,12 @@ class EntityPlotView(QWidget):
             sample_rate=clip.sample_rate,
             audio_data=self._playback_mix(clip),
             group=self._group,
+            entity=self._entity,
+            channel_index=None,
             is_driver=True,
         )
         layout.addWidget(overall_player)
+        overall_player.marker_added.connect(self.entity_modified.emit)
 
         layout.addStretch()
         scroll.setWidget(container)

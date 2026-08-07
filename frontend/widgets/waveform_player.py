@@ -27,10 +27,12 @@ class PlaybackGroup(QObject):
 
     active_changed = Signal(object)     # WaveformPlayer that became active, or None
     position_broadcast = Signal(float)  # seconds; emitted only by the driver while playing
+    clip_active_changed = Signal(object)   # WaveformPlayer in divide-mode, or None
 
     def __init__(self):
         super().__init__()
         self.active_player = None
+        self.clip_active_player = None
 
     @classmethod
     def get_instance(cls) -> "PlaybackGroup":
@@ -49,6 +51,18 @@ class PlaybackGroup(QObject):
         if self.active_player is player:
             self.active_player = None
             self.active_changed.emit(None)
+
+    def request_clip_mode(self, player) -> bool:
+        if self.clip_active_player is not None:
+            return False
+        self.clip_active_player = player
+        self.clip_active_changed.emit(player)
+        return True
+
+    def release_clip_mode(self, player):
+        if self.clip_active_player is player:
+            self.clip_active_player = None
+            self.clip_active_changed.emit(None)
 
     def broadcast_position(self, seconds):
         self.position_broadcast.emit(seconds)
@@ -104,28 +118,66 @@ class _PlaybackEngine:
             self._segment_start = None
 
 class _DraggablePlotWidget(pg.PlotWidget):
-    """PlotWidget supporting relative (grab-and-drag) seeking, like dragging
-    an image: cursor movement distance == content movement distance.
-    Audio is only touched on drag start/end, never on every move, so the
-    drag stays smooth even while the underlying player is playing."""
+    """Supports both: (a) relative image-style panning during playback/pause,
+    and (b) divide-mode, where a green divisor line can be dragged (with
+    magnetic hit-tolerance) and, if allowed, the graph can still be panned."""
+
+    _DIVISOR_HIT_TOLERANCE_PX = 12
 
     def __init__(self, parent=None):
         super().__init__(parent)
         self.drag_enabled = False
-        self.on_drag_start = None    # callback()
-        self.on_seek = None          # callback(time_delta: float) — relative, visual step
-        self.on_drag_end = None      # callback()
+        self.on_drag_start = None
+        self.on_seek = None
+        self.on_drag_end = None
         self._dragging = False
         self._last_x = None
         self._pixels_per_second = None
 
+        self._clip_mode = False
+        self._clip_allow_graph_drag = False
+        self._divisor_getter = None
+        self._divisor_setter = None
+        self._time_to_pixel = None
+        self._dragging_divisor = False
+
+    def set_clip_mode(self, enabled, allow_graph_drag=False,
+                       divisor_getter=None, divisor_setter=None, time_to_pixel=None):
+        self._clip_mode = enabled
+        self._clip_allow_graph_drag = allow_graph_drag
+        self._divisor_getter = divisor_getter
+        self._divisor_setter = divisor_setter
+        self._time_to_pixel = time_to_pixel
+        self._dragging_divisor = False
+        self._dragging = False
+
     def _compute_pixels_per_second(self):
-        view_range = self.getPlotItem().vb.viewRange()[0]  # [xmin, xmax]
+        view_range = self.getPlotItem().vb.viewRange()[0]
         span = view_range[1] - view_range[0]
         width = max(1, self.width())
         return width / span if span > 0 else 1.0
 
+    def _near_divisor(self, event_x):
+        if not self._divisor_getter or not self._time_to_pixel:
+            return False
+        divisor_px = self._time_to_pixel(self._divisor_getter())
+        return abs(event_x - divisor_px) <= self._DIVISOR_HIT_TOLERANCE_PX
+
     def mousePressEvent(self, event):
+        if self._clip_mode and event.button() == Qt.LeftButton:
+            if self._near_divisor(event.pos().x()):
+                self._dragging_divisor = True
+                event.accept()
+                return
+            if self._clip_allow_graph_drag and self.drag_enabled:
+                self._dragging = True
+                self._last_x = event.pos().x()
+                self._pixels_per_second = self._compute_pixels_per_second()
+                if self.on_drag_start:
+                    self.on_drag_start()
+            event.accept()
+            return
+
         if self.drag_enabled and event.button() == Qt.LeftButton:
             self._dragging = True
             self._last_x = event.pos().x()
@@ -137,17 +189,45 @@ class _DraggablePlotWidget(pg.PlotWidget):
         super().mousePressEvent(event)
 
     def mouseMoveEvent(self, event):
+        if self._clip_mode:
+            if self._dragging_divisor and self._divisor_setter:
+                view_box = self.getPlotItem().vb
+                scene_pos = self.mapToScene(event.pos())
+                t = view_box.mapSceneToView(scene_pos).x()
+                self._divisor_setter(t)
+                event.accept()
+                return
+            if self._dragging and self._clip_allow_graph_drag:
+                dx = event.pos().x() - self._last_x
+                self._last_x = event.pos().x()
+                if self.on_seek and self._pixels_per_second:
+                    self.on_seek(-dx / self._pixels_per_second)
+                event.accept()
+                return
+            event.accept()
+            return
+
         if self.drag_enabled and self._dragging:
             dx = event.pos().x() - self._last_x
             self._last_x = event.pos().x()
             if self.on_seek and self._pixels_per_second:
-                dt = -dx / self._pixels_per_second
-                self.on_seek(dt)
+                self.on_seek(-dx / self._pixels_per_second)
             event.accept()
             return
         super().mouseMoveEvent(event)
 
     def mouseReleaseEvent(self, event):
+        if self._clip_mode and event.button() == Qt.LeftButton:
+            was_graph_drag = self._dragging and self._clip_allow_graph_drag and not self._dragging_divisor
+            self._dragging_divisor = False
+            self._dragging = False
+            self._last_x = None
+            self._pixels_per_second = None
+            if was_graph_drag and self.on_drag_end:
+                self.on_drag_end()
+            event.accept()
+            return
+
         if self.drag_enabled and event.button() == Qt.LeftButton:
             self._dragging = False
             self._last_x = None
@@ -160,20 +240,22 @@ class _DraggablePlotWidget(pg.PlotWidget):
 
 
 class WaveformPlayer(QWidget):
-    """One waveform plot with its own Play/Pause/Reset + a disabled Clip button."""
-
     STATE_STOPPED = "stopped"
     STATE_PLAYING = "playing"
     STATE_PAUSED = "paused"
 
+    marker_added = Signal()
+
     def __init__(
         self,
         times: np.ndarray,
-        series: list,               # [(samples, color, label), ...] — >1 entry only for 'Overall'
+        series: list,
         sample_rate: int,
-        audio_data: np.ndarray,     # what's actually played: mono for a channel, mixed for overall
+        audio_data: np.ndarray,
         group: PlaybackGroup,
-        is_driver: bool = False,    # True only for the 'Overall' plot
+        entity,
+        channel_index=None,       # None = Overall plot
+        is_driver: bool = False,
         parent=None,
     ):
         super().__init__(parent)
@@ -182,12 +264,18 @@ class WaveformPlayer(QWidget):
         self._sample_rate = sample_rate
         self._group = group
         self._is_driver = is_driver
+        self._entity = entity
+        self._channel_index = channel_index
 
         self._start_time = float(times[0]) if len(times) else 0.0
         self._end_time = float(times[-1]) if len(times) else 0.0
 
         self._engine = _PlaybackEngine(audio_data, sample_rate)
         self._state = self.STATE_STOPPED
+
+        self._clip_mode = False
+        self._divisor_time = None
+        self._entered_clip_from_pause = False
 
         self._timer = QTimer(self)
         self._timer.setInterval(_TICK_MS)
@@ -198,11 +286,11 @@ class WaveformPlayer(QWidget):
 
         self._group.active_changed.connect(self._on_group_active_changed)
         self._group.position_broadcast.connect(self._on_driver_position)
+        self._group.clip_active_changed.connect(self._on_group_clip_active_changed)
 
-        # If a plot elsewhere (this tab or another) is already playing/paused
-        # when this widget is created, reflect that lock immediately instead
-        # of waiting for the next active_changed signal.
         self._on_group_active_changed(self._group.active_player)
+        self._on_group_clip_active_changed(self._group.clip_active_player)
+        self._refresh_clip_enabled()
 
     # ---------- UI ----------
 
@@ -230,6 +318,24 @@ class WaveformPlayer(QWidget):
         self._playhead.setVisible(False)
         self._plot.addItem(self._playhead)
 
+        self._start_boundary = pg.InfiniteLine(pos=self._start_time, angle=90,
+                                                 pen=pg.mkPen(color="#ffffff", width=1))
+        self._end_boundary = pg.InfiniteLine(pos=self._end_time, angle=90,
+                                              pen=pg.mkPen(color="#ffffff", width=1))
+        self._plot.addItem(self._start_boundary)
+        self._plot.addItem(self._end_boundary)
+
+        self._marker_lines = []
+        for t in self._entity.markers_for(self._channel_index):
+            self._add_marker_line(t)
+
+        self._divisor_line = pg.InfiniteLine(angle=90, movable=False,
+                                              pen=pg.mkPen(color="#4caf50", width=2))
+        self._divisor_line.addMarker('t1', position=0.03, size=14)
+        self._divisor_line.addMarker('t3', position=0.97, size=14)
+        self._divisor_line.setVisible(False)
+        self._plot.addItem(self._divisor_line)
+
         layout.addWidget(self._plot)
 
         controls = QHBoxLayout()
@@ -239,16 +345,24 @@ class WaveformPlayer(QWidget):
         self._pause_btn = QPushButton("⏸ Pause")
         self._reset_btn = QPushButton("⏹ Reset")
         self._clip_btn = QPushButton("✂ Clip")
-        self._clip_btn.setEnabled(False)
-        self._clip_btn.setToolTip("Coming soon")
 
         self._play_btn.clicked.connect(self._on_play_clicked)
         self._pause_btn.clicked.connect(self._on_pause_clicked)
         self._reset_btn.clicked.connect(self._on_reset_clicked)
+        self._clip_btn.clicked.connect(self._on_clip_clicked)
 
-        for btn in (self._play_btn, self._pause_btn, self._reset_btn, self._clip_btn):
+        self._divide_btn = QPushButton("✔ Divide")
+        self._cancel_btn = QPushButton("✕ Cancel")
+        self._divide_btn.setVisible(False)
+        self._cancel_btn.setVisible(False)
+        self._divide_btn.clicked.connect(self._on_divide_clicked)
+        self._cancel_btn.clicked.connect(self._on_cancel_clicked)
+
+        for btn in (self._play_btn, self._pause_btn, self._reset_btn, self._clip_btn,
+                    self._divide_btn, self._cancel_btn):
             btn.setFixedWidth(90)
             controls.addWidget(btn)
+
         controls.addStretch()
 
         layout.addLayout(controls)
@@ -262,6 +376,107 @@ class WaveformPlayer(QWidget):
         self._play_btn.setText("▶ Resume" if paused else "▶ Play")
         self._pause_btn.setVisible(playing)
         self._reset_btn.setVisible(playing or paused)
+
+    def _add_marker_line(self, t):
+        line = pg.InfiniteLine(pos=t, angle=90, pen=pg.mkPen(color="#ffffff", width=1))
+        self._plot.addItem(line)
+        self._marker_lines.append(line)
+
+    def _update_clip_related_visibility(self):
+        self._clip_btn.setVisible(not self._clip_mode)
+        self._divide_btn.setVisible(self._clip_mode)
+        self._cancel_btn.setVisible(self._clip_mode)
+
+    def _clip_button_allowed(self):
+        active = self._group.active_player
+        if active is None:
+            return True
+        if active is self and self._state == self.STATE_PAUSED:
+            return True
+        return False
+
+    def _refresh_clip_enabled(self):
+        if self._clip_mode:
+            return
+        if self._group.clip_active_player is not None and self._group.clip_active_player is not self:
+            self._clip_btn.setEnabled(False)
+            return
+        self._clip_btn.setEnabled(self._clip_button_allowed())
+
+    def _refresh_play_enabled(self):
+        if self._clip_mode:
+            self._play_btn.setEnabled(False)
+            return
+        active = self._group.active_player
+        self._play_btn.setEnabled(active is None or active is self)
+
+    def _on_group_clip_active_changed(self, clip_player):
+        if clip_player is None:
+            self._refresh_clip_enabled()
+            self._refresh_play_enabled()
+            return
+        if clip_player is self:
+            return
+        self._clip_btn.setEnabled(False)
+        self._play_btn.setEnabled(False)
+
+    def _plot_time_to_pixel(self, t):
+        view_box = self._plot.getPlotItem().vb
+        scene_pt = view_box.mapViewToScene(pg.Point(t, 0))
+        return self._plot.mapFromScene(scene_pt).x()
+
+    def _set_divisor_time(self, t):
+        self._divisor_time = self._clamp_time(t)
+        self._divisor_line.setPos(self._divisor_time)
+
+    def _on_clip_clicked(self):
+        if not self._group.request_clip_mode(self):
+            return
+
+        self._entered_clip_from_pause = (self._state == self.STATE_PAUSED)
+        self._clip_mode = True
+
+        if self._entered_clip_from_pause:
+            self._divisor_time = self._clamp_time(self._current_center_time())
+        else:
+            self._divisor_time = self._clamp_time((self._start_time + self._end_time) / 2.0)
+
+        self._divisor_line.setPos(self._divisor_time)
+        self._divisor_line.setVisible(True)
+
+        self._plot.set_clip_mode(
+            enabled=True,
+            allow_graph_drag=self._entered_clip_from_pause,
+            divisor_getter=lambda: self._divisor_time,
+            divisor_setter=self._set_divisor_time,
+            time_to_pixel=self._plot_time_to_pixel,
+        )
+
+        self._update_clip_related_visibility()
+        self._play_btn.setEnabled(False)
+        self._reset_btn.setEnabled(False)
+
+    def _exit_clip_mode(self):
+        self._clip_mode = False
+        self._divisor_line.setVisible(False)
+        self._plot.set_clip_mode(enabled=False)
+        self._update_clip_related_visibility()
+        self._reset_btn.setEnabled(True)
+        self._group.release_clip_mode(self)
+        self._refresh_play_enabled()
+        self._refresh_clip_enabled()
+
+    def _on_divide_clicked(self):
+        t = self._divisor_time
+        existing = set(self._entity.markers_for(self._channel_index))
+        self._entity.add_marker(self._channel_index, t)
+        if t not in existing:
+            self._add_marker_line(t)
+        self._exit_clip_mode()
+        self.marker_added.emit()
+
+    def _on_cancel_clicked(self):
+        self._exit_clip_mode()
 
     # ---------- view helpers ----------
 
@@ -283,12 +498,14 @@ class WaveformPlayer(QWidget):
         self._engine.start_or_resume()
         self._timer.start()
         self._update_button_visibility()
+        self._refresh_clip_enabled() 
 
     def _on_pause_clicked(self):
         self._engine.pause()
         self._timer.stop()
         self._state = self.STATE_PAUSED
         self._update_button_visibility()
+        self._refresh_clip_enabled() 
 
     def _on_reset_clicked(self):
         self._do_reset()
@@ -300,6 +517,7 @@ class WaveformPlayer(QWidget):
         self._show_overview()
         self._update_button_visibility()
         self._group.release(self)
+        self._refresh_clip_enabled()  
 
     def _on_tick(self):
         if self._engine.is_finished():
