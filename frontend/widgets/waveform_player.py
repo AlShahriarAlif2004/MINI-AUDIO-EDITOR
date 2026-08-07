@@ -255,7 +255,7 @@ class _DraggablePlotWidget(pg.PlotWidget):
             dx = event.pos().x() - self._last_x
             self._last_x = event.pos().x()
             if self.on_seek and self._pixels_per_second:
-                self.on_seek(-dx / self._pixels_per_second)
+                self.on_seek(dx / self._pixels_per_second)
             event.accept()
             return
 
@@ -388,6 +388,8 @@ class WaveformPlayer(QWidget):
             self._curve_items.append(curve)
 
         self._playhead = pg.InfiniteLine(angle=90, pen=pg.mkPen(color="#ff4d4d", width=1.5))
+        self._playhead.addMarker('^', position=0.0, size=14)
+        self._playhead.addMarker('v', position=1.0, size=14)
         self._playhead.setVisible(False)
         self._plot.addItem(self._playhead)
 
@@ -657,6 +659,11 @@ class WaveformPlayer(QWidget):
             curve.setData(preview_times, samples)
         preview_end = float(preview_times[-1]) if len(preview_times) > 0 else start + 0.001
         self._end_boundary.setPos(preview_end)
+
+        # Keep division/marker lines aligned with the stretched waveform.
+        for line, original_t in zip(self._marker_lines, self._entity.markers_for(self._channel_index)):
+            line.setPos(start + (original_t - start) * factor)
+
         self._plot.setXRange(start, max(preview_end, start + 0.001), padding=0.02)
 
     def exit_timescale_preview(self):
@@ -668,6 +675,10 @@ class WaveformPlayer(QWidget):
             curve.setData(self._times, samples)
         self._start_boundary.setPos(self._start_time)
         self._end_boundary.setPos(self._end_time)
+    
+        for line, original_t in zip(self._marker_lines, self._entity.markers_for(self._channel_index)):
+            line.setPos(original_t)                     # ← add
+    
         self._show_overview()
         self._refresh_segment_mode()
 
@@ -813,6 +824,7 @@ class WaveformPlayer(QWidget):
         self._timer.start()
         self._update_button_visibility()
         self._refresh_clip_enabled()
+        self._refresh_segment_mode()
 
     def _on_pause_clicked(self):
         (self._trim_engine if self._trim_mode else self._engine).pause()
@@ -826,6 +838,7 @@ class WaveformPlayer(QWidget):
                 self._show_window_centered_at(self._current_center_time())
         self._update_button_visibility()
         self._refresh_clip_enabled()
+        self._refresh_segment_mode()  
 
     def _on_reset_clicked(self):
         self._do_reset()
@@ -842,6 +855,7 @@ class WaveformPlayer(QWidget):
         self._update_button_visibility()
         self._group.release(self)
         self._refresh_clip_enabled()
+        self._refresh_segment_mode()  
 
     def _on_tick(self):
         engine = self._trim_engine if self._trim_mode else self._engine
@@ -894,7 +908,10 @@ class WaveformPlayer(QWidget):
             return
 
         old_center = self._current_center_time()
-        new_time = self._clamp_time(old_center + dt)
+        # Edit mode: graph is fixed, so dragging right should move the line
+        # right (direct mapping). Non-edit mode keeps the old "pan the image"
+        # feel, where dragging right reveals earlier content.
+        new_time = self._clamp_time(old_center + dt) if self._edit_mode else self._clamp_time(old_center - dt)
         actual_dt = new_time - old_center
 
         frame = int(round((new_time - self._start_time) * self._sample_rate))

@@ -698,11 +698,17 @@ class WorkspacePage(QWidget):
             widget.deleteLater()
         self._tab_bar.removeTab(index)
 
+    def _force_stop_active_playback(self):
+        active = self._playback_group.active_player
+        if active is not None and hasattr(active, "force_idle"):
+            active.force_idle()
+
     def _on_tab_changed(self, index: int):
         self._cancel_trim_if_active()
         self._cancel_timescale_if_active()
+        self._force_stop_active_playback()      # ← add, before selection clearing
         self._clear_all_plot_selections()
-
+    
         if index < 0:
             self._content_stack.setCurrentWidget(self._empty_label)
             return
