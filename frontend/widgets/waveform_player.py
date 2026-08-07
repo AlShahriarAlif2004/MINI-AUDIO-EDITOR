@@ -105,12 +105,16 @@ class _PlaybackEngine:
 
 class _DraggablePlotWidget(pg.PlotWidget):
     """PlotWidget supporting relative (grab-and-drag) seeking, like dragging
-    an image: cursor movement distance == content movement distance."""
+    an image: cursor movement distance == content movement distance.
+    Audio is only touched on drag start/end, never on every move, so the
+    drag stays smooth even while the underlying player is playing."""
 
     def __init__(self, parent=None):
         super().__init__(parent)
         self.drag_enabled = False
-        self.on_seek = None          # callback(time_delta: float) — relative!
+        self.on_drag_start = None    # callback()
+        self.on_seek = None          # callback(time_delta: float) — relative, visual step
+        self.on_drag_end = None      # callback()
         self._dragging = False
         self._last_x = None
         self._pixels_per_second = None
@@ -126,6 +130,8 @@ class _DraggablePlotWidget(pg.PlotWidget):
             self._dragging = True
             self._last_x = event.pos().x()
             self._pixels_per_second = self._compute_pixels_per_second()
+            if self.on_drag_start:
+                self.on_drag_start()
             event.accept()
             return
         super().mousePressEvent(event)
@@ -145,9 +151,13 @@ class _DraggablePlotWidget(pg.PlotWidget):
         if self.drag_enabled and event.button() == Qt.LeftButton:
             self._dragging = False
             self._last_x = None
+            self._pixels_per_second = None
+            if self.on_drag_end:
+                self.on_drag_end()
             event.accept()
             return
         super().mouseReleaseEvent(event)
+
 
 class WaveformPlayer(QWidget):
     """One waveform plot with its own Play/Pause/Reset + a disabled Clip button."""
@@ -202,7 +212,9 @@ class WaveformPlayer(QWidget):
         layout.setSpacing(4)
 
         self._plot = _DraggablePlotWidget()
+        self._plot.on_drag_start = self._on_drag_start
         self._plot.on_seek = self._on_seek
+        self._plot.on_drag_end = self._on_drag_end
         self._plot.setBackground(None)
         self._plot.showGrid(x=True, y=True, alpha=0.3)
         self._plot.setYRange(-1.05, 1.05)
@@ -306,17 +318,38 @@ class WaveformPlayer(QWidget):
     def _clamp_time(self, t):
         return max(self._start_time, min(t, self._end_time))
 
+    def _on_drag_start(self):
+        if self._state not in (self.STATE_PLAYING, self.STATE_PAUSED):
+            return
+
+        self._drag_was_playing = (self._state == self.STATE_PLAYING)
+        if self._drag_was_playing:
+            # Freeze audio for the duration of the drag — cheap, no stream
+            # churn per mouse-move. self._engine.seek() below becomes a
+            # pure bookkeeping update once segment_start is None.
+            self._timer.stop()
+            self._engine.pause()
+
     def _on_seek(self, dt):
         if self._state not in (self.STATE_PLAYING, self.STATE_PAUSED):
             return
 
         new_time = self._clamp_time(self._current_center_time() + dt)
         frame = int(round((new_time - self._start_time) * self._sample_rate))
-        self._engine.seek(frame)
+        self._engine.seek(frame)          # cheap: no audio restart mid-drag
         self._show_window_centered_at(new_time)
 
         if self._is_driver:
             self._group.broadcast_position(new_time)
+
+    def _on_drag_end(self):
+        if self._state not in (self.STATE_PLAYING, self.STATE_PAUSED):
+            return
+
+        if getattr(self, "_drag_was_playing", False):
+            self._engine.start_or_resume()   # single, clean restart
+            self._timer.start()
+        self._drag_was_playing = False
 
     # ---------- following another player's broadcast ----------
 
