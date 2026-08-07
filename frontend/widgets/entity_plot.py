@@ -98,6 +98,12 @@ class EntityPlotView(QWidget):
         for player in self._players:
             player.force_idle()
 
+    def set_edit_mode(self, enabled: bool):
+        """Hide/show each plot's Play and Clip controls when the workspace
+        switches between File and Edit top-level modes."""
+        for player in self._players:
+            player.set_edit_mode(enabled)
+
     @staticmethod
     def _time_axis(channel):
         n = len(channel.samples)

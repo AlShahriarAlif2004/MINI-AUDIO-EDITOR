@@ -276,6 +276,7 @@ class WaveformPlayer(QWidget):
         self._clip_mode = False
         self._divisor_time = None
         self._entered_clip_from_pause = False
+        self._edit_mode = False 
 
         self._timer = QTimer(self)
         self._timer.setInterval(_TICK_MS)
@@ -372,7 +373,7 @@ class WaveformPlayer(QWidget):
         playing = self._state == self.STATE_PLAYING
         paused = self._state == self.STATE_PAUSED
         self._plot.drag_enabled = playing or paused
-        self._play_btn.setVisible(not playing)
+        self._play_btn.setVisible(not playing and not self._edit_mode)
         self._play_btn.setText("▶ Resume" if paused else "▶ Play")
         self._pause_btn.setVisible(playing)
         self._reset_btn.setVisible(playing or paused)
@@ -383,7 +384,7 @@ class WaveformPlayer(QWidget):
         self._marker_lines.append(line)
 
     def _update_clip_related_visibility(self):
-        self._clip_btn.setVisible(not self._clip_mode)
+        self._clip_btn.setVisible(not self._clip_mode and not self._edit_mode)
         self._divide_btn.setVisible(self._clip_mode)
         self._cancel_btn.setVisible(self._clip_mode)
 
@@ -486,6 +487,11 @@ class WaveformPlayer(QWidget):
             self._exit_clip_mode()
         if self._state != self.STATE_STOPPED:
             self._do_reset()
+
+    def set_edit_mode(self, enabled: bool):
+        self._edit_mode = enabled
+        self._update_button_visibility()
+        self._update_clip_related_visibility()
 
     # ---------- view helpers ----------
 

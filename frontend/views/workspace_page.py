@@ -23,6 +23,8 @@ from frontend.widgets.entity_plot import EntityPlotView
 class WorkspacePage(QWidget):
     """VSCode-like workspace editor shell."""
 
+    _SELECTED_BTN_STYLE = "QToolButton { background-color: #2f81f7; color: white; font-weight: 600; }"  # <-- added
+
     new_workspace_requested = Signal()
     open_workspace_requested = Signal()
     exit_requested = Signal()
@@ -30,6 +32,7 @@ class WorkspacePage(QWidget):
     def __init__(self, parent=None):
         super().__init__(parent)
         self._workspace: Workspace | None = None
+        self._mode = "file"
         self._build_ui()
 
     def _build_ui(self):
@@ -40,20 +43,28 @@ class WorkspacePage(QWidget):
         top_bar = QHBoxLayout()
         top_bar.setContentsMargins(8, 6, 8, 6)
 
-        self._menu_btn = QToolButton()
-        self._menu_btn.setText("File")
-        self._menu_btn.setFixedWidth(70)
-        self._menu_btn.setPopupMode(QToolButton.InstantPopup)
-        menu = QMenu(self._menu_btn)
-        menu.addAction("New", self.new_workspace_requested.emit)
-        menu.addAction("Open", self.open_workspace_requested.emit)
-        menu.addSeparator()
-        menu.addAction("Exit", self.exit_requested.emit)
-        self._menu_btn.setMenu(menu)
-        self._menu_btn.setStyleSheet("QToolButton::menu-indicator { image: none; width: 0px; }")
-        top_bar.addWidget(self._menu_btn)
+        self._file_btn = QToolButton()
+        self._file_btn.setText("File")
+        self._file_btn.setFixedWidth(70)
+        self._file_btn.clicked.connect(self._on_file_button_clicked)
+
+        self._file_menu = QMenu(self._file_btn)
+        self._file_menu.addAction("New", self.new_workspace_requested.emit)
+        self._file_menu.addAction("Open", self.open_workspace_requested.emit)
+        self._file_menu.addSeparator()
+        self._file_menu.addAction("Exit", self.exit_requested.emit)
+
+        self._edit_btn = QToolButton()
+        self._edit_btn.setText("Edit")
+        self._edit_btn.setFixedWidth(70)
+        self._edit_btn.clicked.connect(self._on_edit_button_clicked)
+
+        top_bar.addWidget(self._file_btn)
+        top_bar.addWidget(self._edit_btn)
         top_bar.addStretch()
         root_layout.addLayout(top_bar)
+
+        self._file_btn.setStyleSheet(self._SELECTED_BTN_STYLE)  # File is selected by default
 
         splitter = QSplitter(Qt.Horizontal)
 
@@ -62,12 +73,12 @@ class WorkspacePage(QWidget):
         sidebar_layout.setContentsMargins(4, 4, 4, 4)
 
         action_row = QHBoxLayout()
-        new_folder_btn = QPushButton("New Folder")
-        new_entity_btn = QPushButton("New Entity")
-        new_folder_btn.clicked.connect(self._create_folder)
-        new_entity_btn.clicked.connect(self._create_entity)
-        action_row.addWidget(new_folder_btn)
-        action_row.addWidget(new_entity_btn)
+        self._new_folder_btn = QPushButton("New Folder")
+        self._new_entity_btn = QPushButton("New Entity")
+        self._new_folder_btn.clicked.connect(self._create_folder)
+        self._new_entity_btn.clicked.connect(self._create_entity)
+        action_row.addWidget(self._new_folder_btn)
+        action_row.addWidget(self._new_entity_btn)
         sidebar_layout.addLayout(action_row)
 
         self._tree = SidebarTree()
@@ -122,9 +133,50 @@ class WorkspacePage(QWidget):
 
         root_layout.addWidget(splitter)
 
+    def _on_file_button_clicked(self):
+        if self._mode == "file":
+            # Already selected — clicking again opens the dropdown.
+            self._file_menu.exec(self._file_btn.mapToGlobal(self._file_btn.rect().bottomLeft()))
+            return
+        self._set_mode("file")
+
+    def _on_edit_button_clicked(self):
+        self._set_mode("edit")
+
+    def _force_idle_all_players(self):
+        """Any plot that's playing/paused (in this tab or any other open
+        tab) must go idle before we switch top-level modes."""
+        for i in range(1, self._content_stack.count()):
+            widget = self._content_stack.widget(i)
+            if hasattr(widget, "shutdown"):
+                widget.shutdown()
+
+    def _set_mode(self, mode):
+        if mode == self._mode:
+            return
+
+        if mode == "edit":
+            self._force_idle_all_players()
+
+        self._mode = mode
+
+        self._file_btn.setStyleSheet(self._SELECTED_BTN_STYLE if mode == "file" else "")
+        self._edit_btn.setStyleSheet(self._SELECTED_BTN_STYLE if mode == "edit" else "")
+
+        is_edit = (mode == "edit")
+        self._new_folder_btn.setVisible(not is_edit)
+        self._new_entity_btn.setVisible(not is_edit)
+        self._tree.setVisible(not is_edit)
+
+        for i in range(1, self._content_stack.count()):
+            widget = self._content_stack.widget(i)
+            if hasattr(widget, "set_edit_mode"):
+                widget.set_edit_mode(is_edit)
+
     def set_workspace(self, workspace: Workspace):
         self._workspace = workspace
         self._clear_tabs()
+        self._set_mode("file") 
         self._tree.populate(workspace.root)
         self._content_stack.setCurrentWidget(self._empty_label)
 
@@ -208,6 +260,7 @@ class WorkspacePage(QWidget):
 
         entity_view = EntityPlotView(entity)
         entity_view.entity_modified.connect(self._on_entity_modified)
+        entity_view.set_edit_mode(self._mode == "edit")
         self._content_stack.addWidget(entity_view)
         self._tab_bar.setCurrentIndex(index)
         self._content_stack.setCurrentWidget(entity_view)
