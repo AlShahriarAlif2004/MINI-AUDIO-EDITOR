@@ -330,9 +330,9 @@ class WaveformPlayer(QWidget):
             self._add_marker_line(t)
 
         self._divisor_line = pg.InfiniteLine(angle=90, movable=False,
-                                              pen=pg.mkPen(color="#4caf50", width=2))
-        self._divisor_line.addMarker('t1', position=0.03, size=14)
-        self._divisor_line.addMarker('t3', position=0.97, size=14)
+                                      pen=pg.mkPen(color="#4caf50", width=2))
+        self._divisor_line.addMarker('^', position=0.0, size=14)  # triangle at bottom, pointing up (inward)
+        self._divisor_line.addMarker('v', position=1.0, size=14)  # inverse triangle at top, pointing down (inward)
         self._divisor_line.setVisible(False)
         self._plot.addItem(self._divisor_line)
 
@@ -478,6 +478,15 @@ class WaveformPlayer(QWidget):
     def _on_cancel_clicked(self):
         self._exit_clip_mode()
 
+    def force_idle(self):
+        """Reset this player to a released, idle state regardless of its
+        current state — used when its tab is closing, so it doesn't leave
+        a stale lock in the shared PlaybackGroup."""
+        if self._clip_mode:
+            self._exit_clip_mode()
+        if self._state != self.STATE_STOPPED:
+            self._do_reset()
+
     # ---------- view helpers ----------
 
     def _show_overview(self):
@@ -504,6 +513,7 @@ class WaveformPlayer(QWidget):
         self._engine.pause()
         self._timer.stop()
         self._state = self.STATE_PAUSED
+        self._show_window_centered_at(self._current_center_time())
         self._update_button_visibility()
         self._refresh_clip_enabled() 
 
@@ -552,10 +562,20 @@ class WaveformPlayer(QWidget):
         if self._state not in (self.STATE_PLAYING, self.STATE_PAUSED):
             return
 
-        new_time = self._clamp_time(self._current_center_time() + dt)
+        old_center = self._current_center_time()
+        new_time = self._clamp_time(old_center + dt)
+        actual_dt = new_time - old_center   # the delta actually applied, after clamping
+
         frame = int(round((new_time - self._start_time) * self._sample_rate))
         self._engine.seek(frame)          # cheap: no audio restart mid-drag
         self._show_window_centered_at(new_time)
+
+        if self._clip_mode and self._divisor_time is not None:
+            # Keep the divisor visually fixed on screen: move it in data-time
+            # by the same amount the view center moved, and never let it
+            # leave the clip's valid range.
+            self._divisor_time = self._clamp_time(self._divisor_time + actual_dt)
+            self._divisor_line.setPos(self._divisor_time)
 
         if self._is_driver:
             self._group.broadcast_position(new_time)

@@ -24,6 +24,7 @@ class EntityPlotView(QWidget):
         super().__init__(parent)
         self._entity = entity
         self._group = PlaybackGroup.get_instance()
+        self._players = []
         self._build_ui()
 
     def _build_ui(self):
@@ -62,6 +63,7 @@ class EntityPlotView(QWidget):
                 )
                 layout.addWidget(player)
                 player.marker_added.connect(self.entity_modified.emit)
+                self._players.append(player)
 
         overall_label = QLabel("Overall")
         overall_label.setStyleSheet("font-size: 16px; font-weight: 600;")
@@ -83,9 +85,18 @@ class EntityPlotView(QWidget):
         )
         layout.addWidget(overall_player)
         overall_player.marker_added.connect(self.entity_modified.emit)
+        self._players.append(overall_player)
 
         layout.addStretch()
         scroll.setWidget(container)
+
+    def shutdown(self):
+        """Force every plot in this tab back to idle/released state.
+        Must be called before the tab is closed, otherwise a lingering
+        active/clip-mode lock in PlaybackGroup can block every other
+        player until the app restarts."""
+        for player in self._players:
+            player.force_idle()
 
     @staticmethod
     def _time_axis(channel):

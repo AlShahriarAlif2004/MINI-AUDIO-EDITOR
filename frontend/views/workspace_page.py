@@ -216,6 +216,7 @@ class WorkspacePage(QWidget):
         widget_index = index + 1
         widget = self._content_stack.widget(widget_index)
         if widget:
+            widget.shutdown()          # <-- release any playback/clip locks first
             self._content_stack.removeWidget(widget)
             widget.deleteLater()
         self._tab_bar.removeTab(index)
