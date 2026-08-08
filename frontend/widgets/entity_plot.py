@@ -32,6 +32,7 @@ class EntityPlotView(QWidget):
     entity_reversed = Signal()
     entity_faded_in = Signal()
     entity_faded_out = Signal()
+    entity_concatenated = Signal()
     trim_cancelled = Signal()
     segment_selected = Signal(object, object, float, float)
     segment_deselected = Signal()
@@ -61,6 +62,10 @@ class EntityPlotView(QWidget):
         self._effect_range = None
         self._effect_mirror_players = []     # channel players mirrored when Overall is selected
         self._effect_overall_target = None   # Overall player mirrored when a channel is selected
+        self._concat_player = None
+        self._concat_range = None
+        self._concat_sources = []
+        self._concat_extra_channel_samples = None
         self._build_ui()
 
     @property
@@ -377,6 +382,125 @@ class EntityPlotView(QWidget):
 
         self._entity.clip = new_clip
 
+    # ------------------------------------------------------------------
+    # Concatenate
+    # ------------------------------------------------------------------
+    # Only valid when the Overall plot is selected (enforced by the caller
+    # via _OVERALL_ONLY_OPS). Each chosen source is a division-bounded
+    # *segment* of some entity's Overall plot (not necessarily the whole
+    # clip) — all of which must share this entity's channel count. They're
+    # appended, in order, right after the end of the current selection on
+    # the Overall plot. Like vertical scale / effects, the Overall preview
+    # mirrors onto every channel plot since every channel is affected
+    # uniformly.
+
+    def begin_concatenate(self, source_portions) -> bool:
+        """source_portions: ordered list of (Entity, segment_start, segment_end)."""
+        if self._selected_player is None or self._selected_player.channel_index is not None:
+            return False
+        segment = self._selected_player.selected_segment
+        if segment is None:
+            return False
+        if not source_portions:
+            return False
+
+        clip = self._entity.clip
+        target_channels = clip.num_channels
+        for src_entity, _seg_start, _seg_end in source_portions:
+            if src_entity.clip.num_channels != target_channels:
+                return False
+
+        insert_time = segment[1]
+        target_rate = clip.sample_rate
+
+        extra_channel_samples = []
+        for ch_idx in range(target_channels):
+            pieces = []
+            for src_entity, seg_start, seg_end in source_portions:
+                src_ch = src_entity.clip.channels[ch_idx]
+                start_idx = max(src_ch.get_index(seg_start), src_ch.start_index)
+                end_idx = min(src_ch.get_index(seg_end), src_ch.end_index())
+                if end_idx < start_idx:
+                    end_idx = start_idx
+                segment_signal = src_ch.trim(start_idx, end_idx)
+                resampled = (
+                    segment_signal if segment_signal.sample_rate == target_rate
+                    else segment_signal.resample(target_rate)
+                )
+                pieces.append(resampled.samples)
+            extra_channel_samples.append(
+                np.concatenate(pieces) if pieces else np.zeros(0, dtype=np.float64)
+            )
+
+        self._concat_player = self._selected_player
+        self._concat_range = segment
+        self._concat_sources = list(source_portions)
+        self._concat_extra_channel_samples = extra_channel_samples
+
+        for player in self._players:
+            if player.channel_index is None:
+                player.enter_concat_preview(insert_time, extra_channel_samples)
+            else:
+                player.enter_concat_preview(insert_time, [extra_channel_samples[player.channel_index]])
+
+        self._lock_selection(True)
+        return True
+
+    def cancel_concatenate(self):
+        if self._concat_player is None:
+            return
+        for player in self._players:
+            player.exit_concat_preview()
+        self._concat_player = None
+        self._concat_range = None
+        self._concat_sources = []
+        self._concat_extra_channel_samples = None
+        self._lock_selection(False)
+        if self._selected_player is not None:
+            self._selected_player.restore_selection_visual()
+
+    def apply_concatenate(self):
+        if self._concat_player is None or self._concat_range is None:
+            return
+        insert_time = self._concat_range[1]
+        for player in self._players:
+            player.exit_concat_preview()
+        self._perform_concatenate(insert_time)
+        self._concat_player = None
+        self._concat_range = None
+        self._concat_sources = []
+        self._concat_extra_channel_samples = None
+        self._lock_selection(False)
+        self.clear_all_selection()   # apply clears selection
+        self.entity_modified.emit()
+        self.entity_concatenated.emit()
+
+    def _perform_concatenate(self, insert_time):
+        clip = self._entity.clip
+        insert_idx = clip.get_index(insert_time)
+        extra = self._concat_extra_channel_samples
+
+        new_channels = []
+        added_len = 0
+        for ch_idx, ch in enumerate(clip.channels):
+            extra_samples = extra[ch_idx]
+            added_len = len(extra_samples)
+            extra_signal = Discrete_Signal(extra_samples, ch.sample_rate, ch.start_index)
+            new_channels.append(ch.concatenate(extra_signal, index=insert_idx))
+
+        self._entity.clip = AudioClip(new_channels, name=clip.name)
+
+        added_duration = added_len / clip.sample_rate
+
+        def _shift_time(t):
+            return t + added_duration if t >= insert_time else t
+
+        self._entity.divisions = [_shift_time(t) for t in self._entity.divisions]
+        for ch_idx in list(self._entity.channel_markers.keys()):
+            self._entity.channel_markers[ch_idx] = [
+                _shift_time(t) for t in self._entity.channel_markers[ch_idx]
+            ]
+
     def _perform_trim(self, start, end):
         clip = self._entity.clip
         remove_start_idx = clip.get_index(start)
@@ -427,7 +551,8 @@ class EntityPlotView(QWidget):
 
     def _on_canvas_clicked(self):
         if (self._trim_player is not None or self._timescale_preview_active
-                or self._vscale_player is not None or self._effect_player is not None):
+                or self._vscale_player is not None or self._effect_player is not None
+                or self._concat_player is not None):
             return
         self.clear_all_selection()
         if self._trim_player is not None:
@@ -507,6 +632,7 @@ class EntityPlotView(QWidget):
         self.cancel_timescale()
         self.cancel_vertical_scale()
         self.cancel_effect()
+        self.cancel_concatenate()
         for player in self._players:
             player.force_idle()
         self.clear_all_selection()

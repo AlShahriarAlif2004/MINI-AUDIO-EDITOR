@@ -18,6 +18,7 @@ from PySide6.QtWidgets import (
 from backend.workspace_model import Entity, Folder, Workspace
 from frontend.dialogs.create_entity_dialog import CreateEntityDialog
 from frontend.dialogs.create_folder_dialog import CreateFolderDialog
+from frontend.dialogs.concatenate_dialog import ConcatenateDialog
 from frontend.widgets.sidebar_tree import SidebarTree
 from frontend.widgets.entity_plot import EntityPlotView
 from frontend.widgets.waveform_player import PlaybackGroup
@@ -139,7 +140,7 @@ class WorkspacePage(QWidget):
     _SELECTED_OPTION_STYLE = "background-color: #2f81f7; color: white; font-weight: 600;"
 
     # Operations that are only valid when the *overall* plot is selected.
-    _OVERALL_ONLY_OPS = {"Trim", "Time Scale"}
+    _OVERALL_ONLY_OPS = {"Trim", "Time Scale", "Concatenate"}
 
     new_workspace_requested = Signal()
     open_workspace_requested = Signal()
@@ -161,6 +162,8 @@ class WorkspacePage(QWidget):
         self._fadein_active_view = None
         self._fadeout_active = False
         self._fadeout_active_view = None
+        self._concat_active = False
+        self._concat_active_view = None
         self._build_ui()
         self._playback_group = PlaybackGroup.get_instance()
         self._playback_group.active_changed.connect(self._on_playback_active_changed)
@@ -232,7 +235,7 @@ class WorkspacePage(QWidget):
 
         self._segment_buttons: dict[str, QPushButton] = {}
 
-        for label in ("Trim", "Time Scale", "Vertical Scale", "Reverse",
+        for label in ("Trim", "Extract", "Time Scale", "Vertical Scale", "Reverse",
                       "Fade In", "Fade Out", "Concatenate"):
             btn = QPushButton(label)
             btn.setEnabled(False)          # disabled until a segment is selected
@@ -369,6 +372,23 @@ class WorkspacePage(QWidget):
                 self._fadeout_panel.setVisible(False)
                 edit_options_layout.addWidget(self._fadeout_panel)
 
+            elif label == "Concatenate":
+                self._concat_btn = btn
+                btn.clicked.connect(self._on_concatenate_clicked)
+
+                self._concat_panel = QWidget()
+                concat_panel_layout = QHBoxLayout(self._concat_panel)
+                concat_panel_layout.setContentsMargins(16, 0, 0, 0)
+                concat_panel_layout.setSpacing(6)
+                self._concat_apply_btn  = QPushButton("Apply")
+                self._concat_cancel_btn = QPushButton("Cancel")
+                self._concat_apply_btn.clicked.connect(self._on_concat_apply_clicked)
+                self._concat_cancel_btn.clicked.connect(self._on_concat_cancel_clicked)
+                concat_panel_layout.addWidget(self._concat_apply_btn)
+                concat_panel_layout.addWidget(self._concat_cancel_btn)
+                self._concat_panel.setVisible(False)
+                edit_options_layout.addWidget(self._concat_panel)
+
         edit_options_layout.addStretch()
         self._edit_options_panel.setVisible(False)   # shown when edit mode is active
         sidebar_layout.addWidget(self._edit_options_panel)
@@ -470,6 +490,7 @@ class WorkspacePage(QWidget):
         self._cancel_reverse_if_active()
         self._cancel_fadein_if_active()
         self._cancel_fadeout_if_active()
+        self._cancel_concat_if_active()
         self._clear_all_plot_selections()
 
         if mode == "edit":
@@ -594,6 +615,7 @@ class WorkspacePage(QWidget):
         locked = (
             self._trim_active or self._timescale_active or self._vscale_active
             or self._reverse_active or self._fadein_active or self._fadeout_active
+            or self._concat_active
         )
         self._tab_bar.setEnabled(not locked)
 
@@ -654,6 +676,7 @@ class WorkspacePage(QWidget):
         self._cancel_reverse_if_active()
         self._cancel_fadein_if_active()
         self._cancel_fadeout_if_active()
+        self._cancel_concat_if_active()
         view = self._current_entity_view()
         if view is None or not view.begin_trim():
             return
@@ -706,6 +729,7 @@ class WorkspacePage(QWidget):
         self._cancel_reverse_if_active()
         self._cancel_fadein_if_active()
         self._cancel_fadeout_if_active()
+        self._cancel_concat_if_active()
         view = self._current_entity_view()
         if view is None or not view.begin_timescale():
             return
@@ -764,6 +788,7 @@ class WorkspacePage(QWidget):
         self._cancel_reverse_if_active()
         self._cancel_fadein_if_active()
         self._cancel_fadeout_if_active()
+        self._cancel_concat_if_active()
         view = self._current_entity_view()
         if view is None or not view.begin_vertical_scale():
             return
@@ -820,6 +845,7 @@ class WorkspacePage(QWidget):
         self._cancel_vscale_if_active()
         self._cancel_fadein_if_active()
         self._cancel_fadeout_if_active()
+        self._cancel_concat_if_active()
         view = self._current_entity_view()
         if view is None or not view.begin_reverse():
             return
@@ -870,6 +896,7 @@ class WorkspacePage(QWidget):
         self._cancel_vscale_if_active()
         self._cancel_reverse_if_active()
         self._cancel_fadeout_if_active()
+        self._cancel_concat_if_active()
         view = self._current_entity_view()
         if view is None or not view.begin_fade_in():
             return
@@ -920,6 +947,7 @@ class WorkspacePage(QWidget):
         self._cancel_vscale_if_active()
         self._cancel_reverse_if_active()
         self._cancel_fadein_if_active()
+        self._cancel_concat_if_active()
         view = self._current_entity_view()
         if view is None or not view.begin_fade_out():
             return
@@ -944,6 +972,68 @@ class WorkspacePage(QWidget):
         view.cancel_effect()
 
     # ------------------------------------------------------------------
+    # Concatenate
+    # ------------------------------------------------------------------
+
+    def _collapse_concat_ui(self):
+        self._concat_active = False
+        self._concat_active_view = None
+        self._concat_btn.setStyleSheet("")
+        self._concat_panel.setVisible(False)
+        self._refresh_tab_bar_lock()
+
+    def _cancel_concat_if_active(self):
+        if self._concat_active and self._concat_active_view is not None:
+            view = self._concat_active_view
+            self._collapse_concat_ui()
+            view.cancel_concatenate()
+        elif self._concat_active:
+            self._collapse_concat_ui()
+
+    def _on_concatenate_clicked(self):
+        if self._concat_active:
+            return
+        self._cancel_trim_if_active()
+        self._cancel_timescale_if_active()
+        self._cancel_vscale_if_active()
+        self._cancel_reverse_if_active()
+        self._cancel_fadein_if_active()
+        self._cancel_fadeout_if_active()
+
+        view = self._current_entity_view()
+        if view is None:
+            return
+
+        channel_count = view.entity.clip.num_channels
+        dialog = ConcatenateDialog(self._workspace, channel_count, self)
+        if dialog.exec() != QDialog.DialogCode.Accepted:
+            return
+
+        sources = dialog.selected_portions()
+        if not sources or not view.begin_concatenate(sources):
+            return
+
+        self._concat_active = True
+        self._concat_active_view = view
+        self._concat_btn.setStyleSheet(self._SELECTED_OPTION_STYLE)
+        self._concat_panel.setVisible(True)
+        self._refresh_tab_bar_lock()
+
+    def _on_concat_apply_clicked(self):
+        if not self._concat_active or self._concat_active_view is None:
+            return
+        view = self._concat_active_view
+        self._collapse_concat_ui()
+        view.apply_concatenate()   # entity_concatenated → rebuild (clears selection)
+
+    def _on_concat_cancel_clicked(self):
+        if not self._concat_active or self._concat_active_view is None:
+            return
+        view = self._concat_active_view
+        self._collapse_concat_ui()
+        view.cancel_concatenate()  # restores graph + keeps selection
+
+    # ------------------------------------------------------------------
     # Entity-view factory / tab lifecycle
     # ------------------------------------------------------------------
 
@@ -958,6 +1048,7 @@ class WorkspacePage(QWidget):
         entity_view.entity_reversed.connect(lambda: self._rebuild_entity_tab(entity))
         entity_view.entity_faded_in.connect(lambda: self._rebuild_entity_tab(entity))
         entity_view.entity_faded_out.connect(lambda: self._rebuild_entity_tab(entity))
+        entity_view.entity_concatenated.connect(lambda: self._rebuild_entity_tab(entity))
         entity_view.trim_cancelled.connect(self._on_trim_cancelled_externally)
         entity_view.set_edit_mode(self._mode == "edit")
         return entity_view
@@ -996,6 +1087,8 @@ class WorkspacePage(QWidget):
             self._collapse_fadein_ui()
         if old_widget is self._fadeout_active_view:
             self._collapse_fadeout_ui()
+        if old_widget is self._concat_active_view:
+            self._collapse_concat_ui()
 
         self._content_stack.removeWidget(old_widget)
         old_widget.deleteLater()
@@ -1034,6 +1127,7 @@ class WorkspacePage(QWidget):
         self._cancel_reverse_if_active()
         self._cancel_fadein_if_active()
         self._cancel_fadeout_if_active()
+        self._cancel_concat_if_active()
         self._force_stop_active_playback()      # ← add, before selection clearing
         self._clear_all_plot_selections()
     

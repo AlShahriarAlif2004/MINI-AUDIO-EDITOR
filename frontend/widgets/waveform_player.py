@@ -346,6 +346,10 @@ class WaveformPlayer(QWidget):
         self._trim_end = None
 
         self._timescale_mode = False
+        self._concat_mode = False
+        self._concat_engine = None
+        self._concat_times = None
+        self._concat_end = None
         self._vscale_mode = False
         self._vscale_range = None
         self._effect_mode = None          # 'reverse' | 'fade_in' | 'fade_out' | None
@@ -533,6 +537,7 @@ class WaveformPlayer(QWidget):
             and not self._clip_mode
             and not self._trim_mode
             and not self._timescale_mode
+            and not self._concat_mode
             and not self._vscale_mode
             and self._effect_mode is None
             and not self._segment_locked
@@ -691,6 +696,105 @@ class WaveformPlayer(QWidget):
     
         self._show_overview()
         self._refresh_segment_mode()
+
+    # ------------------------------------------------------------------
+    # Concatenate preview
+    # ------------------------------------------------------------------
+
+    def enter_concat_preview(self, insert_time, extra_samples_list):
+        """Splice `extra_samples_list` (one 1-D array per curve, in the same
+        order as self._curve_items) into the waveform right after
+        `insert_time`, as a live preview. Does not touch the current
+        selection region — the selected segment itself is untouched, only
+        content after it shifts right."""
+        self._concat_mode = True
+
+        insert_idx = int(np.searchsorted(self._times, insert_time, side="right"))
+        dt = 1.0 / self._sample_rate
+
+        extra_len = max((len(a) for a in extra_samples_list), default=0)
+
+        anchor_time = self._times[insert_idx - 1] if insert_idx > 0 else self._start_time
+        insert_times = anchor_time + dt * (np.arange(extra_len) + 1)
+
+        before_times = self._times[:insert_idx]
+        after_times = self._times[insert_idx:] + extra_len * dt
+        preview_times = np.concatenate([before_times, insert_times, after_times])
+        self._concat_times = preview_times
+
+        for curve, (samples, _color, _label), extra in zip(
+            self._curve_items, self._series, extra_samples_list
+        ):
+            extra = np.asarray(extra)
+            preview_samples = np.concatenate(
+                [samples[:insert_idx], extra, samples[insert_idx:]]
+            )
+            curve.setData(preview_times, preview_samples)
+
+        self._concat_end = float(preview_times[-1]) if len(preview_times) else self._end_time
+        self._end_boundary.setPos(self._concat_end)
+        self._end_boundary.setVisible(True)
+
+        added_duration = extra_len * dt
+
+        def _shift(t):
+            return t + added_duration if t >= insert_time else t
+
+        for line, original_t in zip(self._marker_lines, self._entity.markers_for(self._channel_index)):
+            line.setPos(_shift(original_t))
+
+        self._hover_region.setVisible(False)
+
+        orig_audio = self._engine.audio_data
+        if orig_audio.ndim == 1:
+            extra_audio = (
+                np.asarray(extra_samples_list[0]).astype(orig_audio.dtype)
+                if extra_samples_list else np.zeros(0, dtype=orig_audio.dtype)
+            )
+            preview_audio = np.concatenate(
+                [orig_audio[:insert_idx], extra_audio, orig_audio[insert_idx:]]
+            )
+        else:
+            if extra_samples_list:
+                extra_stack = np.stack(
+                    [np.asarray(a) for a in extra_samples_list], axis=1
+                ).astype(orig_audio.dtype)
+            else:
+                extra_stack = np.zeros((0, orig_audio.shape[1]), dtype=orig_audio.dtype)
+            preview_audio = np.concatenate(
+                [orig_audio[:insert_idx], extra_stack, orig_audio[insert_idx:]], axis=0
+            )
+
+        self._concat_engine = _PlaybackEngine(preview_audio, self._sample_rate)
+
+        self._plot.setXRange(self._start_time, max(self._concat_end, self._start_time + 0.001), padding=0.02)
+        self._refresh_segment_mode()
+        self._update_button_visibility()
+
+    def exit_concat_preview(self):
+        if not self._concat_mode:
+            return
+        if self._state != self.STATE_STOPPED:
+            self._do_reset()
+
+        self._concat_mode = False
+        self._concat_engine = None
+        self._concat_times = None
+        self._concat_end = None
+
+        for curve, (samples, _color, _label) in zip(self._curve_items, self._series):
+            curve.setData(self._times, samples)
+
+        self._end_boundary.setPos(self._end_time)
+        self._end_boundary.setVisible(True)
+
+        for line, original_t in zip(self._marker_lines, self._entity.markers_for(self._channel_index)):
+            line.setPos(original_t)
+            line.setVisible(True)
+
+        self._show_overview()
+        self._refresh_segment_mode()
+        self._update_button_visibility()
 
     def enter_vertical_scale_preview(self, factor: float, start, end):
         """Live amplitude-only preview for the selected range. No time-axis
@@ -972,6 +1076,8 @@ class WaveformPlayer(QWidget):
             self.exit_trim_preview()
         if self._timescale_mode:
             self.exit_timescale_preview()
+        if self._concat_mode:
+            self.exit_concat_preview()
         if self._vscale_mode:
             self.exit_vertical_scale_preview()
         if self._effect_mode is not None:
@@ -1037,6 +1143,13 @@ class WaveformPlayer(QWidget):
         if self._trim_mode:
             self._trim_playhead.setPos(self._trim_start)
             self._trim_playhead.setVisible(False)
+        elif self._concat_mode:
+            self._playhead.setVisible(False)
+            self._plot.setXRange(
+                self._start_time,
+                max(self._concat_end, self._start_time + 0.001),
+                padding=0.02,
+            )
         else:
             self._show_overview()
         self._update_button_visibility()
@@ -1073,6 +1186,8 @@ class WaveformPlayer(QWidget):
         real audio."""
         if self._trim_mode:
             return self._trim_engine
+        if self._concat_mode:
+            return self._concat_engine
         if self._effect_mode is not None and self._effect_engine is not None:
             return self._effect_engine
         return self._engine
@@ -1081,7 +1196,8 @@ class WaveformPlayer(QWidget):
         return self._start_time + self._playback_engine().current_frame() / self._sample_rate
 
     def _clamp_time(self, t):
-        return max(self._start_time, min(t, self._end_time))
+        upper = self._concat_end if (self._concat_mode and self._concat_end is not None) else self._end_time
+        return max(self._start_time, min(t, upper))
 
     def _on_drag_start(self):
         if self._state not in (self.STATE_PLAYING, self.STATE_PAUSED):
