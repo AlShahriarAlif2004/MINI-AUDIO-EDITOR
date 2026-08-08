@@ -33,6 +33,7 @@ class EntityPlotView(QWidget):
     entity_faded_in = Signal()
     entity_faded_out = Signal()
     entity_concatenated = Signal()
+    entity_extracted = Signal()
     trim_cancelled = Signal()
     segment_selected = Signal(object, object, float, float)
     segment_deselected = Signal()
@@ -52,6 +53,8 @@ class EntityPlotView(QWidget):
         self._selected_player = None
         self._trim_player = None
         self._trim_range = None
+        self._extract_player = None
+        self._extract_range = None
         self._timescale_preview_active = False
         self._timescale_range = None
         self._vscale_player = None
@@ -120,6 +123,54 @@ class EntityPlotView(QWidget):
         self.clear_all_selection()   # apply clears selection
         self.entity_modified.emit()
         self.entity_trimmed.emit()
+
+    # ------------------------------------------------------------------
+    # Extract preview
+    # ------------------------------------------------------------------
+    # The inverse of Trim: instead of removing the selected segment and
+    # keeping everything else, Extract keeps *only* the selected segment
+    # and discards everything before and after it. Only valid when the
+    # Overall plot is selected (enforced by the caller via
+    # _OVERALL_ONLY_OPS), same restriction as Trim/Time Scale/Concatenate,
+    # since the operation applies uniformly across every channel.
+
+    def begin_extract(self) -> bool:
+        if self._selected_player is None or self._selected_player.channel_index is not None:
+            return False
+        segment = self._selected_player.selected_segment
+        if segment is None:
+            return False
+
+        self._extract_player = self._selected_player
+        self._extract_range = segment
+        for player in self._players:
+            player.enter_extract_preview(*segment)
+        self._lock_selection(True)
+        return True
+
+    def cancel_extract(self):
+        """Exit extract preview, restore original graph, keep selection."""
+        if self._extract_player is not None:
+            for player in self._players:
+                player.exit_extract_preview()
+        self._extract_player = None
+        self._extract_range = None
+        self._lock_selection(False)
+        # Restore selection highlight (don't clear the selection)
+        if self._selected_player is not None:
+            self._selected_player.restore_selection_visual()
+
+    def apply_extract(self):
+        if self._extract_player is None or self._extract_range is None:
+            return
+        start, end = self._extract_range
+        self._perform_extract(start, end)
+        self._extract_player = None
+        self._extract_range = None
+        self._lock_selection(False)
+        self.clear_all_selection()   # apply clears selection
+        self.entity_modified.emit()
+        self.entity_extracted.emit()
 
     # ------------------------------------------------------------------
     # Time-scale preview
@@ -598,8 +649,43 @@ class EntityPlotView(QWidget):
                 if t is not None
             ]
 
+    def _perform_extract(self, start, end):
+        clip = self._entity.clip
+        keep_start_idx = clip.get_index(start)
+        keep_end_idx = clip.get_index(end)
+
+        new_channels = []
+        for ch in clip.channels:
+            local_start = max(keep_start_idx, ch.start_index)
+            local_end = min(keep_end_idx, ch.end_index())
+
+            if local_end < local_start:
+                # selection fell entirely outside this channel's range —
+                # keep a single silent sample so the clip never collapses
+                # to zero length
+                new_channels.append(Discrete_Signal(
+                    np.zeros(1, dtype=ch.samples.dtype), ch.sample_rate, ch.start_index
+                ))
+            else:
+                new_channels.append(ch.trim(local_start, local_end))
+
+        self._entity.clip = AudioClip(new_channels, name=clip.name)
+
+        # Sample indices (and therefore times) inside the kept segment are
+        # unchanged — only content outside [start, end] is discarded — so
+        # divisions/markers just need filtering to what still falls
+        # strictly inside the kept range, with no time-shift required.
+        self._entity.divisions = [
+            t for t in self._entity.divisions if start < t < end
+        ]
+        for ch_idx in list(self._entity.channel_markers.keys()):
+            self._entity.channel_markers[ch_idx] = [
+                t for t in self._entity.channel_markers[ch_idx] if start < t < end
+            ]
+
     def _on_canvas_clicked(self):
-        if (self._trim_player is not None or self._timescale_preview_active
+        if (self._trim_player is not None or self._extract_player is not None
+                or self._timescale_preview_active
                 or self._vscale_player is not None or self._effect_player is not None
                 or self._concat_player is not None):
             return
@@ -678,6 +764,7 @@ class EntityPlotView(QWidget):
 
     def shutdown(self):
         self.cancel_trim()
+        self.cancel_extract()
         self.cancel_timescale()
         self.cancel_vertical_scale()
         self.cancel_effect()

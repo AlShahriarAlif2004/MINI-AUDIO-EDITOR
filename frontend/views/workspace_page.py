@@ -140,7 +140,7 @@ class WorkspacePage(QWidget):
     _SELECTED_OPTION_STYLE = "background-color: #2f81f7; color: white; font-weight: 600;"
 
     # Operations that are only valid when the *overall* plot is selected.
-    _OVERALL_ONLY_OPS = {"Trim", "Time Scale", "Concatenate"}
+    _OVERALL_ONLY_OPS = {"Trim", "Extract", "Time Scale", "Concatenate"}
 
     new_workspace_requested = Signal()
     open_workspace_requested = Signal()
@@ -152,6 +152,8 @@ class WorkspacePage(QWidget):
         self._mode = "file"
         self._trim_active = False
         self._trim_active_view = None
+        self._extract_active = False
+        self._extract_active_view = None
         self._timescale_active = False
         self._timescale_active_view = None
         self._vscale_active = False
@@ -291,6 +293,23 @@ class WorkspacePage(QWidget):
                 trim_panel_layout.addWidget(self._trim_cancel_btn)
                 self._trim_panel.setVisible(False)
                 edit_options_layout.addWidget(self._trim_panel)
+
+            elif label == "Extract":
+                self._extract_btn = btn
+                btn.clicked.connect(self._on_extract_clicked)
+
+                self._extract_panel = QWidget()
+                extract_panel_layout = QHBoxLayout(self._extract_panel)
+                extract_panel_layout.setContentsMargins(16, 0, 0, 0)
+                extract_panel_layout.setSpacing(6)
+                self._extract_apply_btn  = QPushButton("Apply")
+                self._extract_cancel_btn = QPushButton("Cancel")
+                self._extract_apply_btn.clicked.connect(self._on_extract_apply_clicked)
+                self._extract_cancel_btn.clicked.connect(self._on_extract_cancel_clicked)
+                extract_panel_layout.addWidget(self._extract_apply_btn)
+                extract_panel_layout.addWidget(self._extract_cancel_btn)
+                self._extract_panel.setVisible(False)
+                edit_options_layout.addWidget(self._extract_panel)
 
             elif label == "Time Scale":
                 self._timescale_btn = btn
@@ -518,6 +537,7 @@ class WorkspacePage(QWidget):
             return
 
         self._cancel_trim_if_active()
+        self._cancel_extract_if_active()
         self._cancel_timescale_if_active()
         self._cancel_vscale_if_active()
         self._cancel_reverse_if_active()
@@ -615,7 +635,7 @@ class WorkspacePage(QWidget):
 
     def _refresh_tab_bar_lock(self):
         locked = (
-            self._trim_active or self._timescale_active or self._vscale_active
+            self._trim_active or self._extract_active or self._timescale_active or self._vscale_active
             or self._reverse_active or self._fadein_active or self._fadeout_active
             or self._concat_active
         )
@@ -673,6 +693,7 @@ class WorkspacePage(QWidget):
         if self._trim_active:
             return
         # Fold timescale if it was open
+        self._cancel_extract_if_active()
         self._cancel_timescale_if_active()
         self._cancel_vscale_if_active()
         self._cancel_reverse_if_active()
@@ -703,6 +724,59 @@ class WorkspacePage(QWidget):
         view.cancel_trim()         # restores graph + keeps selection
 
     # ------------------------------------------------------------------
+    # Extract
+    # ------------------------------------------------------------------
+
+    def _collapse_extract_ui(self):
+        self._extract_active = False
+        self._extract_active_view = None
+        self._extract_btn.setStyleSheet("")
+        self._extract_panel.setVisible(False)
+        self._refresh_tab_bar_lock()
+
+    def _cancel_extract_if_active(self):
+        if self._extract_active and self._extract_active_view is not None:
+            view = self._extract_active_view
+            self._collapse_extract_ui()
+            view.cancel_extract()
+        elif self._extract_active:
+            self._collapse_extract_ui()
+
+    def _on_extract_clicked(self):
+        if self._extract_active:
+            return
+        # Fold any other open op
+        self._cancel_trim_if_active()
+        self._cancel_timescale_if_active()
+        self._cancel_vscale_if_active()
+        self._cancel_reverse_if_active()
+        self._cancel_fadein_if_active()
+        self._cancel_fadeout_if_active()
+        self._cancel_concat_if_active()
+        view = self._current_entity_view()
+        if view is None or not view.begin_extract():
+            return
+        self._extract_active = True
+        self._extract_active_view = view
+        self._extract_btn.setStyleSheet(self._SELECTED_OPTION_STYLE)
+        self._extract_panel.setVisible(True)
+        self._refresh_tab_bar_lock()
+
+    def _on_extract_apply_clicked(self):
+        if not self._extract_active or self._extract_active_view is None:
+            return
+        view = self._extract_active_view
+        self._collapse_extract_ui()
+        view.apply_extract()       # entity_extracted → _rebuild_entity_tab (clears selection)
+
+    def _on_extract_cancel_clicked(self):
+        if not self._extract_active or self._extract_active_view is None:
+            return
+        view = self._extract_active_view
+        self._collapse_extract_ui()
+        view.cancel_extract()      # restores graph + keeps selection
+
+    # ------------------------------------------------------------------
     # Time Scale
     # ------------------------------------------------------------------
 
@@ -727,6 +801,7 @@ class WorkspacePage(QWidget):
             return
         # Fold trim if it was open
         self._cancel_trim_if_active()
+        self._cancel_extract_if_active()
         self._cancel_vscale_if_active()
         self._cancel_reverse_if_active()
         self._cancel_fadein_if_active()
@@ -786,6 +861,7 @@ class WorkspacePage(QWidget):
         if self._vscale_active:
             return
         self._cancel_trim_if_active()
+        self._cancel_extract_if_active()
         self._cancel_timescale_if_active()
         self._cancel_reverse_if_active()
         self._cancel_fadein_if_active()
@@ -843,6 +919,7 @@ class WorkspacePage(QWidget):
         if self._reverse_active:
             return
         self._cancel_trim_if_active()
+        self._cancel_extract_if_active()
         self._cancel_timescale_if_active()
         self._cancel_vscale_if_active()
         self._cancel_fadein_if_active()
@@ -894,6 +971,7 @@ class WorkspacePage(QWidget):
         if self._fadein_active:
             return
         self._cancel_trim_if_active()
+        self._cancel_extract_if_active()
         self._cancel_timescale_if_active()
         self._cancel_vscale_if_active()
         self._cancel_reverse_if_active()
@@ -945,6 +1023,7 @@ class WorkspacePage(QWidget):
         if self._fadeout_active:
             return
         self._cancel_trim_if_active()
+        self._cancel_extract_if_active()
         self._cancel_timescale_if_active()
         self._cancel_vscale_if_active()
         self._cancel_reverse_if_active()
@@ -996,6 +1075,7 @@ class WorkspacePage(QWidget):
         if self._concat_active:
             return
         self._cancel_trim_if_active()
+        self._cancel_extract_if_active()
         self._cancel_timescale_if_active()
         self._cancel_vscale_if_active()
         self._cancel_reverse_if_active()
@@ -1045,6 +1125,7 @@ class WorkspacePage(QWidget):
         entity_view.segment_selected.connect(self._on_segment_selected)
         entity_view.segment_deselected.connect(self._on_segment_deselected)
         entity_view.entity_trimmed.connect(lambda: self._rebuild_entity_tab(entity))
+        entity_view.entity_extracted.connect(lambda: self._rebuild_entity_tab(entity))
         entity_view.entity_timescaled.connect(lambda: self._rebuild_entity_tab(entity))
         entity_view.entity_vscaled.connect(lambda: self._rebuild_entity_tab(entity))
         entity_view.entity_reversed.connect(lambda: self._rebuild_entity_tab(entity))
@@ -1079,6 +1160,8 @@ class WorkspacePage(QWidget):
 
         if old_widget is self._trim_active_view:
             self._collapse_trim_ui()
+        if old_widget is self._extract_active_view:
+            self._collapse_extract_ui()
         if old_widget is self._timescale_active_view:
             self._collapse_timescale_ui()
         if old_widget is self._vscale_active_view:     # ← add (both methods; use `widget` instead of `old_widget` in _close_tab)
@@ -1109,6 +1192,8 @@ class WorkspacePage(QWidget):
         widget = self._content_stack.widget(widget_index)
         if widget is self._trim_active_view:
             self._collapse_trim_ui()
+        if widget is self._extract_active_view:
+            self._collapse_extract_ui()
         if widget is self._timescale_active_view:
             self._collapse_timescale_ui()
         if widget:
@@ -1124,6 +1209,7 @@ class WorkspacePage(QWidget):
 
     def _on_tab_changed(self, index: int):
         self._cancel_trim_if_active()
+        self._cancel_extract_if_active()
         self._cancel_timescale_if_active()
         self._cancel_vscale_if_active()
         self._cancel_reverse_if_active()

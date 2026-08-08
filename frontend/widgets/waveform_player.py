@@ -345,6 +345,11 @@ class WaveformPlayer(QWidget):
         self._trim_start = None
         self._trim_end = None
 
+        self._extract_mode = False
+        self._extract_engine = None
+        self._extract_start = None
+        self._extract_end = None
+
         self._timescale_mode = False
         self._timescale_range = None
         self._timescale_preview_end = None
@@ -450,6 +455,13 @@ class WaveformPlayer(QWidget):
         self._trim_playhead.setVisible(False)
         self._plot.addItem(self._trim_playhead)
 
+        self._extract_playhead = pg.InfiniteLine(angle=90, movable=False,
+                                                   pen=pg.mkPen(color="#ff4d4d", width=2))
+        self._extract_playhead.addMarker('^', position=0.0, size=14)
+        self._extract_playhead.addMarker('v', position=1.0, size=14)
+        self._extract_playhead.setVisible(False)
+        self._plot.addItem(self._extract_playhead)
+
         layout.addWidget(self._plot)
 
         controls = QHBoxLayout()
@@ -540,6 +552,7 @@ class WaveformPlayer(QWidget):
             and self._state == self.STATE_STOPPED
             and not self._clip_mode
             and not self._trim_mode
+            and not self._extract_mode
             and not self._timescale_mode
             and not self._concat_mode
             and not self._vscale_mode
@@ -637,6 +650,90 @@ class WaveformPlayer(QWidget):
         self._trim_start = None
         self._trim_end = None
         self._trim_playhead.setVisible(False)
+
+        for curve, (samples, _color, _label) in zip(self._curve_items, self._series):
+            curve.setData(self._times, samples)
+
+        self._start_boundary.setPos(self._start_time)
+        self._start_boundary.setVisible(True)
+        self._end_boundary.setPos(self._end_time)
+        self._end_boundary.setVisible(True)
+
+        for line, original_t in zip(self._marker_lines, self._entity.markers_for(self._channel_index)):
+            line.setPos(original_t)
+            line.setVisible(True)
+
+        self._show_overview()
+        self._refresh_segment_mode()
+        self._update_button_visibility()
+
+    # ------------------------------------------------------------------
+    # Extract preview
+    # ------------------------------------------------------------------
+    # The inverse of Trim: only the selected [start, end] span is kept and
+    # shown, everything outside it is dropped from the preview entirely.
+    # Sample indices (and therefore times) of the kept portion are left
+    # untouched — the underlying data operation is a plain crop, not a
+    # splice — so, unlike Trim, nothing needs to be shifted.
+
+    def enter_extract_preview(self, start, end):
+        start_idx, end_idx = self._preview_slice_indices(start, end)
+
+        self._extract_mode = True
+
+        preview_times = self._times[start_idx:end_idx]
+        if len(preview_times) == 0:
+            preview_times = np.array([start])
+
+        self._extract_start = float(preview_times[0])
+        self._extract_end = float(preview_times[-1])
+
+        for curve, (samples, _color, _label) in zip(self._curve_items, self._series):
+            kept_samples = samples[start_idx:end_idx]
+            if len(kept_samples) == 0:
+                kept_samples = np.zeros(1, dtype=samples.dtype)
+            curve.setData(preview_times, kept_samples)
+
+        self._start_boundary.setPos(self._extract_start)
+        self._start_boundary.setVisible(True)
+        self._end_boundary.setPos(self._extract_end)
+        self._end_boundary.setVisible(True)
+
+        for line, original_t in zip(self._marker_lines, self._entity.markers_for(self._channel_index)):
+            if start < original_t < end:
+                line.setPos(original_t)
+                line.setVisible(True)
+            else:
+                line.setVisible(False)
+
+        self._hover_region.setVisible(False)
+        self._selection_region.setVisible(False)
+
+        preview_audio = self._engine.audio_data[start_idx:end_idx]
+        if len(preview_audio) == 0:
+            preview_audio = np.zeros(
+                (1,) + self._engine.audio_data.shape[1:], dtype=self._engine.audio_data.dtype
+            )
+        self._extract_engine = _PlaybackEngine(preview_audio, self._sample_rate)
+
+        self._extract_playhead.setPos(self._extract_start)
+        self._extract_playhead.setVisible(False)
+        self._plot.setXRange(self._extract_start, max(self._extract_end, self._extract_start + 0.001), padding=0.02)
+
+        self._refresh_segment_mode()
+        self._update_button_visibility()
+
+    def exit_extract_preview(self):
+        if not self._extract_mode:
+            return
+        if self._state != self.STATE_STOPPED:
+            self._do_reset()
+
+        self._extract_mode = False
+        self._extract_engine = None
+        self._extract_start = None
+        self._extract_end = None
+        self._extract_playhead.setVisible(False)
 
         for curve, (samples, _color, _label) in zip(self._curve_items, self._series):
             curve.setData(self._times, samples)
@@ -1152,6 +1249,8 @@ class WaveformPlayer(QWidget):
             self._exit_clip_mode()
         if self._trim_mode:
             self.exit_trim_preview()
+        if self._extract_mode:
+            self.exit_extract_preview()
         if self._timescale_mode:
             self.exit_timescale_preview()
         if self._concat_mode:
@@ -1213,7 +1312,7 @@ class WaveformPlayer(QWidget):
         self._playback_engine().pause()
         self._timer.stop()
         self._state = self.STATE_PAUSED
-        if not self._trim_mode:
+        if not self._trim_mode and not self._extract_mode:
             if self._edit_mode:
                 self._playhead.setPos(self._current_center_time())
                 self._playhead.setVisible(True)
@@ -1233,6 +1332,9 @@ class WaveformPlayer(QWidget):
         if self._trim_mode:
             self._trim_playhead.setPos(self._trim_start)
             self._trim_playhead.setVisible(False)
+        elif self._extract_mode:
+            self._extract_playhead.setPos(self._extract_start)
+            self._extract_playhead.setVisible(False)
         elif self._concat_mode:
             self._playhead.setVisible(False)
             self._plot.setXRange(
@@ -1259,6 +1361,12 @@ class WaveformPlayer(QWidget):
             self._trim_playhead.setVisible(True)
             return
 
+        if self._extract_mode:
+            current_time = self._extract_start + engine.current_frame() / self._sample_rate
+            self._extract_playhead.setPos(current_time)
+            self._extract_playhead.setVisible(True)
+            return
+
         current_time = self._start_time + engine.current_frame() / self._sample_rate
 
         if self._edit_mode:
@@ -1273,6 +1381,8 @@ class WaveformPlayer(QWidget):
     def _playback_engine(self):
         if self._trim_mode:
             return self._trim_engine
+        if self._extract_mode:
+            return self._extract_engine
         if self._concat_mode:
             return self._concat_engine
         if self._timescale_mode and self._timescale_engine is not None:
@@ -1309,6 +1419,15 @@ class WaveformPlayer(QWidget):
             self._trim_engine.seek(frame)
             self._trim_playhead.setPos(new_time)
             self._trim_playhead.setVisible(True)
+            return
+
+        if self._extract_mode:
+            current = self._extract_start + self._extract_engine.current_frame() / self._sample_rate
+            new_time = max(self._extract_start, min(current + dt, self._extract_end))
+            frame = int(round((new_time - self._extract_start) * self._sample_rate))
+            self._extract_engine.seek(frame)
+            self._extract_playhead.setPos(new_time)
+            self._extract_playhead.setVisible(True)
             return
 
         old_center = self._current_center_time()
