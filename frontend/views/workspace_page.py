@@ -168,6 +168,39 @@ class WorkspacePage(QWidget):
         self._playback_group = PlaybackGroup.get_instance()
         self._playback_group.active_changed.connect(self._on_playback_active_changed)
 
+    def _create_folder(self):
+        if not self._workspace:
+            return
+        parent = self._target_folder()
+        if parent is None:
+            return
+        dialog = CreateFolderDialog(self._workspace, parent, self)
+        if dialog.exec() != QDialog.DialogCode.Accepted:
+            return
+        name = dialog.folder_name()
+        if not name:
+            return
+        parent.add_child(Folder(name))
+        self._workspace.mark_dirty()
+        self._tree.populate(self._workspace.root)
+
+    def _create_entity(self):
+        if not self._workspace:
+            return
+        parent = self._target_folder()
+        if parent is None:
+            return
+        dialog = CreateEntityDialog(self._workspace, parent, self)
+        if dialog.exec() != QDialog.DialogCode.Accepted:
+            return
+        entity = dialog.created_entity()
+        if entity is None:
+            return
+        parent.add_child(entity)
+        self._workspace.mark_dirty()
+        self._tree.populate(self._workspace.root)
+        self._open_entity_tab(entity)
+
     # ------------------------------------------------------------------
     # UI construction
     # ------------------------------------------------------------------
@@ -544,38 +577,7 @@ class WorkspacePage(QWidget):
         selected = self._tree.selected_folder()
         return selected if selected is not None else self._workspace.root
 
-    def _create_folder(self):
-        if not self._workspace:
-            return
-        parent = self._target_folder()
-        if parent is None:
-            return
-        dialog = CreateFolderDialog(self._workspace, self)
-        if dialog.exec() != QDialog.DialogCode.Accepted:
-            return
-        name = dialog.folder_name()
-        if not name or parent.find_child_by_name(name):
-            return
-        parent.add_child(Folder(name))
-        self._workspace.mark_dirty()
-        self._tree.populate(self._workspace.root)
-
-    def _create_entity(self):
-        if not self._workspace:
-            return
-        parent = self._target_folder()
-        if parent is None:
-            return
-        dialog = CreateEntityDialog(self._workspace, self)
-        if dialog.exec() != QDialog.DialogCode.Accepted:
-            return
-        entity = dialog.created_entity()
-        if entity is None or parent.find_child_by_name(entity.name):
-            return
-        parent.add_child(entity)
-        self._workspace.mark_dirty()
-        self._tree.populate(self._workspace.root)
-        self._open_entity_tab(entity)
+    
 
     def _find_entity_tab(self, entity_id: str) -> int:
         for i in range(self._tab_bar.count()):

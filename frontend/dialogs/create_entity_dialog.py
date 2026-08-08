@@ -13,6 +13,7 @@ from PySide6.QtWidgets import (
     QRadioButton,
     QVBoxLayout,
     QWidget,
+    QLabel
 )
 
 from backend.workspace_model import Entity, Workspace
@@ -21,9 +22,10 @@ from backend.workspace_model import Entity, Workspace
 class CreateEntityDialog(QDialog):
     """Collect entity name and audio source (file or existing entity)."""
 
-    def __init__(self, workspace: Workspace, parent=None):
+    def __init__(self, workspace: Workspace, target_folder, parent=None):
         super().__init__(parent)
         self._workspace = workspace
+        self._target_folder = target_folder
         self._entity: Entity | None = None
 
         self.setWindowTitle("Create Entity")
@@ -36,8 +38,15 @@ class CreateEntityDialog(QDialog):
         form = QFormLayout()
         self._name_edit = QLineEdit()
         self._name_edit.setPlaceholderText("Entity name")
+        self._name_edit.textChanged.connect(self._validate_name)
         form.addRow("Name:", self._name_edit)
         layout.addLayout(form)
+
+        self._error_label = QLabel("")
+        self._error_label.setStyleSheet("color: #e57373;")
+        self._error_label.setWordWrap(True)
+        self._error_label.setVisible(False)
+        layout.addWidget(self._error_label)
 
         self._from_file_radio = QRadioButton("From audio file")
         self._from_entity_radio = QRadioButton("From existing entity")
@@ -62,12 +71,14 @@ class CreateEntityDialog(QDialog):
         self._from_file_radio.toggled.connect(self._update_source_enabled)
         self._update_source_enabled()
 
-        buttons = QDialogButtonBox(
+        self._buttons = QDialogButtonBox(
             QDialogButtonBox.Ok | QDialogButtonBox.Cancel
         )
-        buttons.accepted.connect(self._on_accept)
-        buttons.rejected.connect(self.reject)
-        layout.addWidget(buttons)
+        self._buttons.accepted.connect(self._on_accept)
+        self._buttons.rejected.connect(self.reject)
+        layout.addWidget(self._buttons)
+
+        self._validate_name()
 
     def _collect_entities(self) -> list[Entity]:
         entities: list[Entity] = []
@@ -89,6 +100,16 @@ class CreateEntityDialog(QDialog):
         self._entity_combo.setVisible(not from_file)
         self.adjustSize()
 
+    def _validate_name(self):
+        name = self._name_edit.text().strip()
+        error = None
+        if name and self._target_folder.find_child_by_name(name):
+            error = f'A folder or entity named "{name}" already exists here.'
+
+        self._error_label.setText(error or "")
+        self._error_label.setVisible(bool(error))
+        self._buttons.button(QDialogButtonBox.Ok).setEnabled(bool(name) and not error)
+
     def _browse_file(self):
         path, _ = QFileDialog.getOpenFileName(
             self,
@@ -101,7 +122,8 @@ class CreateEntityDialog(QDialog):
 
     def _on_accept(self):
         name = self._name_edit.text().strip()
-        if not name:
+        if not name or self._target_folder.find_child_by_name(name):
+            self._validate_name()
             return
 
         try:
