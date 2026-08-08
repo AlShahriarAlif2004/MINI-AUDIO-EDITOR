@@ -348,8 +348,12 @@ class WaveformPlayer(QWidget):
         self._timescale_mode = False
         self._vscale_mode = False
         self._vscale_range = None
+        self._effect_mode = None          # 'reverse' | 'fade_in' | 'fade_out' | None
+        self._effect_range = None
+        self._effect_engine = None        # _PlaybackEngine over the previewed (modified) audio
         self._preview_curve_index = None
         self._preview_curve_range = None
+        self._preview_curve_effect = None  # set when the mirrored curve preview is a factor-free effect
 
         self._timer = QTimer(self)
         self._timer.setInterval(_TICK_MS)
@@ -530,6 +534,7 @@ class WaveformPlayer(QWidget):
             and not self._trim_mode
             and not self._timescale_mode
             and not self._vscale_mode
+            and self._effect_mode is None
             and not self._segment_locked
         )
         self._plot.set_segment_mode(
@@ -732,6 +737,98 @@ class WaveformPlayer(QWidget):
         self._autoscale_y_for_preview()
         self._refresh_segment_mode()
 
+    @staticmethod
+    def _compute_effect(effect, segment):
+        """Factor-free preview transform applied to one segment of samples.
+        Mirrors the multiply-by-factor step in _update_vertical_scale_display,
+        just with reverse/fade_in/fade_out standing in for the factor."""
+        if effect == "reverse":
+            return segment[::-1].copy()
+
+        if len(segment) <= 1:
+            return np.zeros_like(segment)
+
+        if effect == "fade_in":
+            factors = np.linspace(0.0, 1.0, len(segment))
+        elif effect == "fade_out":
+            factors = np.linspace(1.0, 0.0, len(segment))
+        else:
+            return segment
+
+        if segment.ndim > 1:
+            factors = factors[:, np.newaxis]   # broadcast across channels for 2-D playback buffers
+
+        return segment * factors
+
+    def enter_effect_preview(self, effect, start, end):
+        """Live preview for reverse / fade_in / fade_out over the selected
+        range. Just like enter_vertical_scale_preview, no time-axis
+        remapping happens here, so markers and the selection box don't move.
+        Unlike vertical scale there's no factor to tweak, so the preview is
+        computed once up front instead of on every slider change."""
+        self._effect_mode = effect
+        self._effect_range = (start, end)
+        self._hover_region.setVisible(False)
+        self._update_effect_display()
+        self._build_effect_preview_engine()
+        self._refresh_segment_mode()
+
+    def _build_effect_preview_engine(self):
+        """Mirrors the (visual-only) curve preview onto an actual playback
+        buffer, so Play hears the reverse/fade_in/fade_out too instead of
+        the original audio."""
+        start, end = self._effect_range
+        start_idx, end_idx = self._preview_slice_indices(start, end)
+        preview_audio = self._engine.audio_data.copy()
+        preview_audio[start_idx:end_idx] = self._compute_effect(
+            self._effect_mode, preview_audio[start_idx:end_idx]
+        )
+        self._effect_engine = _PlaybackEngine(preview_audio, self._sample_rate)
+
+    def _update_effect_display(self):
+        start, end = self._effect_range
+        start_idx, end_idx = self._preview_slice_indices(start, end)
+        for curve, (samples, _color, _label) in zip(self._curve_items, self._series):
+            preview = samples.copy()
+            preview[start_idx:end_idx] = self._compute_effect(
+                self._effect_mode, preview[start_idx:end_idx]
+            )
+            curve.setData(self._times, preview)
+        self._autoscale_y_for_preview()
+
+    def exit_effect_preview(self):
+        if self._effect_mode is None:
+            return
+        if self._state != self.STATE_STOPPED and self._playback_engine() is self._effect_engine:
+            self._do_reset()
+        self._effect_mode = None
+        self._effect_range = None
+        self._effect_engine = None
+        for curve, (samples, _color, _label) in zip(self._curve_items, self._series):
+            curve.setData(self._times, samples)
+        self._autoscale_y_for_preview()
+        self._refresh_segment_mode()
+
+    def preview_channel_curve_effect(self, curve_index, effect, start, end):
+        """Mirror another plot's reverse/fade_in/fade_out preview onto one
+        overlaid curve here — the effect counterpart of preview_channel_curve."""
+        self._preview_curve_index = curve_index
+        self._preview_curve_range = (start, end)
+        self._preview_curve_effect = effect
+        self._update_channel_curve_effect_preview()
+
+    def _update_channel_curve_effect_preview(self):
+        curve_index = self._preview_curve_index
+        start, end = self._preview_curve_range
+        start_idx, end_idx = self._preview_slice_indices(start, end)
+        samples = self._series[curve_index][0]
+        preview = samples.copy()
+        preview[start_idx:end_idx] = self._compute_effect(
+            self._preview_curve_effect, preview[start_idx:end_idx]
+        )
+        self._curve_items[curve_index].setData(self._times, preview)
+        self._autoscale_y_for_preview()
+
     def preview_channel_curve(self, curve_index, factor, start, end):
         """Live-preview another plot's vertical-scale edit by scaling just
         that one overlaid curve here too. Used on the Overall plot so a
@@ -763,6 +860,7 @@ class WaveformPlayer(QWidget):
         self._curve_items[curve_index].setData(self._times, samples)
         self._preview_curve_index = None
         self._preview_curve_range = None
+        self._preview_curve_effect = None
         self._autoscale_y_for_preview()
 
     def restore_selection_visual(self):
@@ -876,6 +974,8 @@ class WaveformPlayer(QWidget):
             self.exit_timescale_preview()
         if self._vscale_mode:
             self.exit_vertical_scale_preview()
+        if self._effect_mode is not None:
+            self.exit_effect_preview()
         if self._preview_curve_index is not None:     # ← add
             self.exit_channel_curve_preview()
         if self._state != self.STATE_STOPPED:
@@ -907,14 +1007,14 @@ class WaveformPlayer(QWidget):
         if not self._group.request_play(self):
             return
         self._state = self.STATE_PLAYING
-        (self._trim_engine if self._trim_mode else self._engine).start_or_resume()
+        self._playback_engine().start_or_resume()
         self._timer.start()
         self._update_button_visibility()
         self._refresh_clip_enabled()
         self._refresh_segment_mode()
 
     def _on_pause_clicked(self):
-        (self._trim_engine if self._trim_mode else self._engine).pause()
+        self._playback_engine().pause()
         self._timer.stop()
         self._state = self.STATE_PAUSED
         if not self._trim_mode:
@@ -931,7 +1031,7 @@ class WaveformPlayer(QWidget):
         self._do_reset()
 
     def _do_reset(self):
-        (self._trim_engine if self._trim_mode else self._engine).stop()
+        self._playback_engine().stop()
         self._timer.stop()
         self._state = self.STATE_STOPPED
         if self._trim_mode:
@@ -945,7 +1045,7 @@ class WaveformPlayer(QWidget):
         self._refresh_segment_mode()  
 
     def _on_tick(self):
-        engine = self._trim_engine if self._trim_mode else self._engine
+        engine = self._playback_engine()
         if engine.is_finished():
             self._do_reset()
             return
@@ -967,8 +1067,18 @@ class WaveformPlayer(QWidget):
         if self._is_driver:
             self._group.broadcast_position(current_time)
 
+    def _playback_engine(self):
+        """Whichever engine should actually drive Play/Pause/Reset right now:
+        the trim preview, the reverse/fade_in/fade_out preview, or the
+        real audio."""
+        if self._trim_mode:
+            return self._trim_engine
+        if self._effect_mode is not None and self._effect_engine is not None:
+            return self._effect_engine
+        return self._engine
+
     def _current_center_time(self):
-        return self._start_time + self._engine.current_frame() / self._sample_rate
+        return self._start_time + self._playback_engine().current_frame() / self._sample_rate
 
     def _clamp_time(self, t):
         return max(self._start_time, min(t, self._end_time))
@@ -979,7 +1089,7 @@ class WaveformPlayer(QWidget):
         self._drag_was_playing = (self._state == self.STATE_PLAYING)
         if self._drag_was_playing:
             self._timer.stop()
-            (self._trim_engine if self._trim_mode else self._engine).pause()
+            self._playback_engine().pause()
 
     def _on_seek(self, dt):
         if self._state not in (self.STATE_PLAYING, self.STATE_PAUSED):
@@ -1002,7 +1112,7 @@ class WaveformPlayer(QWidget):
         actual_dt = new_time - old_center
 
         frame = int(round((new_time - self._start_time) * self._sample_rate))
-        self._engine.seek(frame)
+        self._playback_engine().seek(frame)
 
         if self._edit_mode:
             self._playhead.setPos(new_time)
@@ -1021,15 +1131,7 @@ class WaveformPlayer(QWidget):
         if self._state not in (self.STATE_PLAYING, self.STATE_PAUSED):
             return
         if getattr(self, "_drag_was_playing", False):
-            (self._trim_engine if self._trim_mode else self._engine).start_or_resume()
-            self._timer.start()
-        self._drag_was_playing = False
-    def _on_drag_end(self):
-        if self._state not in (self.STATE_PLAYING, self.STATE_PAUSED):
-            return
-
-        if getattr(self, "_drag_was_playing", False):
-            self._engine.start_or_resume()   # single, clean restart
+            self._playback_engine().start_or_resume()
             self._timer.start()
         self._drag_was_playing = False
 

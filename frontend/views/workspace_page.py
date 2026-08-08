@@ -155,6 +155,12 @@ class WorkspacePage(QWidget):
         self._timescale_active_view = None
         self._vscale_active = False
         self._vscale_active_view = None
+        self._reverse_active = False
+        self._reverse_active_view = None
+        self._fadein_active = False
+        self._fadein_active_view = None
+        self._fadeout_active = False
+        self._fadeout_active_view = None
         self._build_ui()
         self._playback_group = PlaybackGroup.get_instance()
         self._playback_group.active_changed.connect(self._on_playback_active_changed)
@@ -226,7 +232,7 @@ class WorkspacePage(QWidget):
 
         self._segment_buttons: dict[str, QPushButton] = {}
 
-        for label in ("Trim", "Time Scale", "Vertical Scale", "Reverse", "Shift",
+        for label in ("Trim", "Time Scale", "Vertical Scale", "Reverse",
                       "Fade In", "Fade Out", "Concatenate"):
             btn = QPushButton(label)
             btn.setEnabled(False)          # disabled until a segment is selected
@@ -311,6 +317,57 @@ class WorkspacePage(QWidget):
 
                 self._vscale_panel.setVisible(False)
                 edit_options_layout.addWidget(self._vscale_panel)
+
+            elif label == "Reverse":
+                self._reverse_btn = btn
+                btn.clicked.connect(self._on_reverse_clicked)
+
+                self._reverse_panel = QWidget()
+                reverse_panel_layout = QHBoxLayout(self._reverse_panel)
+                reverse_panel_layout.setContentsMargins(16, 0, 0, 0)
+                reverse_panel_layout.setSpacing(6)
+                self._reverse_apply_btn  = QPushButton("Apply")
+                self._reverse_cancel_btn = QPushButton("Cancel")
+                self._reverse_apply_btn.clicked.connect(self._on_reverse_apply_clicked)
+                self._reverse_cancel_btn.clicked.connect(self._on_reverse_cancel_clicked)
+                reverse_panel_layout.addWidget(self._reverse_apply_btn)
+                reverse_panel_layout.addWidget(self._reverse_cancel_btn)
+                self._reverse_panel.setVisible(False)
+                edit_options_layout.addWidget(self._reverse_panel)
+
+            elif label == "Fade In":
+                self._fadein_btn = btn
+                btn.clicked.connect(self._on_fadein_clicked)
+
+                self._fadein_panel = QWidget()
+                fadein_panel_layout = QHBoxLayout(self._fadein_panel)
+                fadein_panel_layout.setContentsMargins(16, 0, 0, 0)
+                fadein_panel_layout.setSpacing(6)
+                self._fadein_apply_btn  = QPushButton("Apply")
+                self._fadein_cancel_btn = QPushButton("Cancel")
+                self._fadein_apply_btn.clicked.connect(self._on_fadein_apply_clicked)
+                self._fadein_cancel_btn.clicked.connect(self._on_fadein_cancel_clicked)
+                fadein_panel_layout.addWidget(self._fadein_apply_btn)
+                fadein_panel_layout.addWidget(self._fadein_cancel_btn)
+                self._fadein_panel.setVisible(False)
+                edit_options_layout.addWidget(self._fadein_panel)
+
+            elif label == "Fade Out":
+                self._fadeout_btn = btn
+                btn.clicked.connect(self._on_fadeout_clicked)
+
+                self._fadeout_panel = QWidget()
+                fadeout_panel_layout = QHBoxLayout(self._fadeout_panel)
+                fadeout_panel_layout.setContentsMargins(16, 0, 0, 0)
+                fadeout_panel_layout.setSpacing(6)
+                self._fadeout_apply_btn  = QPushButton("Apply")
+                self._fadeout_cancel_btn = QPushButton("Cancel")
+                self._fadeout_apply_btn.clicked.connect(self._on_fadeout_apply_clicked)
+                self._fadeout_cancel_btn.clicked.connect(self._on_fadeout_cancel_clicked)
+                fadeout_panel_layout.addWidget(self._fadeout_apply_btn)
+                fadeout_panel_layout.addWidget(self._fadeout_cancel_btn)
+                self._fadeout_panel.setVisible(False)
+                edit_options_layout.addWidget(self._fadeout_panel)
 
         edit_options_layout.addStretch()
         self._edit_options_panel.setVisible(False)   # shown when edit mode is active
@@ -409,6 +466,10 @@ class WorkspacePage(QWidget):
 
         self._cancel_trim_if_active()
         self._cancel_timescale_if_active()
+        self._cancel_vscale_if_active()
+        self._cancel_reverse_if_active()
+        self._cancel_fadein_if_active()
+        self._cancel_fadeout_if_active()
         self._clear_all_plot_selections()
 
         if mode == "edit":
@@ -530,7 +591,10 @@ class WorkspacePage(QWidget):
                 btn.setEnabled(True)
 
     def _refresh_tab_bar_lock(self):
-        locked = self._trim_active or self._timescale_active or self._vscale_active
+        locked = (
+            self._trim_active or self._timescale_active or self._vscale_active
+            or self._reverse_active or self._fadein_active or self._fadeout_active
+        )
         self._tab_bar.setEnabled(not locked)
 
     def _on_segment_selected(self, entity, channel_index, start, end):
@@ -586,7 +650,10 @@ class WorkspacePage(QWidget):
             return
         # Fold timescale if it was open
         self._cancel_timescale_if_active()
-        self._cancel_vscale_if_active() 
+        self._cancel_vscale_if_active()
+        self._cancel_reverse_if_active()
+        self._cancel_fadein_if_active()
+        self._cancel_fadeout_if_active()
         view = self._current_entity_view()
         if view is None or not view.begin_trim():
             return
@@ -636,6 +703,9 @@ class WorkspacePage(QWidget):
         # Fold trim if it was open
         self._cancel_trim_if_active()
         self._cancel_vscale_if_active()
+        self._cancel_reverse_if_active()
+        self._cancel_fadein_if_active()
+        self._cancel_fadeout_if_active()
         view = self._current_entity_view()
         if view is None or not view.begin_timescale():
             return
@@ -691,6 +761,9 @@ class WorkspacePage(QWidget):
             return
         self._cancel_trim_if_active()
         self._cancel_timescale_if_active()
+        self._cancel_reverse_if_active()
+        self._cancel_fadein_if_active()
+        self._cancel_fadeout_if_active()
         view = self._current_entity_view()
         if view is None or not view.begin_vertical_scale():
             return
@@ -719,7 +792,157 @@ class WorkspacePage(QWidget):
         view = self._vscale_active_view
         self._collapse_vscale_ui()
         view.cancel_vertical_scale()
-    
+
+    # ------------------------------------------------------------------
+    # Reverse
+    # ------------------------------------------------------------------
+
+    def _collapse_reverse_ui(self):
+        self._reverse_active = False
+        self._reverse_active_view = None
+        self._reverse_btn.setStyleSheet("")
+        self._reverse_panel.setVisible(False)
+        self._refresh_tab_bar_lock()
+
+    def _cancel_reverse_if_active(self):
+        if self._reverse_active and self._reverse_active_view is not None:
+            view = self._reverse_active_view
+            self._collapse_reverse_ui()
+            view.cancel_effect()
+        elif self._reverse_active:
+            self._collapse_reverse_ui()
+
+    def _on_reverse_clicked(self):
+        if self._reverse_active:
+            return
+        self._cancel_trim_if_active()
+        self._cancel_timescale_if_active()
+        self._cancel_vscale_if_active()
+        self._cancel_fadein_if_active()
+        self._cancel_fadeout_if_active()
+        view = self._current_entity_view()
+        if view is None or not view.begin_reverse():
+            return
+        self._reverse_active = True
+        self._reverse_active_view = view
+        self._reverse_btn.setStyleSheet(self._SELECTED_OPTION_STYLE)
+        self._reverse_panel.setVisible(True)
+        self._refresh_tab_bar_lock()
+
+    def _on_reverse_apply_clicked(self):
+        if not self._reverse_active or self._reverse_active_view is None:
+            return
+        view = self._reverse_active_view
+        self._collapse_reverse_ui()
+        view.apply_effect()
+
+    def _on_reverse_cancel_clicked(self):
+        if not self._reverse_active or self._reverse_active_view is None:
+            return
+        view = self._reverse_active_view
+        self._collapse_reverse_ui()
+        view.cancel_effect()
+
+    # ------------------------------------------------------------------
+    # Fade In
+    # ------------------------------------------------------------------
+
+    def _collapse_fadein_ui(self):
+        self._fadein_active = False
+        self._fadein_active_view = None
+        self._fadein_btn.setStyleSheet("")
+        self._fadein_panel.setVisible(False)
+        self._refresh_tab_bar_lock()
+
+    def _cancel_fadein_if_active(self):
+        if self._fadein_active and self._fadein_active_view is not None:
+            view = self._fadein_active_view
+            self._collapse_fadein_ui()
+            view.cancel_effect()
+        elif self._fadein_active:
+            self._collapse_fadein_ui()
+
+    def _on_fadein_clicked(self):
+        if self._fadein_active:
+            return
+        self._cancel_trim_if_active()
+        self._cancel_timescale_if_active()
+        self._cancel_vscale_if_active()
+        self._cancel_reverse_if_active()
+        self._cancel_fadeout_if_active()
+        view = self._current_entity_view()
+        if view is None or not view.begin_fade_in():
+            return
+        self._fadein_active = True
+        self._fadein_active_view = view
+        self._fadein_btn.setStyleSheet(self._SELECTED_OPTION_STYLE)
+        self._fadein_panel.setVisible(True)
+        self._refresh_tab_bar_lock()
+
+    def _on_fadein_apply_clicked(self):
+        if not self._fadein_active or self._fadein_active_view is None:
+            return
+        view = self._fadein_active_view
+        self._collapse_fadein_ui()
+        view.apply_effect()
+
+    def _on_fadein_cancel_clicked(self):
+        if not self._fadein_active or self._fadein_active_view is None:
+            return
+        view = self._fadein_active_view
+        self._collapse_fadein_ui()
+        view.cancel_effect()
+
+    # ------------------------------------------------------------------
+    # Fade Out
+    # ------------------------------------------------------------------
+
+    def _collapse_fadeout_ui(self):
+        self._fadeout_active = False
+        self._fadeout_active_view = None
+        self._fadeout_btn.setStyleSheet("")
+        self._fadeout_panel.setVisible(False)
+        self._refresh_tab_bar_lock()
+
+    def _cancel_fadeout_if_active(self):
+        if self._fadeout_active and self._fadeout_active_view is not None:
+            view = self._fadeout_active_view
+            self._collapse_fadeout_ui()
+            view.cancel_effect()
+        elif self._fadeout_active:
+            self._collapse_fadeout_ui()
+
+    def _on_fadeout_clicked(self):
+        if self._fadeout_active:
+            return
+        self._cancel_trim_if_active()
+        self._cancel_timescale_if_active()
+        self._cancel_vscale_if_active()
+        self._cancel_reverse_if_active()
+        self._cancel_fadein_if_active()
+        view = self._current_entity_view()
+        if view is None or not view.begin_fade_out():
+            return
+        self._fadeout_active = True
+        self._fadeout_active_view = view
+        self._fadeout_btn.setStyleSheet(self._SELECTED_OPTION_STYLE)
+        self._fadeout_panel.setVisible(True)
+        self._refresh_tab_bar_lock()
+
+    def _on_fadeout_apply_clicked(self):
+        if not self._fadeout_active or self._fadeout_active_view is None:
+            return
+        view = self._fadeout_active_view
+        self._collapse_fadeout_ui()
+        view.apply_effect()
+
+    def _on_fadeout_cancel_clicked(self):
+        if not self._fadeout_active or self._fadeout_active_view is None:
+            return
+        view = self._fadeout_active_view
+        self._collapse_fadeout_ui()
+        view.cancel_effect()
+
     # ------------------------------------------------------------------
     # Entity-view factory / tab lifecycle
     # ------------------------------------------------------------------
@@ -732,6 +955,9 @@ class WorkspacePage(QWidget):
         entity_view.entity_trimmed.connect(lambda: self._rebuild_entity_tab(entity))
         entity_view.entity_timescaled.connect(lambda: self._rebuild_entity_tab(entity))
         entity_view.entity_vscaled.connect(lambda: self._rebuild_entity_tab(entity))
+        entity_view.entity_reversed.connect(lambda: self._rebuild_entity_tab(entity))
+        entity_view.entity_faded_in.connect(lambda: self._rebuild_entity_tab(entity))
+        entity_view.entity_faded_out.connect(lambda: self._rebuild_entity_tab(entity))
         entity_view.trim_cancelled.connect(self._on_trim_cancelled_externally)
         entity_view.set_edit_mode(self._mode == "edit")
         return entity_view
@@ -764,6 +990,12 @@ class WorkspacePage(QWidget):
             self._collapse_timescale_ui()
         if old_widget is self._vscale_active_view:     # ← add (both methods; use `widget` instead of `old_widget` in _close_tab)
             self._collapse_vscale_ui()
+        if old_widget is self._reverse_active_view:
+            self._collapse_reverse_ui()
+        if old_widget is self._fadein_active_view:
+            self._collapse_fadein_ui()
+        if old_widget is self._fadeout_active_view:
+            self._collapse_fadeout_ui()
 
         self._content_stack.removeWidget(old_widget)
         old_widget.deleteLater()
@@ -799,6 +1031,9 @@ class WorkspacePage(QWidget):
         self._cancel_trim_if_active()
         self._cancel_timescale_if_active()
         self._cancel_vscale_if_active()
+        self._cancel_reverse_if_active()
+        self._cancel_fadein_if_active()
+        self._cancel_fadeout_if_active()
         self._force_stop_active_playback()      # ← add, before selection clearing
         self._clear_all_plot_selections()
     

@@ -29,6 +29,9 @@ class EntityPlotView(QWidget):
     entity_trimmed = Signal()
     entity_timescaled = Signal()
     entity_vscaled = Signal()
+    entity_reversed = Signal()
+    entity_faded_in = Signal()
+    entity_faded_out = Signal()
     trim_cancelled = Signal()
     segment_selected = Signal(object, object, float, float)
     segment_deselected = Signal()
@@ -53,6 +56,11 @@ class EntityPlotView(QWidget):
         self._vscale_range = None
         self._vscale_mirror_players = []     # channel players mirrored when Overall is selected
         self._vscale_overall_target = None   # Overall player mirrored when a channel is selected
+        self._effect_op = None               # 'reverse' | 'fade_in' | 'fade_out'
+        self._effect_player = None
+        self._effect_range = None
+        self._effect_mirror_players = []     # channel players mirrored when Overall is selected
+        self._effect_overall_target = None   # Overall player mirrored when a channel is selected
         self._build_ui()
 
     @property
@@ -258,6 +266,117 @@ class EntityPlotView(QWidget):
 
         self._entity.clip = new_clip
 
+    # ------------------------------------------------------------------
+    # Reverse / Fade In / Fade Out preview
+    # ------------------------------------------------------------------
+    # Same architecture as vertical scale: a preview lives on the selected
+    # player and, when a channel is selected, mirrors onto that channel's
+    # curve in the Overall plot; when Overall is selected, mirrors onto
+    # every channel plot. The only difference from vertical scale is that
+    # none of these operations take a factor, so there's no live-update
+    # step — the preview is computed once when the op begins.
+
+    def begin_effect(self, op) -> bool:
+        if self._selected_player is None:
+            return False
+        segment = self._selected_player.selected_segment
+        if segment is None:
+            return False
+
+        self._effect_op = op
+        self._effect_player = self._selected_player
+        self._effect_range = segment
+        self._effect_player.enter_effect_preview(op, *segment)
+
+        self._effect_overall_target = None
+        self._effect_mirror_players = []
+
+        if self._effect_player.channel_index is not None:
+            # A single channel was selected — mirror the preview onto that
+            # channel's curve inside the Overall plot.
+            overall_player = self._find_overall_player()
+            if overall_player is not None and overall_player is not self._effect_player:
+                overall_player.preview_channel_curve_effect(self._effect_player.channel_index, op, *segment)
+                self._effect_overall_target = overall_player
+        else:
+            # The Overall plot was selected — it applies the effect to
+            # every channel uniformly, so mirror the same preview onto
+            # each channel plot.
+            self._effect_mirror_players = [
+                p for p in self._players
+                if p is not self._effect_player and p.channel_index is not None
+            ]
+            for player in self._effect_mirror_players:
+                player.enter_effect_preview(op, *segment)
+
+        self._lock_selection(True)
+        return True
+
+    def begin_reverse(self) -> bool:
+        return self.begin_effect("reverse")
+
+    def begin_fade_in(self) -> bool:
+        return self.begin_effect("fade_in")
+
+    def begin_fade_out(self) -> bool:
+        return self.begin_effect("fade_out")
+
+    def cancel_effect(self):
+        if self._effect_player is None:
+            return
+        self._effect_player.exit_effect_preview()
+        if self._effect_overall_target is not None:
+            self._effect_overall_target.exit_channel_curve_preview()
+        for player in self._effect_mirror_players:
+            player.exit_effect_preview()
+        self._effect_op = None
+        self._effect_player = None
+        self._effect_overall_target = None
+        self._effect_mirror_players = []
+        self._effect_range = None
+        self._lock_selection(False)
+        if self._selected_player is not None:
+            self._selected_player.restore_selection_visual()
+
+    def apply_effect(self):
+        if self._effect_player is None:
+            return
+        op = self._effect_op
+        channel_index = self._effect_player.channel_index
+        start, end = self._effect_range
+        self._effect_player.exit_effect_preview()
+        if self._effect_overall_target is not None:
+            self._effect_overall_target.exit_channel_curve_preview()
+        for player in self._effect_mirror_players:
+            player.exit_effect_preview()
+        self._perform_effect(op, channel_index, start, end)
+        self._effect_op = None
+        self._effect_player = None
+        self._effect_overall_target = None
+        self._effect_mirror_players = []
+        self._effect_range = None
+        self._lock_selection(False)
+        self.clear_all_selection()
+        self.entity_modified.emit()
+        if op == "reverse":
+            self.entity_reversed.emit()
+        elif op == "fade_in":
+            self.entity_faded_in.emit()
+        elif op == "fade_out":
+            self.entity_faded_out.emit()
+
+    def _perform_effect(self, op, channel_index, start, end):
+        clip = self._entity.clip
+        start_idx = clip.get_index(start)
+        end_idx = clip.get_index(end)
+
+        if channel_index is None:
+            new_clip = clip.apply(op, start_idx, end_idx)
+        else:
+            new_clip = clip.apply(op, start_idx, end_idx, channel=channel_index)
+
+        self._entity.clip = new_clip
+
     def _perform_trim(self, start, end):
         clip = self._entity.clip
         remove_start_idx = clip.get_index(start)
@@ -307,7 +426,8 @@ class EntityPlotView(QWidget):
             ]
 
     def _on_canvas_clicked(self):
-        if self._trim_player is not None or self._timescale_preview_active or self._vscale_player is not None:
+        if (self._trim_player is not None or self._timescale_preview_active
+                or self._vscale_player is not None or self._effect_player is not None):
             return
         self.clear_all_selection()
         if self._trim_player is not None:
@@ -386,6 +506,7 @@ class EntityPlotView(QWidget):
         self.cancel_trim()
         self.cancel_timescale()
         self.cancel_vertical_scale()
+        self.cancel_effect()
         for player in self._players:
             player.force_idle()
         self.clear_all_selection()
