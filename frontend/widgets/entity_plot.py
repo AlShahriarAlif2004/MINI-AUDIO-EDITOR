@@ -53,6 +53,7 @@ class EntityPlotView(QWidget):
         self._trim_player = None
         self._trim_range = None
         self._timescale_preview_active = False
+        self._timescale_range = None
         self._vscale_player = None
         self._vscale_range = None
         self._vscale_mirror_players = []     # channel players mirrored when Overall is selected
@@ -125,12 +126,18 @@ class EntityPlotView(QWidget):
     # ------------------------------------------------------------------
 
     def begin_timescale(self) -> bool:
-        """Enter timescale preview. Only valid when the overall plot is selected."""
+        """Enter timescale preview. Only valid when the overall plot is
+        selected with a segment chosen — the factor applies to that
+        segment only, not the whole clip."""
         if self._selected_player is None or self._selected_player.channel_index is not None:
             return False
+        segment = self._selected_player.selected_segment
+        if segment is None:
+            return False
         self._timescale_preview_active = True
+        self._timescale_range = segment
         for player in self._players:
-            player.enter_timescale_preview(1.0)
+            player.enter_timescale_preview(1.0, *segment)
         self._lock_selection(True)
         return True
 
@@ -146,6 +153,7 @@ class EntityPlotView(QWidget):
         if not self._timescale_preview_active:
             return
         self._timescale_preview_active = False
+        self._timescale_range = None
         for player in self._players:
             player.exit_timescale_preview()
         self._lock_selection(False)
@@ -160,21 +168,62 @@ class EntityPlotView(QWidget):
         self._timescale_preview_active = False
         for player in self._players:
             player.exit_timescale_preview()
-        self._perform_timescale(factor)
+        start, end = self._timescale_range
+        self._timescale_range = None
+        self._perform_timescale(factor, start, end)
         self._lock_selection(False)
         self.clear_all_selection()   # apply clears selection
         self.entity_modified.emit()
         self.entity_timescaled.emit()
 
-    def _perform_timescale(self, factor: float):
+    def _perform_timescale(self, factor: float, start, end):
         clip = self._entity.clip
-        new_channels = [ch.time_scale(factor) for ch in clip.channels]
+        start_idx = clip.get_index(start)
+        end_idx = clip.get_index(end)
+
+        new_channels = []
+        added_len = 0
+        for ch in clip.channels:
+            pieces = []
+            if start_idx > ch.start_index:
+                pieces.append(ch.trim(ch.start_index, start_idx - 1))
+
+            seg_end_idx = min(end_idx, ch.end_index())
+            if seg_end_idx >= start_idx:
+                segment = ch.trim(start_idx, seg_end_idx).time_scale(factor)
+                added_len = len(segment.samples)
+                pieces.append(segment)
+
+            if end_idx < ch.end_index():
+                pieces.append(ch.trim(end_idx + 1, ch.end_index()))
+
+            if not pieces:
+                pieces = [Discrete_Signal(
+                    np.zeros(1, dtype=ch.samples.dtype), ch.sample_rate, ch.start_index
+                )]
+
+            merged = pieces[0]
+            for piece in pieces[1:]:
+                merged = merged.concatenate(piece)
+            new_channels.append(merged)
+
         self._entity.clip = AudioClip(new_channels, name=clip.name)
-        # Rescale marker/division timestamps proportionally
-        self._entity.divisions = [t * factor for t in self._entity.divisions]
+
+        removed_span = end - start
+        new_seg_duration = added_len / clip.sample_rate
+        delta = new_seg_duration - removed_span
+
+        def _shift_time(t):
+            if t <= start:
+                return t
+            if t >= end:
+                return t + delta
+            return start + (t - start) * factor   # marker fell inside the scaled segment
+
+        self._entity.divisions = [_shift_time(t) for t in self._entity.divisions]
         for ch_idx in list(self._entity.channel_markers.keys()):
             self._entity.channel_markers[ch_idx] = [
-                t * factor for t in self._entity.channel_markers[ch_idx]
+                _shift_time(t) for t in self._entity.channel_markers[ch_idx]
             ]
 
     # ------------------------------------------------------------------

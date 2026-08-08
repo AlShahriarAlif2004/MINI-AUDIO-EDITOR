@@ -346,12 +346,16 @@ class WaveformPlayer(QWidget):
         self._trim_end = None
 
         self._timescale_mode = False
+        self._timescale_range = None
+        self._timescale_preview_end = None
+        self._timescale_engine = None
         self._concat_mode = False
         self._concat_engine = None
         self._concat_times = None
         self._concat_end = None
         self._vscale_mode = False
         self._vscale_range = None
+        self._vscale_engine = None
         self._effect_mode = None          # 'reverse' | 'fade_in' | 'fade_out' | None
         self._effect_range = None
         self._effect_engine = None        # _PlaybackEngine over the previewed (modified) audio
@@ -654,9 +658,13 @@ class WaveformPlayer(QWidget):
     # Timescale preview
     # ------------------------------------------------------------------
 
-    def enter_timescale_preview(self, factor: float):
-        """Show a scaled version of the waveform (time-axis only) as a preview."""
+    def enter_timescale_preview(self, factor: float, start, end):
+        """Show a scaled version of the waveform (time-axis only) as a
+        preview, restricted to [start, end]. Content before start is
+        untouched; content after end keeps its shape and just shifts to
+        stay contiguous with the resized segment."""
         self._timescale_mode = True
+        self._timescale_range = (start, end)
         self._hover_region.setVisible(False)
         self._update_timescale_display(factor)
         self._refresh_segment_mode()
@@ -668,32 +676,87 @@ class WaveformPlayer(QWidget):
 
     def _update_timescale_display(self, factor: float):
         factor = max(0.1, float(factor))
-        start = self._start_time
-        preview_times = start + (self._times - start) * factor
+        start, end = self._timescale_range
+        start_idx, end_idx = self._preview_slice_indices(start, end)
+        dt = 1.0 / self._sample_rate
+
+        seg_len = end_idx - start_idx
+        new_seg_len = max(1, round(seg_len * factor))
+        delta = (new_seg_len - seg_len) * dt
+
+        seg_start_time = self._times[start_idx] if start_idx < len(self._times) else start
+        preview_seg_times = seg_start_time + np.arange(new_seg_len) * dt
+        preview_times = np.concatenate([
+            self._times[:start_idx],
+            preview_seg_times,
+            self._times[end_idx:] + delta,
+        ])
+
+        old_pos = np.arange(max(seg_len, 1))
+        new_pos = np.linspace(0, max(seg_len - 1, 0), new_seg_len)
+
         for curve, (samples, _color, _label) in zip(self._curve_items, self._series):
-            curve.setData(preview_times, samples)
+            seg = samples[start_idx:end_idx]
+            scaled_seg = np.interp(new_pos, old_pos, seg) if seg_len > 0 else np.zeros(new_seg_len)
+            preview_samples = np.concatenate([samples[:start_idx], scaled_seg, samples[end_idx:]])
+            curve.setData(preview_times, preview_samples)
+
         preview_end = float(preview_times[-1]) if len(preview_times) > 0 else start + 0.001
+        self._timescale_preview_end = preview_end
         self._end_boundary.setPos(preview_end)
 
-        # Keep division/marker lines aligned with the stretched waveform.
-        for line, original_t in zip(self._marker_lines, self._entity.markers_for(self._channel_index)):
-            line.setPos(start + (original_t - start) * factor)
+        def _shift(t):
+            if t <= start:
+                return t
+            if t >= end:
+                return t + delta
+            return start + (t - start) * factor
 
-        self._plot.setXRange(start, max(preview_end, start + 0.001), padding=0.02)
+        for line, original_t in zip(self._marker_lines, self._entity.markers_for(self._channel_index)):
+            line.setPos(_shift(original_t))
+
+        self._build_timescale_preview_engine(start_idx, end_idx, new_seg_len)
+        self._plot.setXRange(self._start_time, max(preview_end, self._start_time + 0.001), padding=0.02)
+
+    def _build_timescale_preview_engine(self, start_idx, end_idx, new_seg_len):
+        """Mirrors the visual preview onto an actual playback buffer, so
+        Play hears the scaled segment too instead of the original audio."""
+        audio = self._engine.audio_data
+        seg = audio[start_idx:end_idx]
+        old_pos = np.arange(max(len(seg), 1))
+        new_pos = np.linspace(0, max(len(seg) - 1, 0), new_seg_len)
+
+        if len(seg) == 0:
+            scaled_seg = np.zeros((new_seg_len,) + audio.shape[1:], dtype=audio.dtype)
+        elif audio.ndim == 1:
+            scaled_seg = np.interp(new_pos, old_pos, seg).astype(audio.dtype)
+        else:
+            scaled_seg = np.stack(
+                [np.interp(new_pos, old_pos, seg[:, c]) for c in range(seg.shape[1])],
+                axis=1,
+            ).astype(audio.dtype)
+
+        preview_audio = np.concatenate([audio[:start_idx], scaled_seg, audio[end_idx:]], axis=0)
+        self._timescale_engine = _PlaybackEngine(preview_audio, self._sample_rate)
 
     def exit_timescale_preview(self):
         """Restore the original waveform display."""
         if not self._timescale_mode:
             return
+        if self._state != self.STATE_STOPPED and self._playback_engine() is self._timescale_engine:
+            self._do_reset()
         self._timescale_mode = False
+        self._timescale_range = None
+        self._timescale_preview_end = None
+        self._timescale_engine = None
         for curve, (samples, _color, _label) in zip(self._curve_items, self._series):
             curve.setData(self._times, samples)
         self._start_boundary.setPos(self._start_time)
         self._end_boundary.setPos(self._end_time)
-    
+
         for line, original_t in zip(self._marker_lines, self._entity.markers_for(self._channel_index)):
-            line.setPos(original_t)                     # ← add
-    
+            line.setPos(original_t)
+
         self._show_overview()
         self._refresh_segment_mode()
 
@@ -816,7 +879,19 @@ class WaveformPlayer(QWidget):
             preview = samples.copy()
             preview[start_idx:end_idx] = preview[start_idx:end_idx] * factor
             curve.setData(self._times, preview)
-            self._autoscale_y_for_preview() 
+        self._autoscale_y_for_preview()
+        self._build_vscale_preview_engine(factor)
+
+    def _build_vscale_preview_engine(self, factor: float):
+        """Mirrors the visual vertical-scale preview onto an actual
+        playback buffer, so Play hears the scaled segment too instead of
+        the original audio. Rebuilt on every factor change, since the
+        factor is live (spinbox/slider)."""
+        start, end = self._vscale_range
+        start_idx, end_idx = self._preview_slice_indices(start, end)
+        preview_audio = self._engine.audio_data.copy()
+        preview_audio[start_idx:end_idx] = preview_audio[start_idx:end_idx] * factor
+        self._vscale_engine = _PlaybackEngine(preview_audio, self._sample_rate) 
 
     def _autoscale_y_for_preview(self):
         """Grow (or shrink back) the Y range so every curve currently drawn
@@ -834,8 +909,11 @@ class WaveformPlayer(QWidget):
     def exit_vertical_scale_preview(self):
         if not self._vscale_mode:
             return
+        if self._state != self.STATE_STOPPED and self._playback_engine() is self._vscale_engine:
+            self._do_reset()
         self._vscale_mode = False
         self._vscale_range = None
+        self._vscale_engine = None
         for curve, (samples, _color, _label) in zip(self._curve_items, self._series):
             curve.setData(self._times, samples)
         self._autoscale_y_for_preview()
@@ -1099,8 +1177,20 @@ class WaveformPlayer(QWidget):
     # ---------- view helpers ----------
 
     def _show_overview(self):
-        self._plot.setXRange(self._start_time, max(self._end_time, self._start_time + 0.001))
+        end = self._overview_end_time()
+        self._plot.setXRange(self._start_time, max(end, self._start_time + 0.001))
         self._playhead.setVisible(False)
+
+    def _overview_end_time(self):
+        """Right-hand boundary of the full (unwindowed) view. Accounts for
+        whichever preview — if any — is currently changing the waveform's
+        displayed width, so the plot re-fits correctly after play/pause/
+        reset no matter which preview is active."""
+        if self._timescale_mode:
+            return self._timescale_preview_end
+        if self._concat_mode:
+            return self._concat_end
+        return self._end_time
 
     def _show_window_centered_at(self, t):
         self._plot.setXRange(t - _HALF_WINDOW_SECONDS, t + _HALF_WINDOW_SECONDS, padding=0)
@@ -1181,13 +1271,14 @@ class WaveformPlayer(QWidget):
             self._group.broadcast_position(current_time)
 
     def _playback_engine(self):
-        """Whichever engine should actually drive Play/Pause/Reset right now:
-        the trim preview, the reverse/fade_in/fade_out preview, or the
-        real audio."""
         if self._trim_mode:
             return self._trim_engine
         if self._concat_mode:
             return self._concat_engine
+        if self._timescale_mode and self._timescale_engine is not None:
+            return self._timescale_engine
+        if self._vscale_mode and self._vscale_engine is not None:
+            return self._vscale_engine
         if self._effect_mode is not None and self._effect_engine is not None:
             return self._effect_engine
         return self._engine
