@@ -408,6 +408,8 @@ class WaveformPlayer(QWidget):
             curve = self._plot.plot(self._times, samples, pen=pg.mkPen(color=color, width=1))
             self._curve_items.append(curve)
 
+        self._autoscale_y()
+
         self._playhead = pg.InfiniteLine(angle=90, pen=pg.mkPen(color="#ff4d4d", width=1.5))
         self._playhead.addMarker('^', position=0.0, size=14)
         self._playhead.addMarker('v', position=1.0, size=14)
@@ -976,7 +978,7 @@ class WaveformPlayer(QWidget):
             preview = samples.copy()
             preview[start_idx:end_idx] = preview[start_idx:end_idx] * factor
             curve.setData(self._times, preview)
-        self._autoscale_y_for_preview()
+        self._autoscale_y()
         self._build_vscale_preview_engine(factor)
 
     def _build_vscale_preview_engine(self, factor: float):
@@ -990,10 +992,11 @@ class WaveformPlayer(QWidget):
         preview_audio[start_idx:end_idx] = preview_audio[start_idx:end_idx] * factor
         self._vscale_engine = _PlaybackEngine(preview_audio, self._sample_rate) 
 
-    def _autoscale_y_for_preview(self):
+    def _autoscale_y(self):
         """Grow (or shrink back) the Y range so every curve currently drawn
-        on this plot — including a live vertical-scale preview — fits fully
-        inside the view, instead of clipping at the fixed ±1.05 default."""
+        on this plot — including a live vertical-scale preview, or the
+        freshly-applied result of any edit op — fits fully inside the
+        view, instead of clipping at the fixed ±1.05 default."""
         peak = 1.0
         for curve in self._curve_items:
             y_data = curve.yData
@@ -1013,7 +1016,7 @@ class WaveformPlayer(QWidget):
         self._vscale_engine = None
         for curve, (samples, _color, _label) in zip(self._curve_items, self._series):
             curve.setData(self._times, samples)
-        self._autoscale_y_for_preview()
+        self._autoscale_y()
         self._refresh_segment_mode()
 
     @staticmethod
@@ -1073,7 +1076,7 @@ class WaveformPlayer(QWidget):
                 self._effect_mode, preview[start_idx:end_idx]
             )
             curve.setData(self._times, preview)
-        self._autoscale_y_for_preview()
+        self._autoscale_y()
 
     def exit_effect_preview(self):
         if self._effect_mode is None:
@@ -1085,7 +1088,7 @@ class WaveformPlayer(QWidget):
         self._effect_engine = None
         for curve, (samples, _color, _label) in zip(self._curve_items, self._series):
             curve.setData(self._times, samples)
-        self._autoscale_y_for_preview()
+        self._autoscale_y()
         self._refresh_segment_mode()
 
     def preview_channel_curve_effect(self, curve_index, effect, start, end):
@@ -1106,7 +1109,7 @@ class WaveformPlayer(QWidget):
             self._preview_curve_effect, preview[start_idx:end_idx]
         )
         self._curve_items[curve_index].setData(self._times, preview)
-        self._autoscale_y_for_preview()
+        self._autoscale_y()
 
     def preview_channel_curve(self, curve_index, factor, start, end):
         """Live-preview another plot's vertical-scale edit by scaling just
@@ -1129,7 +1132,7 @@ class WaveformPlayer(QWidget):
         preview = samples.copy()
         preview[start_idx:end_idx] = preview[start_idx:end_idx] * factor
         self._curve_items[curve_index].setData(self._times, preview)
-        self._autoscale_y_for_preview() 
+        self._autoscale_y() 
 
     def exit_channel_curve_preview(self):
         if self._preview_curve_index is None:
@@ -1140,7 +1143,7 @@ class WaveformPlayer(QWidget):
         self._preview_curve_index = None
         self._preview_curve_range = None
         self._preview_curve_effect = None
-        self._autoscale_y_for_preview()
+        self._autoscale_y()
 
     def restore_selection_visual(self):
         """Re-show the selection highlight after exiting a preview mode."""
