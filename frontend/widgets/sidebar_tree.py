@@ -11,12 +11,17 @@ class SidebarTree(QTreeWidget):
     entity_clicked = Signal(object)  # Entity
     folder_clicked = Signal(object)  # Folder
 
+    entity_context_menu_requested = Signal(object, object)  # Entity, QPoint (global)
+    folder_context_menu_requested = Signal(object, object)  # Folder, QPoint (global)
+
     def __init__(self, parent=None):
         super().__init__(parent)
         self.setStyle(QStyleFactory.create("Fusion"))
         self.setHeaderHidden(True)
         self.setIndentation(16)
         self.setExpandsOnDoubleClick(False)
+        self.setContextMenuPolicy(Qt.CustomContextMenu)
+        self.customContextMenuRequested.connect(self._on_context_menu_requested)
 
     def populate(self, root: Folder):
         self.clear()
@@ -44,6 +49,25 @@ class SidebarTree(QTreeWidget):
                 tree_item.addChild(placeholder)
 
         return tree_item
+
+    def _on_context_menu_requested(self, pos):
+        item = self.itemAt(pos)
+        if item is None:
+            return
+
+        data = item.data(0, Qt.UserRole)
+        if not isinstance(data, (Entity, Folder)):
+            return
+
+        # Right-clicking selects the item, so it's clear what the menu applies to
+        # and so callers relying on selected_folder()/currentItem() stay in sync.
+        self.setCurrentItem(item)
+
+        global_pos = self.mapToGlobal(pos)
+        if isinstance(data, Entity):
+            self.entity_context_menu_requested.emit(data, global_pos)
+        else:
+            self.folder_context_menu_requested.emit(data, global_pos)
 
     def selected_folder(self) -> Folder | None:
         items = self.selectedItems()

@@ -2,10 +2,13 @@ from PySide6.QtCore import Qt, Signal
 from PySide6.QtGui import QDoubleValidator
 from PySide6.QtWidgets import (
     QDialog,
+    QFileDialog,
     QHBoxLayout,
+    QInputDialog,
     QLabel,
     QLineEdit,
     QMenu,
+    QMessageBox,
     QPushButton,
     QSplitter,
     QStackedWidget,
@@ -16,6 +19,7 @@ from PySide6.QtWidgets import (
 )
 
 from backend.workspace_model import Entity, Folder, Workspace
+from backend.audio_io import WavIO
 from frontend.dialogs.create_entity_dialog import CreateEntityDialog
 from frontend.dialogs.create_folder_dialog import CreateFolderDialog
 from frontend.dialogs.concatenate_dialog import ConcatenateDialog
@@ -171,10 +175,10 @@ class WorkspacePage(QWidget):
         self._playback_group.active_changed.connect(self._on_playback_active_changed)
 
     def _create_folder(self):
-        if not self._workspace:
-            return
-        parent = self._target_folder()
-        if parent is None:
+        self._create_folder_in(self._target_folder())
+
+    def _create_folder_in(self, parent: Folder | None):
+        if not self._workspace or parent is None:
             return
         dialog = CreateFolderDialog(self._workspace, parent, self)
         if dialog.exec() != QDialog.DialogCode.Accepted:
@@ -187,10 +191,10 @@ class WorkspacePage(QWidget):
         self._tree.populate(self._workspace.root)
 
     def _create_entity(self):
-        if not self._workspace:
-            return
-        parent = self._target_folder()
-        if parent is None:
+        self._create_entity_in(self._target_folder())
+
+    def _create_entity_in(self, parent: Folder | None):
+        if not self._workspace or parent is None:
             return
         dialog = CreateEntityDialog(self._workspace, parent, self)
         if dialog.exec() != QDialog.DialogCode.Accepted:
@@ -202,6 +206,146 @@ class WorkspacePage(QWidget):
         self._workspace.mark_dirty()
         self._tree.populate(self._workspace.root)
         self._open_entity_tab(entity)
+
+    # ------------------------------------------------------------------
+    # Sidebar right-click context menus
+    # ------------------------------------------------------------------
+
+    def _show_folder_context_menu(self, folder: Folder, global_pos):
+        if not self._workspace or self._mode != "file":
+            return
+
+        menu = QMenu(self)
+        new_entity_action = menu.addAction("New Entity")
+        new_folder_action = menu.addAction("New Folder")
+        menu.addSeparator()
+        rename_action = menu.addAction("Rename")
+        delete_action = menu.addAction("Delete")
+
+        action = menu.exec(global_pos)
+        if action is new_entity_action:
+            self._create_entity_in(folder)
+        elif action is new_folder_action:
+            self._create_folder_in(folder)
+        elif action is rename_action:
+            self._rename_item(folder)
+        elif action is delete_action:
+            self._delete_item(folder)
+
+    def _show_entity_context_menu(self, entity: Entity, global_pos):
+        if not self._workspace or self._mode != "file":
+            return
+
+        menu = QMenu(self)
+        rename_action = menu.addAction("Rename")
+        delete_action = menu.addAction("Delete")
+        download_action = menu.addAction("Download")
+
+        action = menu.exec(global_pos)
+        if action is rename_action:
+            self._rename_item(entity)
+        elif action is delete_action:
+            self._delete_item(entity)
+        elif action is download_action:
+            self._download_entity(entity)
+
+    def _rename_item(self, item):
+        if not self._workspace or item.parent is None:
+            return
+
+        parent = item.parent
+        while True:
+            name, ok = QInputDialog.getText(
+                self, "Rename", "New name:", QLineEdit.Normal, item.name
+            )
+            if not ok:
+                return
+
+            name = name.strip()
+            if not name or name == item.name:
+                return
+
+            clash = parent.find_child_by_name(name)
+            if clash is not None and clash is not item:
+                QMessageBox.warning(
+                    self,
+                    "Rename Failed",
+                    f'A folder or entity named "{name}" already exists here.',
+                )
+                continue
+            break
+
+        item.name = name
+        if isinstance(item, Entity):
+            index = self._find_entity_tab(item.id)
+            if index != -1:
+                self._tab_bar.setTabText(index, name)
+
+        self._workspace.mark_dirty()
+        self._tree.populate(self._workspace.root)
+
+    def _delete_item(self, item):
+        if not self._workspace or item.parent is None:
+            return
+
+        extra = " This will delete everything inside it." if isinstance(item, Folder) else ""
+        reply = QMessageBox.question(
+            self,
+            "Delete",
+            f'Are you sure you want to delete "{item.name}"?{extra}',
+            QMessageBox.Yes | QMessageBox.No,
+            QMessageBox.No,
+        )
+        if reply != QMessageBox.Yes:
+            return
+
+        # Close any open tabs for the entity, or every entity nested inside
+        # a deleted folder, before it disappears from the workspace.
+        for entity in self._collect_entities_under(item):
+            index = self._find_entity_tab(entity.id)
+            if index != -1:
+                self._close_tab(index)
+
+        item.parent.remove_child(item)
+        self._workspace.mark_dirty()
+        self._tree.populate(self._workspace.root)
+
+    def _collect_entities_under(self, item) -> list[Entity]:
+        if isinstance(item, Entity):
+            return [item]
+
+        entities: list[Entity] = []
+
+        def walk(folder):
+            for child in folder.children:
+                if isinstance(child, Entity):
+                    entities.append(child)
+                else:
+                    walk(child)
+
+        walk(item)
+        return entities
+
+    def _download_entity(self, entity: Entity):
+        path, _ = QFileDialog.getSaveFileName(
+            self,
+            "Download Entity",
+            f"{entity.name}.wav",
+            "WAV Files (*.wav)",
+        )
+        if not path:
+            return
+        if not path.lower().endswith(".wav"):
+            path += ".wav"
+
+        try:
+            WavIO.unload(entity.clip, path)
+        except (ValueError, OSError) as exc:
+            QMessageBox.critical(
+                self,
+                "Download Failed",
+                f"Could not download entity:\n{exc}",
+            )
 
     # ------------------------------------------------------------------
     # UI construction
@@ -256,6 +400,8 @@ class WorkspacePage(QWidget):
 
         self._tree = SidebarTree()
         self._tree.entity_clicked.connect(self._open_entity_tab)
+        self._tree.folder_context_menu_requested.connect(self._show_folder_context_menu)
+        self._tree.entity_context_menu_requested.connect(self._show_entity_context_menu)
         sidebar_layout.addWidget(self._tree)
 
         # ---- edit-options panel (always present; shown only in edit mode) ----
