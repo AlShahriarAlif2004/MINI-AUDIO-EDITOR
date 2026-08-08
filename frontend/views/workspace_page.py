@@ -153,6 +153,8 @@ class WorkspacePage(QWidget):
         self._trim_active_view = None
         self._timescale_active = False
         self._timescale_active_view = None
+        self._vscale_active = False
+        self._vscale_active_view = None
         self._build_ui()
         self._playback_group = PlaybackGroup.get_instance()
         self._playback_group.active_changed.connect(self._on_playback_active_changed)
@@ -278,6 +280,37 @@ class WorkspacePage(QWidget):
 
                 self._timescale_panel.setVisible(False)
                 edit_options_layout.addWidget(self._timescale_panel)
+
+            elif label == "Vertical Scale":
+                self._vscale_btn = btn
+                btn.clicked.connect(self._on_vscale_clicked)
+
+                self._vscale_panel = QWidget()
+                vs_panel_layout = QVBoxLayout(self._vscale_panel)
+                vs_panel_layout.setContentsMargins(16, 0, 0, 0)
+                vs_panel_layout.setSpacing(4)
+
+                vs_factor_row = QHBoxLayout()
+                vs_factor_row.setSpacing(6)
+                vs_factor_row.addWidget(QLabel("Factor"))
+                self._vs_factor_input = _FactorInput()
+                self._vs_factor_input.value_changed.connect(self._on_vscale_factor_changed)
+                vs_factor_row.addWidget(self._vs_factor_input)
+                vs_factor_row.addStretch()
+                vs_panel_layout.addLayout(vs_factor_row)
+
+                vs_btn_row = QHBoxLayout()
+                vs_btn_row.setSpacing(6)
+                self._vs_apply_btn  = QPushButton("Apply")
+                self._vs_cancel_btn = QPushButton("Cancel")
+                self._vs_apply_btn.clicked.connect(self._on_vscale_apply_clicked)
+                self._vs_cancel_btn.clicked.connect(self._on_vscale_cancel_clicked)
+                vs_btn_row.addWidget(self._vs_apply_btn)
+                vs_btn_row.addWidget(self._vs_cancel_btn)
+                vs_panel_layout.addLayout(vs_btn_row)
+
+                self._vscale_panel.setVisible(False)
+                edit_options_layout.addWidget(self._vscale_panel)
 
         edit_options_layout.addStretch()
         self._edit_options_panel.setVisible(False)   # shown when edit mode is active
@@ -497,7 +530,7 @@ class WorkspacePage(QWidget):
                 btn.setEnabled(True)
 
     def _refresh_tab_bar_lock(self):
-        locked = self._trim_active or self._timescale_active
+        locked = self._trim_active or self._timescale_active or self._vscale_active
         self._tab_bar.setEnabled(not locked)
 
     def _on_segment_selected(self, entity, channel_index, start, end):
@@ -553,6 +586,7 @@ class WorkspacePage(QWidget):
             return
         # Fold timescale if it was open
         self._cancel_timescale_if_active()
+        self._cancel_vscale_if_active() 
         view = self._current_entity_view()
         if view is None or not view.begin_trim():
             return
@@ -601,6 +635,7 @@ class WorkspacePage(QWidget):
             return
         # Fold trim if it was open
         self._cancel_trim_if_active()
+        self._cancel_vscale_if_active()
         view = self._current_entity_view()
         if view is None or not view.begin_timescale():
             return
@@ -632,6 +667,60 @@ class WorkspacePage(QWidget):
         view.cancel_timescale()        # restores graph + keeps selection
 
     # ------------------------------------------------------------------
+    # Vertical Scale
+    # ------------------------------------------------------------------
+    
+    def _collapse_vscale_ui(self):
+        self._vscale_active = False
+        self._vscale_active_view = None
+        self._vscale_btn.setStyleSheet("")
+        self._vscale_panel.setVisible(False)
+        self._vs_factor_input.setValue(1.0)
+        self._refresh_tab_bar_lock()
+    
+    def _cancel_vscale_if_active(self):
+        if self._vscale_active and self._vscale_active_view is not None:
+            view = self._vscale_active_view
+            self._collapse_vscale_ui()
+            view.cancel_vertical_scale()
+        elif self._vscale_active:
+            self._collapse_vscale_ui()
+    
+    def _on_vscale_clicked(self):
+        if self._vscale_active:
+            return
+        self._cancel_trim_if_active()
+        self._cancel_timescale_if_active()
+        view = self._current_entity_view()
+        if view is None or not view.begin_vertical_scale():
+            return
+        self._vscale_active = True
+        self._vscale_active_view = view
+        self._vs_factor_input.setValue(1.0)
+        self._vscale_btn.setStyleSheet(self._SELECTED_OPTION_STYLE)
+        self._vscale_panel.setVisible(True)
+        self._refresh_tab_bar_lock()
+    
+    def _on_vscale_factor_changed(self, factor: float):
+        if self._vscale_active and self._vscale_active_view is not None:
+            self._vscale_active_view.update_vertical_scale_preview(factor)
+    
+    def _on_vscale_apply_clicked(self):
+        if not self._vscale_active or self._vscale_active_view is None:
+            return
+        factor = self._vs_factor_input.value()
+        view   = self._vscale_active_view
+        self._collapse_vscale_ui()
+        view.apply_vertical_scale(factor)
+    
+    def _on_vscale_cancel_clicked(self):
+        if not self._vscale_active or self._vscale_active_view is None:
+            return
+        view = self._vscale_active_view
+        self._collapse_vscale_ui()
+        view.cancel_vertical_scale()
+    
+    # ------------------------------------------------------------------
     # Entity-view factory / tab lifecycle
     # ------------------------------------------------------------------
 
@@ -642,6 +731,7 @@ class WorkspacePage(QWidget):
         entity_view.segment_deselected.connect(self._on_segment_deselected)
         entity_view.entity_trimmed.connect(lambda: self._rebuild_entity_tab(entity))
         entity_view.entity_timescaled.connect(lambda: self._rebuild_entity_tab(entity))
+        entity_view.entity_vscaled.connect(lambda: self._rebuild_entity_tab(entity))
         entity_view.trim_cancelled.connect(self._on_trim_cancelled_externally)
         entity_view.set_edit_mode(self._mode == "edit")
         return entity_view
@@ -672,6 +762,8 @@ class WorkspacePage(QWidget):
             self._collapse_trim_ui()
         if old_widget is self._timescale_active_view:
             self._collapse_timescale_ui()
+        if old_widget is self._vscale_active_view:     # ← add (both methods; use `widget` instead of `old_widget` in _close_tab)
+            self._collapse_vscale_ui()
 
         self._content_stack.removeWidget(old_widget)
         old_widget.deleteLater()
@@ -706,6 +798,7 @@ class WorkspacePage(QWidget):
     def _on_tab_changed(self, index: int):
         self._cancel_trim_if_active()
         self._cancel_timescale_if_active()
+        self._cancel_vscale_if_active()
         self._force_stop_active_playback()      # ← add, before selection clearing
         self._clear_all_plot_selections()
     

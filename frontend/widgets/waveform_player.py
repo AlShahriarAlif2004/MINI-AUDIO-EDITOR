@@ -346,6 +346,10 @@ class WaveformPlayer(QWidget):
         self._trim_end = None
 
         self._timescale_mode = False
+        self._vscale_mode = False
+        self._vscale_range = None
+        self._preview_curve_index = None
+        self._preview_curve_range = None
 
         self._timer = QTimer(self)
         self._timer.setInterval(_TICK_MS)
@@ -525,6 +529,7 @@ class WaveformPlayer(QWidget):
             and not self._clip_mode
             and not self._trim_mode
             and not self._timescale_mode
+            and not self._vscale_mode
             and not self._segment_locked
         )
         self._plot.set_segment_mode(
@@ -682,6 +687,84 @@ class WaveformPlayer(QWidget):
         self._show_overview()
         self._refresh_segment_mode()
 
+    def enter_vertical_scale_preview(self, factor: float, start, end):
+        """Live amplitude-only preview for the selected range. No time-axis
+        remapping happens here, so markers and the selection box don't move."""
+        self._vscale_mode = True
+        self._vscale_range = (start, end)
+        self._hover_region.setVisible(False)
+        self._update_vertical_scale_display(factor)
+        self._refresh_segment_mode()
+
+    def update_vertical_scale_preview(self, factor: float):
+        if self._vscale_mode:
+            self._update_vertical_scale_display(factor)
+
+    def _update_vertical_scale_display(self, factor: float):
+        start, end = self._vscale_range
+        start_idx, end_idx = self._preview_slice_indices(start, end)
+        for curve, (samples, _color, _label) in zip(self._curve_items, self._series):
+            preview = samples.copy()
+            preview[start_idx:end_idx] = preview[start_idx:end_idx] * factor
+            curve.setData(self._times, preview)
+            self._autoscale_y_for_preview() 
+
+    def _autoscale_y_for_preview(self):
+        """Grow (or shrink back) the Y range so every curve currently drawn
+        on this plot — including a live vertical-scale preview — fits fully
+        inside the view, instead of clipping at the fixed ±1.05 default."""
+        peak = 1.0
+        for curve in self._curve_items:
+            y_data = curve.yData
+            if y_data is not None and len(y_data):
+                curve_peak = float(np.max(np.abs(y_data)))
+                if curve_peak > peak:
+                    peak = curve_peak
+        self._plot.setYRange(-peak * 1.05, peak * 1.05)
+
+    def exit_vertical_scale_preview(self):
+        if not self._vscale_mode:
+            return
+        self._vscale_mode = False
+        self._vscale_range = None
+        for curve, (samples, _color, _label) in zip(self._curve_items, self._series):
+            curve.setData(self._times, samples)
+        self._autoscale_y_for_preview()
+        self._refresh_segment_mode()
+
+    def preview_channel_curve(self, curve_index, factor, start, end):
+        """Live-preview another plot's vertical-scale edit by scaling just
+        that one overlaid curve here too. Used on the Overall plot so a
+        channel being edited stays visible even if it's currently drawn
+        underneath an identical/overlapping channel."""
+        self._preview_curve_index = curve_index
+        self._preview_curve_range = (start, end)
+        self._update_channel_curve_preview(factor)
+
+    def update_channel_curve_preview(self, factor: float):
+        if self._preview_curve_index is not None:
+            self._update_channel_curve_preview(factor)
+
+    def _update_channel_curve_preview(self, factor: float):
+        curve_index = self._preview_curve_index
+        start, end = self._preview_curve_range
+        start_idx, end_idx = self._preview_slice_indices(start, end)
+        samples = self._series[curve_index][0]
+        preview = samples.copy()
+        preview[start_idx:end_idx] = preview[start_idx:end_idx] * factor
+        self._curve_items[curve_index].setData(self._times, preview)
+        self._autoscale_y_for_preview() 
+
+    def exit_channel_curve_preview(self):
+        if self._preview_curve_index is None:
+            return
+        curve_index = self._preview_curve_index
+        samples = self._series[curve_index][0]
+        self._curve_items[curve_index].setData(self._times, samples)
+        self._preview_curve_index = None
+        self._preview_curve_range = None
+        self._autoscale_y_for_preview()
+
     def restore_selection_visual(self):
         """Re-show the selection highlight after exiting a preview mode."""
         if self._selected_segment is not None:
@@ -791,6 +874,10 @@ class WaveformPlayer(QWidget):
             self.exit_trim_preview()
         if self._timescale_mode:
             self.exit_timescale_preview()
+        if self._vscale_mode:
+            self.exit_vertical_scale_preview()
+        if self._preview_curve_index is not None:     # ← add
+            self.exit_channel_curve_preview()
         if self._state != self.STATE_STOPPED:
             self._do_reset()
         self.clear_selection()

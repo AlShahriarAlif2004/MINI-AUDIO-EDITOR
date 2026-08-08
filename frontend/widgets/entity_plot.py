@@ -28,6 +28,7 @@ class EntityPlotView(QWidget):
     entity_modified = Signal()
     entity_trimmed = Signal()
     entity_timescaled = Signal()
+    entity_vscaled = Signal()
     trim_cancelled = Signal()
     segment_selected = Signal(object, object, float, float)
     segment_deselected = Signal()
@@ -48,6 +49,10 @@ class EntityPlotView(QWidget):
         self._trim_player = None
         self._trim_range = None
         self._timescale_preview_active = False
+        self._vscale_player = None
+        self._vscale_range = None
+        self._vscale_mirror_players = []     # channel players mirrored when Overall is selected
+        self._vscale_overall_target = None   # Overall player mirrored when a channel is selected
         self._build_ui()
 
     @property
@@ -57,6 +62,12 @@ class EntityPlotView(QWidget):
     def _lock_selection(self, locked: bool):
         for player in self._players:
             player.set_segment_locked(locked)
+
+    def _find_overall_player(self):
+        for player in self._players:
+            if player.channel_index is None:
+                return player
+        return None
 
     def begin_trim(self) -> bool:
         if self._selected_player is None or self._selected_player.channel_index is not None:
@@ -153,6 +164,100 @@ class EntityPlotView(QWidget):
                 t * factor for t in self._entity.channel_markers[ch_idx]
             ]
 
+    # ------------------------------------------------------------------
+    # Vertical-scale preview
+    # ------------------------------------------------------------------
+
+    def begin_vertical_scale(self) -> bool:
+        if self._selected_player is None:
+            return False
+        segment = self._selected_player.selected_segment
+        if segment is None:
+            return False
+
+        self._vscale_player = self._selected_player
+        self._vscale_range = segment
+        self._vscale_player.enter_vertical_scale_preview(1.0, *segment)
+
+        self._vscale_overall_target = None
+        self._vscale_mirror_players = []
+
+        if self._vscale_player.channel_index is not None:
+            # A single channel was selected — mirror the preview onto that
+            # channel's curve inside the Overall plot.
+            overall_player = self._find_overall_player()
+            if overall_player is not None and overall_player is not self._vscale_player:
+                overall_player.preview_channel_curve(self._vscale_player.channel_index, 1.0, *segment)
+                self._vscale_overall_target = overall_player
+        else:
+            # The Overall plot was selected — it scales every channel
+            # uniformly, so mirror the same preview onto each channel plot.
+            self._vscale_mirror_players = [
+                p for p in self._players
+                if p is not self._vscale_player and p.channel_index is not None
+            ]
+            for player in self._vscale_mirror_players:
+                player.enter_vertical_scale_preview(1.0, *segment)
+
+        self._lock_selection(True)
+        return True
+
+    def update_vertical_scale_preview(self, factor: float):
+        if self._vscale_player is not None:
+            self._vscale_player.update_vertical_scale_preview(factor)
+        if self._vscale_overall_target is not None:
+            self._vscale_overall_target.update_channel_curve_preview(factor)
+        for player in self._vscale_mirror_players:
+            player.update_vertical_scale_preview(factor)
+
+    def cancel_vertical_scale(self):
+        if self._vscale_player is None:
+            return
+        self._vscale_player.exit_vertical_scale_preview()
+        if self._vscale_overall_target is not None:
+            self._vscale_overall_target.exit_channel_curve_preview()
+        for player in self._vscale_mirror_players:
+            player.exit_vertical_scale_preview()
+        self._vscale_player = None
+        self._vscale_overall_target = None
+        self._vscale_mirror_players = []
+        self._vscale_range = None
+        self._lock_selection(False)
+        if self._selected_player is not None:
+            self._selected_player.restore_selection_visual()
+
+    def apply_vertical_scale(self, factor: float):
+        if self._vscale_player is None:
+            return
+        channel_index = self._vscale_player.channel_index
+        start, end = self._vscale_range
+        self._vscale_player.exit_vertical_scale_preview()
+        if self._vscale_overall_target is not None:
+            self._vscale_overall_target.exit_channel_curve_preview()
+        for player in self._vscale_mirror_players:
+            player.exit_vertical_scale_preview()
+        self._perform_vertical_scale(factor, channel_index, start, end)
+        self._vscale_player = None
+        self._vscale_overall_target = None
+        self._vscale_mirror_players = []
+        self._vscale_range = None
+        self._lock_selection(False)
+        self.clear_all_selection()
+        self.entity_modified.emit()
+        self.entity_vscaled.emit()
+
+    def _perform_vertical_scale(self, factor, channel_index, start, end):
+        clip = self._entity.clip
+        start_idx = clip.get_index(start)
+        end_idx = clip.get_index(end)
+
+        if channel_index is None:
+            new_clip = clip.apply("vertical_scale", factor, start_idx, end_idx)
+        else:
+            new_clip = clip.apply("vertical_scale", factor, start_idx, end_idx, channel=channel_index)
+
+        self._entity.clip = new_clip
+
     def _perform_trim(self, start, end):
         clip = self._entity.clip
         remove_start_idx = clip.get_index(start)
@@ -202,9 +307,7 @@ class EntityPlotView(QWidget):
             ]
 
     def _on_canvas_clicked(self):
-        # While Trim / Time Scale is expanded, empty-space clicks must do
-        # nothing — only the panel's own Apply/Cancel can end it.
-        if self._trim_player is not None or self._timescale_preview_active:
+        if self._trim_player is not None or self._timescale_preview_active or self._vscale_player is not None:
             return
         self.clear_all_selection()
         if self._trim_player is not None:
@@ -282,6 +385,7 @@ class EntityPlotView(QWidget):
     def shutdown(self):
         self.cancel_trim()
         self.cancel_timescale()
+        self.cancel_vertical_scale()
         for player in self._players:
             player.force_idle()
         self.clear_all_selection()
