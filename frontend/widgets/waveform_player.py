@@ -1280,7 +1280,7 @@ class WaveformPlayer(QWidget):
 
     def _show_overview(self):
         end = self._overview_end_time()
-        self._plot.setXRange(self._start_time, max(end, self._start_time + 0.001))
+        self._plot.setXRange(self._start_time, max(end, self._start_time + 0.001), padding=0.02)
         self._playhead.setVisible(False)
 
     def _overview_end_time(self):
@@ -1479,7 +1479,7 @@ class WaveformPlayer(QWidget):
         if active_player is None:
             if self._state != self.STATE_STOPPED:
                 self._do_reset()
-            else:
+            elif not (self._trim_mode or self._extract_mode or self._concat_mode):
                 self._show_overview()
             self._play_btn.setEnabled(True)
             return
