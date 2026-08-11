@@ -134,6 +134,30 @@ class _FactorInput(QWidget):
 
 
 # ---------------------------------------------------------------------------
+# Per-operation runtime state (one instance per entry in _OP_SPECS)
+# ---------------------------------------------------------------------------
+
+class _OpEntry:
+    """Bundles the widgets + live state for a single edit-mode operation
+    (Trim, Extract, Time Scale, ...). Built from an _OP_SPECS dict."""
+
+    __slots__ = (
+        "spec", "button", "panel", "apply_btn", "cancel_btn",
+        "factor_input", "active", "active_view",
+    )
+
+    def __init__(self, spec, button, panel, apply_btn, cancel_btn, factor_input):
+        self.spec = spec
+        self.button = button
+        self.panel = panel
+        self.apply_btn = apply_btn
+        self.cancel_btn = cancel_btn
+        self.factor_input = factor_input
+        self.active = False
+        self.active_view = None
+
+
+# ---------------------------------------------------------------------------
 # WorkspacePage
 # ---------------------------------------------------------------------------
 
@@ -146,6 +170,55 @@ class WorkspacePage(QWidget):
     # Operations that are only valid when the *overall* plot is selected.
     _OVERALL_ONLY_OPS = {"Trim", "Extract", "Time Scale", "Concatenate"}
 
+    # ------------------------------------------------------------------
+    # Declarative description of the 8 edit-mode operations. Each entry
+    # drives: panel construction, button wiring, mutual-exclusion
+    # cancellation, and the generic apply/cancel handlers below.
+    #
+    #   key      -- internal identifier
+    #   label    -- button text (also the _segment_buttons dict key)
+    #   begin    -- EntityPlotView method name to start the op (no args,
+    #               except "concat" which is special-cased: it opens a
+    #               dialog first and passes the chosen sources)
+    #   apply    -- EntityPlotView method name to commit the op
+    #   cancel   -- EntityPlotView method name to abort/restore
+    #   rebuild_signal -- EntityPlotView signal that means "content
+    #               changed, rebuild the tab" (connected once per view)
+    #   factor   -- True if this op has a live-preview factor spinner
+    #   preview  -- EntityPlotView method name for live preview (only
+    #               when factor is True)
+    #   needs_dialog -- True only for Concatenate, which must collect
+    #               source portions via ConcatenateDialog before begin
+    # ------------------------------------------------------------------
+    _OP_SPECS = [
+        dict(key="trim", label="Trim",
+             begin="begin_trim", apply="apply_trim", cancel="cancel_trim",
+             rebuild_signal="entity_trimmed", factor=False, needs_dialog=False),
+        dict(key="extract", label="Extract",
+             begin="begin_extract", apply="apply_extract", cancel="cancel_extract",
+             rebuild_signal="entity_extracted", factor=False, needs_dialog=False),
+        dict(key="timescale", label="Time Scale",
+             begin="begin_timescale", apply="apply_timescale", cancel="cancel_timescale",
+             rebuild_signal="entity_timescaled", factor=True,
+             preview="update_timescale_preview", needs_dialog=False),
+        dict(key="vscale", label="Vertical Scale",
+             begin="begin_vertical_scale", apply="apply_vertical_scale", cancel="cancel_vertical_scale",
+             rebuild_signal="entity_vscaled", factor=True,
+             preview="update_vertical_scale_preview", needs_dialog=False),
+        dict(key="reverse", label="Reverse",
+             begin="begin_reverse", apply="apply_reverse", cancel="cancel_reverse",
+             rebuild_signal="entity_reversed", factor=False, needs_dialog=False),
+        dict(key="fadein", label="Fade In",
+             begin="begin_fade_in", apply="apply_fade_in", cancel="cancel_fade_in",
+             rebuild_signal="entity_faded_in", factor=False, needs_dialog=False),
+        dict(key="fadeout", label="Fade Out",
+             begin="begin_fade_out", apply="apply_fade_out", cancel="cancel_fade_out",
+             rebuild_signal="entity_faded_out", factor=False, needs_dialog=False),
+        dict(key="concat", label="Concatenate",
+             begin="begin_concatenate", apply="apply_concatenate", cancel="cancel_concatenate",
+             rebuild_signal="entity_concatenated", factor=False, needs_dialog=True),
+    ]
+
     new_workspace_requested = Signal()
     open_workspace_requested = Signal()
     exit_requested = Signal()
@@ -154,22 +227,7 @@ class WorkspacePage(QWidget):
         super().__init__(parent)
         self._workspace: Workspace | None = None
         self._mode = "file"
-        self._trim_active = False
-        self._trim_active_view = None
-        self._extract_active = False
-        self._extract_active_view = None
-        self._timescale_active = False
-        self._timescale_active_view = None
-        self._vscale_active = False
-        self._vscale_active_view = None
-        self._reverse_active = False
-        self._reverse_active_view = None
-        self._fadein_active = False
-        self._fadein_active_view = None
-        self._fadeout_active = False
-        self._fadeout_active_view = None
-        self._concat_active = False
-        self._concat_active_view = None
+        self._ops: dict[str, _OpEntry] = {}   # populated in _build_ui
         self._build_ui()
         self._playback_group = PlaybackGroup.get_instance()
         self._playback_group.active_changed.connect(self._on_playback_active_changed)
@@ -416,176 +474,26 @@ class WorkspacePage(QWidget):
 
         self._segment_buttons: dict[str, QPushButton] = {}
 
-        for label in ("Trim", "Extract", "Time Scale", "Vertical Scale", "Reverse",
-                      "Fade In", "Fade Out", "Concatenate"):
-            btn = QPushButton(label)
+        for spec in self._OP_SPECS:
+            btn = QPushButton(spec["label"])
             btn.setEnabled(False)          # disabled until a segment is selected
             edit_options_layout.addWidget(btn)
-            self._segment_buttons[label] = btn
+            self._segment_buttons[spec["label"]] = btn
 
-            if label == "Trim":
-                self._trim_btn = btn
-                btn.clicked.connect(self._on_trim_clicked)
+            panel, apply_btn, cancel_btn, factor_input = self._build_op_panel(spec)
+            edit_options_layout.addWidget(panel)
 
-                self._trim_panel = QWidget()
-                trim_panel_layout = QHBoxLayout(self._trim_panel)
-                trim_panel_layout.setContentsMargins(16, 0, 0, 0)
-                trim_panel_layout.setSpacing(6)
-                self._trim_apply_btn  = QPushButton("Apply")
-                self._trim_cancel_btn = QPushButton("Cancel")
-                self._trim_apply_btn.clicked.connect(self._on_trim_apply_clicked)
-                self._trim_cancel_btn.clicked.connect(self._on_trim_cancel_clicked)
-                trim_panel_layout.addWidget(self._trim_apply_btn)
-                trim_panel_layout.addWidget(self._trim_cancel_btn)
-                self._trim_panel.setVisible(False)
-                edit_options_layout.addWidget(self._trim_panel)
+            entry = _OpEntry(spec, btn, panel, apply_btn, cancel_btn, factor_input)
+            self._ops[spec["key"]] = entry
 
-            elif label == "Extract":
-                self._extract_btn = btn
-                btn.clicked.connect(self._on_extract_clicked)
-
-                self._extract_panel = QWidget()
-                extract_panel_layout = QHBoxLayout(self._extract_panel)
-                extract_panel_layout.setContentsMargins(16, 0, 0, 0)
-                extract_panel_layout.setSpacing(6)
-                self._extract_apply_btn  = QPushButton("Apply")
-                self._extract_cancel_btn = QPushButton("Cancel")
-                self._extract_apply_btn.clicked.connect(self._on_extract_apply_clicked)
-                self._extract_cancel_btn.clicked.connect(self._on_extract_cancel_clicked)
-                extract_panel_layout.addWidget(self._extract_apply_btn)
-                extract_panel_layout.addWidget(self._extract_cancel_btn)
-                self._extract_panel.setVisible(False)
-                edit_options_layout.addWidget(self._extract_panel)
-
-            elif label == "Time Scale":
-                self._timescale_btn = btn
-                btn.clicked.connect(self._on_timescale_clicked)
-
-                self._timescale_panel = QWidget()
-                ts_panel_layout = QVBoxLayout(self._timescale_panel)
-                ts_panel_layout.setContentsMargins(16, 0, 0, 0)
-                ts_panel_layout.setSpacing(4)
-
-                factor_row = QHBoxLayout()
-                factor_row.setSpacing(6)
-                factor_row.addWidget(QLabel("Factor"))
-                self._factor_input = _FactorInput()
-                self._factor_input.value_changed.connect(self._on_timescale_factor_changed)
-                factor_row.addWidget(self._factor_input)
-                factor_row.addStretch()
-                ts_panel_layout.addLayout(factor_row)
-
-                ts_btn_row = QHBoxLayout()
-                ts_btn_row.setSpacing(6)
-                self._ts_apply_btn  = QPushButton("Apply")
-                self._ts_cancel_btn = QPushButton("Cancel")
-                self._ts_apply_btn.clicked.connect(self._on_timescale_apply_clicked)
-                self._ts_cancel_btn.clicked.connect(self._on_timescale_cancel_clicked)
-                ts_btn_row.addWidget(self._ts_apply_btn)
-                ts_btn_row.addWidget(self._ts_cancel_btn)
-                ts_panel_layout.addLayout(ts_btn_row)
-
-                self._timescale_panel.setVisible(False)
-                edit_options_layout.addWidget(self._timescale_panel)
-
-            elif label == "Vertical Scale":
-                self._vscale_btn = btn
-                btn.clicked.connect(self._on_vscale_clicked)
-
-                self._vscale_panel = QWidget()
-                vs_panel_layout = QVBoxLayout(self._vscale_panel)
-                vs_panel_layout.setContentsMargins(16, 0, 0, 0)
-                vs_panel_layout.setSpacing(4)
-
-                vs_factor_row = QHBoxLayout()
-                vs_factor_row.setSpacing(6)
-                vs_factor_row.addWidget(QLabel("Factor"))
-                self._vs_factor_input = _FactorInput()
-                self._vs_factor_input.value_changed.connect(self._on_vscale_factor_changed)
-                vs_factor_row.addWidget(self._vs_factor_input)
-                vs_factor_row.addStretch()
-                vs_panel_layout.addLayout(vs_factor_row)
-
-                vs_btn_row = QHBoxLayout()
-                vs_btn_row.setSpacing(6)
-                self._vs_apply_btn  = QPushButton("Apply")
-                self._vs_cancel_btn = QPushButton("Cancel")
-                self._vs_apply_btn.clicked.connect(self._on_vscale_apply_clicked)
-                self._vs_cancel_btn.clicked.connect(self._on_vscale_cancel_clicked)
-                vs_btn_row.addWidget(self._vs_apply_btn)
-                vs_btn_row.addWidget(self._vs_cancel_btn)
-                vs_panel_layout.addLayout(vs_btn_row)
-
-                self._vscale_panel.setVisible(False)
-                edit_options_layout.addWidget(self._vscale_panel)
-
-            elif label == "Reverse":
-                self._reverse_btn = btn
-                btn.clicked.connect(self._on_reverse_clicked)
-
-                self._reverse_panel = QWidget()
-                reverse_panel_layout = QHBoxLayout(self._reverse_panel)
-                reverse_panel_layout.setContentsMargins(16, 0, 0, 0)
-                reverse_panel_layout.setSpacing(6)
-                self._reverse_apply_btn  = QPushButton("Apply")
-                self._reverse_cancel_btn = QPushButton("Cancel")
-                self._reverse_apply_btn.clicked.connect(self._on_reverse_apply_clicked)
-                self._reverse_cancel_btn.clicked.connect(self._on_reverse_cancel_clicked)
-                reverse_panel_layout.addWidget(self._reverse_apply_btn)
-                reverse_panel_layout.addWidget(self._reverse_cancel_btn)
-                self._reverse_panel.setVisible(False)
-                edit_options_layout.addWidget(self._reverse_panel)
-
-            elif label == "Fade In":
-                self._fadein_btn = btn
-                btn.clicked.connect(self._on_fadein_clicked)
-
-                self._fadein_panel = QWidget()
-                fadein_panel_layout = QHBoxLayout(self._fadein_panel)
-                fadein_panel_layout.setContentsMargins(16, 0, 0, 0)
-                fadein_panel_layout.setSpacing(6)
-                self._fadein_apply_btn  = QPushButton("Apply")
-                self._fadein_cancel_btn = QPushButton("Cancel")
-                self._fadein_apply_btn.clicked.connect(self._on_fadein_apply_clicked)
-                self._fadein_cancel_btn.clicked.connect(self._on_fadein_cancel_clicked)
-                fadein_panel_layout.addWidget(self._fadein_apply_btn)
-                fadein_panel_layout.addWidget(self._fadein_cancel_btn)
-                self._fadein_panel.setVisible(False)
-                edit_options_layout.addWidget(self._fadein_panel)
-
-            elif label == "Fade Out":
-                self._fadeout_btn = btn
-                btn.clicked.connect(self._on_fadeout_clicked)
-
-                self._fadeout_panel = QWidget()
-                fadeout_panel_layout = QHBoxLayout(self._fadeout_panel)
-                fadeout_panel_layout.setContentsMargins(16, 0, 0, 0)
-                fadeout_panel_layout.setSpacing(6)
-                self._fadeout_apply_btn  = QPushButton("Apply")
-                self._fadeout_cancel_btn = QPushButton("Cancel")
-                self._fadeout_apply_btn.clicked.connect(self._on_fadeout_apply_clicked)
-                self._fadeout_cancel_btn.clicked.connect(self._on_fadeout_cancel_clicked)
-                fadeout_panel_layout.addWidget(self._fadeout_apply_btn)
-                fadeout_panel_layout.addWidget(self._fadeout_cancel_btn)
-                self._fadeout_panel.setVisible(False)
-                edit_options_layout.addWidget(self._fadeout_panel)
-
-            elif label == "Concatenate":
-                self._concat_btn = btn
-                btn.clicked.connect(self._on_concatenate_clicked)
-
-                self._concat_panel = QWidget()
-                concat_panel_layout = QHBoxLayout(self._concat_panel)
-                concat_panel_layout.setContentsMargins(16, 0, 0, 0)
-                concat_panel_layout.setSpacing(6)
-                self._concat_apply_btn  = QPushButton("Apply")
-                self._concat_cancel_btn = QPushButton("Cancel")
-                self._concat_apply_btn.clicked.connect(self._on_concat_apply_clicked)
-                self._concat_cancel_btn.clicked.connect(self._on_concat_cancel_clicked)
-                concat_panel_layout.addWidget(self._concat_apply_btn)
-                concat_panel_layout.addWidget(self._concat_cancel_btn)
-                self._concat_panel.setVisible(False)
-                edit_options_layout.addWidget(self._concat_panel)
+            key = spec["key"]
+            btn.clicked.connect(lambda checked=False, k=key: self._on_op_clicked(k))
+            apply_btn.clicked.connect(lambda checked=False, k=key: self._on_op_apply_clicked(k))
+            cancel_btn.clicked.connect(lambda checked=False, k=key: self._on_op_cancel_clicked(k))
+            if factor_input is not None:
+                factor_input.value_changed.connect(
+                    lambda value, k=key: self._on_op_factor_changed(k, value)
+                )
 
         edit_options_layout.addStretch()
         self._edit_options_panel.setVisible(False)   # shown when edit mode is active
@@ -640,6 +548,45 @@ class WorkspacePage(QWidget):
 
         root_layout.addWidget(splitter)
 
+    def _build_op_panel(self, spec):
+        """Build the Apply/Cancel (and, for factor ops, the factor row)
+        panel for one operation. Returns (panel, apply_btn, cancel_btn,
+        factor_input_or_None)."""
+        panel = QWidget()
+
+        if spec["factor"]:
+            layout = QVBoxLayout(panel)
+            layout.setContentsMargins(16, 0, 0, 0)
+            layout.setSpacing(4)
+
+            factor_row = QHBoxLayout()
+            factor_row.setSpacing(6)
+            factor_row.addWidget(QLabel("Factor"))
+            factor_input = _FactorInput()
+            factor_row.addWidget(factor_input)
+            factor_row.addStretch()
+            layout.addLayout(factor_row)
+
+            btn_row = QHBoxLayout()
+            btn_row.setSpacing(6)
+            apply_btn = QPushButton("Apply")
+            cancel_btn = QPushButton("Cancel")
+            btn_row.addWidget(apply_btn)
+            btn_row.addWidget(cancel_btn)
+            layout.addLayout(btn_row)
+        else:
+            layout = QHBoxLayout(panel)
+            layout.setContentsMargins(16, 0, 0, 0)
+            layout.setSpacing(6)
+            apply_btn = QPushButton("Apply")
+            cancel_btn = QPushButton("Cancel")
+            layout.addWidget(apply_btn)
+            layout.addWidget(cancel_btn)
+            factor_input = None
+
+        panel.setVisible(False)
+        return panel, apply_btn, cancel_btn, factor_input
+
     # ------------------------------------------------------------------
     # Mode switching
     # ------------------------------------------------------------------
@@ -682,14 +629,7 @@ class WorkspacePage(QWidget):
         if mode == self._mode:
             return
 
-        self._cancel_trim_if_active()
-        self._cancel_extract_if_active()
-        self._cancel_timescale_if_active()
-        self._cancel_vscale_if_active()
-        self._cancel_reverse_if_active()
-        self._cancel_fadein_if_active()
-        self._cancel_fadeout_if_active()
-        self._cancel_concat_if_active()
+        self._cancel_all_ops()
         self._clear_all_plot_selections()
 
         if mode == "edit":
@@ -743,8 +683,6 @@ class WorkspacePage(QWidget):
         selected = self._tree.selected_folder()
         return selected if selected is not None else self._workspace.root
 
-    
-
     def _find_entity_tab(self, entity_id: str) -> int:
         for i in range(self._tab_bar.count()):
             if self._tab_bar.tabData(i) == entity_id:
@@ -780,11 +718,7 @@ class WorkspacePage(QWidget):
                 btn.setEnabled(True)
 
     def _refresh_tab_bar_lock(self):
-        locked = (
-            self._trim_active or self._extract_active or self._timescale_active or self._vscale_active
-            or self._reverse_active or self._fadein_active or self._fadeout_active
-            or self._concat_active
-        )
+        locked = any(entry.active for entry in self._ops.values())
         self._tab_bar.setEnabled(not locked)
 
     def _on_segment_selected(self, entity, channel_index, start, end):
@@ -813,453 +747,100 @@ class WorkspacePage(QWidget):
         return widget if isinstance(widget, EntityPlotView) else None
 
     # ------------------------------------------------------------------
-    # Trim
+    # Generic edit-mode operation handling
+    #
+    # Every one of the 8 operations (Trim, Extract, Time Scale, Vertical
+    # Scale, Reverse, Fade In, Fade Out, Concatenate) goes through these
+    # same six methods, parameterized by its _OP_SPECS entry. Only
+    # Concatenate has a real branch (it needs a dialog for source
+    # selection before it can "begin").
     # ------------------------------------------------------------------
 
-    def _collapse_trim_ui(self):
-        self._trim_active = False
-        self._trim_active_view = None
-        self._trim_btn.setStyleSheet("")
-        self._trim_panel.setVisible(False)
+    def _collapse_op_ui(self, key: str):
+        entry = self._ops[key]
+        entry.active = False
+        entry.active_view = None
+        entry.button.setStyleSheet("")
+        entry.panel.setVisible(False)
+        if entry.factor_input is not None:
+            entry.factor_input.setValue(1.0)
         self._refresh_tab_bar_lock()
 
-    def _cancel_trim_if_active(self):
-        if self._trim_active and self._trim_active_view is not None:
-            view = self._trim_active_view
-            self._collapse_trim_ui()
-            view.cancel_trim()
-        elif self._trim_active:
-            self._collapse_trim_ui()
+    def _cancel_op_if_active(self, key: str):
+        entry = self._ops[key]
+        if entry.active and entry.active_view is not None:
+            view = entry.active_view
+            self._collapse_op_ui(key)
+            getattr(view, entry.spec["cancel"])()
+        elif entry.active:
+            self._collapse_op_ui(key)
 
-    def _on_trim_cancelled_externally(self):
-        if self._trim_active:
-            self._collapse_trim_ui()
+    def _cancel_all_ops(self, except_key: str | None = None):
+        for key in self._ops:
+            if key != except_key:
+                self._cancel_op_if_active(key)
 
-    def _on_trim_clicked(self):
-        if self._trim_active:
+    def _on_op_clicked(self, key: str):
+        entry = self._ops[key]
+        if entry.active:
             return
-        # Fold timescale if it was open
-        self._cancel_extract_if_active()
-        self._cancel_timescale_if_active()
-        self._cancel_vscale_if_active()
-        self._cancel_reverse_if_active()
-        self._cancel_fadein_if_active()
-        self._cancel_fadeout_if_active()
-        self._cancel_concat_if_active()
-        view = self._current_entity_view()
-        if view is None or not view.begin_trim():
-            return
-        self._trim_active = True
-        self._trim_active_view = view
-        self._trim_btn.setStyleSheet(self._SELECTED_OPTION_STYLE)
-        self._trim_panel.setVisible(True)
-        self._refresh_tab_bar_lock()
 
-    def _on_trim_apply_clicked(self):
-        if not self._trim_active or self._trim_active_view is None:
-            return
-        view = self._trim_active_view
-        self._collapse_trim_ui()
-        view.apply_trim()          # entity_trimmed → _rebuild_entity_tab (clears selection)
-
-    def _on_trim_cancel_clicked(self):
-        if not self._trim_active or self._trim_active_view is None:
-            return
-        view = self._trim_active_view
-        self._collapse_trim_ui()
-        view.cancel_trim()         # restores graph + keeps selection
-
-    # ------------------------------------------------------------------
-    # Extract
-    # ------------------------------------------------------------------
-
-    def _collapse_extract_ui(self):
-        self._extract_active = False
-        self._extract_active_view = None
-        self._extract_btn.setStyleSheet("")
-        self._extract_panel.setVisible(False)
-        self._refresh_tab_bar_lock()
-
-    def _cancel_extract_if_active(self):
-        if self._extract_active and self._extract_active_view is not None:
-            view = self._extract_active_view
-            self._collapse_extract_ui()
-            view.cancel_extract()
-        elif self._extract_active:
-            self._collapse_extract_ui()
-
-    def _on_extract_clicked(self):
-        if self._extract_active:
-            return
-        # Fold any other open op
-        self._cancel_trim_if_active()
-        self._cancel_timescale_if_active()
-        self._cancel_vscale_if_active()
-        self._cancel_reverse_if_active()
-        self._cancel_fadein_if_active()
-        self._cancel_fadeout_if_active()
-        self._cancel_concat_if_active()
-        view = self._current_entity_view()
-        if view is None or not view.begin_extract():
-            return
-        self._extract_active = True
-        self._extract_active_view = view
-        self._extract_btn.setStyleSheet(self._SELECTED_OPTION_STYLE)
-        self._extract_panel.setVisible(True)
-        self._refresh_tab_bar_lock()
-
-    def _on_extract_apply_clicked(self):
-        if not self._extract_active or self._extract_active_view is None:
-            return
-        view = self._extract_active_view
-        self._collapse_extract_ui()
-        view.apply_extract()       # entity_extracted → _rebuild_entity_tab (clears selection)
-
-    def _on_extract_cancel_clicked(self):
-        if not self._extract_active or self._extract_active_view is None:
-            return
-        view = self._extract_active_view
-        self._collapse_extract_ui()
-        view.cancel_extract()      # restores graph + keeps selection
-
-    # ------------------------------------------------------------------
-    # Time Scale
-    # ------------------------------------------------------------------
-
-    def _collapse_timescale_ui(self):
-        self._timescale_active = False
-        self._timescale_active_view = None
-        self._timescale_btn.setStyleSheet("")
-        self._timescale_panel.setVisible(False)
-        self._factor_input.setValue(1.0)
-        self._refresh_tab_bar_lock()
-
-    def _cancel_timescale_if_active(self):
-        if self._timescale_active and self._timescale_active_view is not None:
-            view = self._timescale_active_view
-            self._collapse_timescale_ui()
-            view.cancel_timescale()   # restores graph + keeps selection
-        elif self._timescale_active:
-            self._collapse_timescale_ui()
-
-    def _on_timescale_clicked(self):
-        if self._timescale_active:
-            return
-        # Fold trim if it was open
-        self._cancel_trim_if_active()
-        self._cancel_extract_if_active()
-        self._cancel_vscale_if_active()
-        self._cancel_reverse_if_active()
-        self._cancel_fadein_if_active()
-        self._cancel_fadeout_if_active()
-        self._cancel_concat_if_active()
-        view = self._current_entity_view()
-        if view is None or not view.begin_timescale():
-            return
-        self._timescale_active = True
-        self._timescale_active_view = view
-        self._factor_input.setValue(1.0)
-        self._timescale_btn.setStyleSheet(self._SELECTED_OPTION_STYLE)
-        self._timescale_panel.setVisible(True)
-        self._refresh_tab_bar_lock()
-
-    def _on_timescale_factor_changed(self, factor: float):
-        """Live-preview: update plot instantly as the factor changes."""
-        if self._timescale_active and self._timescale_active_view is not None:
-            self._timescale_active_view.update_timescale_preview(factor)
-
-    def _on_timescale_apply_clicked(self):
-        if not self._timescale_active or self._timescale_active_view is None:
-            return
-        factor = self._factor_input.value()
-        view   = self._timescale_active_view
-        self._collapse_timescale_ui()
-        view.apply_timescale(factor)   # entity_timescaled → rebuild (clears selection)
-
-    def _on_timescale_cancel_clicked(self):
-        if not self._timescale_active or self._timescale_active_view is None:
-            return
-        view = self._timescale_active_view
-        self._collapse_timescale_ui()
-        view.cancel_timescale()        # restores graph + keeps selection
-
-    # ------------------------------------------------------------------
-    # Vertical Scale
-    # ------------------------------------------------------------------
-    
-    def _collapse_vscale_ui(self):
-        self._vscale_active = False
-        self._vscale_active_view = None
-        self._vscale_btn.setStyleSheet("")
-        self._vscale_panel.setVisible(False)
-        self._vs_factor_input.setValue(1.0)
-        self._refresh_tab_bar_lock()
-    
-    def _cancel_vscale_if_active(self):
-        if self._vscale_active and self._vscale_active_view is not None:
-            view = self._vscale_active_view
-            self._collapse_vscale_ui()
-            view.cancel_vertical_scale()
-        elif self._vscale_active:
-            self._collapse_vscale_ui()
-    
-    def _on_vscale_clicked(self):
-        if self._vscale_active:
-            return
-        self._cancel_trim_if_active()
-        self._cancel_extract_if_active()
-        self._cancel_timescale_if_active()
-        self._cancel_reverse_if_active()
-        self._cancel_fadein_if_active()
-        self._cancel_fadeout_if_active()
-        self._cancel_concat_if_active()
-        view = self._current_entity_view()
-        if view is None or not view.begin_vertical_scale():
-            return
-        self._vscale_active = True
-        self._vscale_active_view = view
-        self._vs_factor_input.setValue(1.0)
-        self._vscale_btn.setStyleSheet(self._SELECTED_OPTION_STYLE)
-        self._vscale_panel.setVisible(True)
-        self._refresh_tab_bar_lock()
-    
-    def _on_vscale_factor_changed(self, factor: float):
-        if self._vscale_active and self._vscale_active_view is not None:
-            self._vscale_active_view.update_vertical_scale_preview(factor)
-    
-    def _on_vscale_apply_clicked(self):
-        if not self._vscale_active or self._vscale_active_view is None:
-            return
-        factor = self._vs_factor_input.value()
-        view   = self._vscale_active_view
-        self._collapse_vscale_ui()
-        view.apply_vertical_scale(factor)
-    
-    def _on_vscale_cancel_clicked(self):
-        if not self._vscale_active or self._vscale_active_view is None:
-            return
-        view = self._vscale_active_view
-        self._collapse_vscale_ui()
-        view.cancel_vertical_scale()
-
-    # ------------------------------------------------------------------
-    # Reverse
-    # ------------------------------------------------------------------
-
-    def _collapse_reverse_ui(self):
-        self._reverse_active = False
-        self._reverse_active_view = None
-        self._reverse_btn.setStyleSheet("")
-        self._reverse_panel.setVisible(False)
-        self._refresh_tab_bar_lock()
-
-    def _cancel_reverse_if_active(self):
-        if self._reverse_active and self._reverse_active_view is not None:
-            view = self._reverse_active_view
-            self._collapse_reverse_ui()
-            view.cancel_effect()
-        elif self._reverse_active:
-            self._collapse_reverse_ui()
-
-    def _on_reverse_clicked(self):
-        if self._reverse_active:
-            return
-        self._cancel_trim_if_active()
-        self._cancel_extract_if_active()
-        self._cancel_timescale_if_active()
-        self._cancel_vscale_if_active()
-        self._cancel_fadein_if_active()
-        self._cancel_fadeout_if_active()
-        self._cancel_concat_if_active()
-        view = self._current_entity_view()
-        if view is None or not view.begin_reverse():
-            return
-        self._reverse_active = True
-        self._reverse_active_view = view
-        self._reverse_btn.setStyleSheet(self._SELECTED_OPTION_STYLE)
-        self._reverse_panel.setVisible(True)
-        self._refresh_tab_bar_lock()
-
-    def _on_reverse_apply_clicked(self):
-        if not self._reverse_active or self._reverse_active_view is None:
-            return
-        view = self._reverse_active_view
-        self._collapse_reverse_ui()
-        view.apply_effect()
-
-    def _on_reverse_cancel_clicked(self):
-        if not self._reverse_active or self._reverse_active_view is None:
-            return
-        view = self._reverse_active_view
-        self._collapse_reverse_ui()
-        view.cancel_effect()
-
-    # ------------------------------------------------------------------
-    # Fade In
-    # ------------------------------------------------------------------
-
-    def _collapse_fadein_ui(self):
-        self._fadein_active = False
-        self._fadein_active_view = None
-        self._fadein_btn.setStyleSheet("")
-        self._fadein_panel.setVisible(False)
-        self._refresh_tab_bar_lock()
-
-    def _cancel_fadein_if_active(self):
-        if self._fadein_active and self._fadein_active_view is not None:
-            view = self._fadein_active_view
-            self._collapse_fadein_ui()
-            view.cancel_effect()
-        elif self._fadein_active:
-            self._collapse_fadein_ui()
-
-    def _on_fadein_clicked(self):
-        if self._fadein_active:
-            return
-        self._cancel_trim_if_active()
-        self._cancel_extract_if_active()
-        self._cancel_timescale_if_active()
-        self._cancel_vscale_if_active()
-        self._cancel_reverse_if_active()
-        self._cancel_fadeout_if_active()
-        self._cancel_concat_if_active()
-        view = self._current_entity_view()
-        if view is None or not view.begin_fade_in():
-            return
-        self._fadein_active = True
-        self._fadein_active_view = view
-        self._fadein_btn.setStyleSheet(self._SELECTED_OPTION_STYLE)
-        self._fadein_panel.setVisible(True)
-        self._refresh_tab_bar_lock()
-
-    def _on_fadein_apply_clicked(self):
-        if not self._fadein_active or self._fadein_active_view is None:
-            return
-        view = self._fadein_active_view
-        self._collapse_fadein_ui()
-        view.apply_effect()
-
-    def _on_fadein_cancel_clicked(self):
-        if not self._fadein_active or self._fadein_active_view is None:
-            return
-        view = self._fadein_active_view
-        self._collapse_fadein_ui()
-        view.cancel_effect()
-
-    # ------------------------------------------------------------------
-    # Fade Out
-    # ------------------------------------------------------------------
-
-    def _collapse_fadeout_ui(self):
-        self._fadeout_active = False
-        self._fadeout_active_view = None
-        self._fadeout_btn.setStyleSheet("")
-        self._fadeout_panel.setVisible(False)
-        self._refresh_tab_bar_lock()
-
-    def _cancel_fadeout_if_active(self):
-        if self._fadeout_active and self._fadeout_active_view is not None:
-            view = self._fadeout_active_view
-            self._collapse_fadeout_ui()
-            view.cancel_effect()
-        elif self._fadeout_active:
-            self._collapse_fadeout_ui()
-
-    def _on_fadeout_clicked(self):
-        if self._fadeout_active:
-            return
-        self._cancel_trim_if_active()
-        self._cancel_extract_if_active()
-        self._cancel_timescale_if_active()
-        self._cancel_vscale_if_active()
-        self._cancel_reverse_if_active()
-        self._cancel_fadein_if_active()
-        self._cancel_concat_if_active()
-        view = self._current_entity_view()
-        if view is None or not view.begin_fade_out():
-            return
-        self._fadeout_active = True
-        self._fadeout_active_view = view
-        self._fadeout_btn.setStyleSheet(self._SELECTED_OPTION_STYLE)
-        self._fadeout_panel.setVisible(True)
-        self._refresh_tab_bar_lock()
-
-    def _on_fadeout_apply_clicked(self):
-        if not self._fadeout_active or self._fadeout_active_view is None:
-            return
-        view = self._fadeout_active_view
-        self._collapse_fadeout_ui()
-        view.apply_effect()
-
-    def _on_fadeout_cancel_clicked(self):
-        if not self._fadeout_active or self._fadeout_active_view is None:
-            return
-        view = self._fadeout_active_view
-        self._collapse_fadeout_ui()
-        view.cancel_effect()
-
-    # ------------------------------------------------------------------
-    # Concatenate
-    # ------------------------------------------------------------------
-
-    def _collapse_concat_ui(self):
-        self._concat_active = False
-        self._concat_active_view = None
-        self._concat_btn.setStyleSheet("")
-        self._concat_panel.setVisible(False)
-        self._refresh_tab_bar_lock()
-
-    def _cancel_concat_if_active(self):
-        if self._concat_active and self._concat_active_view is not None:
-            view = self._concat_active_view
-            self._collapse_concat_ui()
-            view.cancel_concatenate()
-        elif self._concat_active:
-            self._collapse_concat_ui()
-
-    def _on_concatenate_clicked(self):
-        if self._concat_active:
-            return
-        self._cancel_trim_if_active()
-        self._cancel_extract_if_active()
-        self._cancel_timescale_if_active()
-        self._cancel_vscale_if_active()
-        self._cancel_reverse_if_active()
-        self._cancel_fadein_if_active()
-        self._cancel_fadeout_if_active()
+        # Only one operation panel can be open at a time.
+        self._cancel_all_ops(except_key=key)
 
         view = self._current_entity_view()
         if view is None:
             return
 
-        channel_count = view.entity.clip.num_channels
-        dialog = ConcatenateDialog(self._workspace, channel_count, self)
-        if dialog.exec() != QDialog.DialogCode.Accepted:
+        if entry.spec["needs_dialog"]:
+            # Concatenate: collect source portions via dialog first.
+            channel_count = view.entity.clip.num_channels
+            dialog = ConcatenateDialog(self._workspace, channel_count, self)
+            if dialog.exec() != QDialog.DialogCode.Accepted:
+                return
+            sources = dialog.selected_portions()
+            if not sources:
+                return
+            began = getattr(view, entry.spec["begin"])(sources)
+        else:
+            began = getattr(view, entry.spec["begin"])()
+
+        if not began:
             return
 
-        sources = dialog.selected_portions()
-        if not sources or not view.begin_concatenate(sources):
-            return
-
-        self._concat_active = True
-        self._concat_active_view = view
-        self._concat_btn.setStyleSheet(self._SELECTED_OPTION_STYLE)
-        self._concat_panel.setVisible(True)
+        entry.active = True
+        entry.active_view = view
+        if entry.factor_input is not None:
+            entry.factor_input.setValue(1.0)
+        entry.button.setStyleSheet(self._SELECTED_OPTION_STYLE)
+        entry.panel.setVisible(True)
         self._refresh_tab_bar_lock()
 
-    def _on_concat_apply_clicked(self):
-        if not self._concat_active or self._concat_active_view is None:
-            return
-        view = self._concat_active_view
-        self._collapse_concat_ui()
-        view.apply_concatenate()   # entity_concatenated → rebuild (clears selection)
+    def _on_op_factor_changed(self, key: str, factor: float):
+        """Live-preview: update the plot instantly as the factor changes."""
+        entry = self._ops[key]
+        if entry.active and entry.active_view is not None:
+            getattr(entry.active_view, entry.spec["preview"])(factor)
 
-    def _on_concat_cancel_clicked(self):
-        if not self._concat_active or self._concat_active_view is None:
+    def _on_op_apply_clicked(self, key: str):
+        entry = self._ops[key]
+        if not entry.active or entry.active_view is None:
             return
-        view = self._concat_active_view
-        self._collapse_concat_ui()
-        view.cancel_concatenate()  # restores graph + keeps selection
+        view = entry.active_view
+        factor = entry.factor_input.value() if entry.factor_input is not None else None
+        self._collapse_op_ui(key)
+        if factor is None:
+            getattr(view, entry.spec["apply"])()          # → rebuild (clears selection)
+        else:
+            getattr(view, entry.spec["apply"])(factor)    # → rebuild (clears selection)
+
+    def _on_op_cancel_clicked(self, key: str):
+        entry = self._ops[key]
+        if not entry.active or entry.active_view is None:
+            return
+        view = entry.active_view
+        self._collapse_op_ui(key)
+        getattr(view, entry.spec["cancel"])()              # restores graph + keeps selection
 
     # ------------------------------------------------------------------
     # Entity-view factory / tab lifecycle
@@ -1270,15 +851,9 @@ class WorkspacePage(QWidget):
         entity_view.entity_modified.connect(self._on_entity_modified)
         entity_view.segment_selected.connect(self._on_segment_selected)
         entity_view.segment_deselected.connect(self._on_segment_deselected)
-        entity_view.entity_trimmed.connect(lambda: self._rebuild_entity_tab(entity))
-        entity_view.entity_extracted.connect(lambda: self._rebuild_entity_tab(entity))
-        entity_view.entity_timescaled.connect(lambda: self._rebuild_entity_tab(entity))
-        entity_view.entity_vscaled.connect(lambda: self._rebuild_entity_tab(entity))
-        entity_view.entity_reversed.connect(lambda: self._rebuild_entity_tab(entity))
-        entity_view.entity_faded_in.connect(lambda: self._rebuild_entity_tab(entity))
-        entity_view.entity_faded_out.connect(lambda: self._rebuild_entity_tab(entity))
-        entity_view.entity_concatenated.connect(lambda: self._rebuild_entity_tab(entity))
-        entity_view.trim_cancelled.connect(self._on_trim_cancelled_externally)
+        for entry in self._ops.values():
+            signal = getattr(entity_view, entry.spec["rebuild_signal"])
+            signal.connect(lambda entity=entity: self._rebuild_entity_tab(entity))
         entity_view.set_edit_mode(self._mode == "edit")
         return entity_view
 
@@ -1296,6 +871,14 @@ class WorkspacePage(QWidget):
         self._tab_bar.setCurrentIndex(index)
         self._content_stack.setCurrentWidget(entity_view)
 
+    def _collapse_ops_for_widget(self, widget):
+        """Collapse any operation panel that's mid-flight on `widget`,
+        for every one of the 8 ops (not just Trim/Extract/Time Scale —
+        see the discussion on the earlier stale-reference bug)."""
+        for key, entry in self._ops.items():
+            if widget is entry.active_view:
+                self._collapse_op_ui(key)
+
     def _rebuild_entity_tab(self, entity: Entity):
         index = self._find_entity_tab(entity.id)
         if index == -1:
@@ -1304,22 +887,7 @@ class WorkspacePage(QWidget):
         old_widget   = self._content_stack.widget(widget_index)
         was_current  = (self._tab_bar.currentIndex() == index)
 
-        if old_widget is self._trim_active_view:
-            self._collapse_trim_ui()
-        if old_widget is self._extract_active_view:
-            self._collapse_extract_ui()
-        if old_widget is self._timescale_active_view:
-            self._collapse_timescale_ui()
-        if old_widget is self._vscale_active_view:     # ← add (both methods; use `widget` instead of `old_widget` in _close_tab)
-            self._collapse_vscale_ui()
-        if old_widget is self._reverse_active_view:
-            self._collapse_reverse_ui()
-        if old_widget is self._fadein_active_view:
-            self._collapse_fadein_ui()
-        if old_widget is self._fadeout_active_view:
-            self._collapse_fadeout_ui()
-        if old_widget is self._concat_active_view:
-            self._collapse_concat_ui()
+        self._collapse_ops_for_widget(old_widget)
 
         self._content_stack.removeWidget(old_widget)
         old_widget.deleteLater()
@@ -1336,12 +904,9 @@ class WorkspacePage(QWidget):
     def _close_tab(self, index: int):
         widget_index = index + 1
         widget = self._content_stack.widget(widget_index)
-        if widget is self._trim_active_view:
-            self._collapse_trim_ui()
-        if widget is self._extract_active_view:
-            self._collapse_extract_ui()
-        if widget is self._timescale_active_view:
-            self._collapse_timescale_ui()
+
+        self._collapse_ops_for_widget(widget)
+
         if widget:
             widget.shutdown()
             self._content_stack.removeWidget(widget)
@@ -1354,17 +919,10 @@ class WorkspacePage(QWidget):
             active.force_idle()
 
     def _on_tab_changed(self, index: int):
-        self._cancel_trim_if_active()
-        self._cancel_extract_if_active()
-        self._cancel_timescale_if_active()
-        self._cancel_vscale_if_active()
-        self._cancel_reverse_if_active()
-        self._cancel_fadein_if_active()
-        self._cancel_fadeout_if_active()
-        self._cancel_concat_if_active()
-        self._force_stop_active_playback()      # ← add, before selection clearing
+        self._cancel_all_ops()
+        self._force_stop_active_playback()
         self._clear_all_plot_selections()
-    
+
         if index < 0:
             self._content_stack.setCurrentWidget(self._empty_label)
             return

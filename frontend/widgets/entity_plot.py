@@ -34,7 +34,6 @@ class EntityPlotView(QWidget):
     entity_faded_out = Signal()
     entity_concatenated = Signal()
     entity_extracted = Signal()
-    trim_cancelled = Signal()
     segment_selected = Signal(object, object, float, float)
     segment_deselected = Signal()
     """
@@ -61,11 +60,18 @@ class EntityPlotView(QWidget):
         self._vscale_range = None
         self._vscale_mirror_players = []     # channel players mirrored when Overall is selected
         self._vscale_overall_target = None   # Overall player mirrored when a channel is selected
-        self._effect_op = None               # 'reverse' | 'fade_in' | 'fade_out'
-        self._effect_player = None
-        self._effect_range = None
-        self._effect_mirror_players = []     # channel players mirrored when Overall is selected
-        self._effect_overall_target = None   # Overall player mirrored when a channel is selected
+        self._reverse_player = None
+        self._reverse_range = None
+        self._reverse_mirror_players = []    # channel players mirrored when Overall is selected
+        self._reverse_overall_target = None  # Overall player mirrored when a channel is selected
+        self._fadein_player = None
+        self._fadein_range = None
+        self._fadein_mirror_players = []     # channel players mirrored when Overall is selected
+        self._fadein_overall_target = None   # Overall player mirrored when a channel is selected
+        self._fadeout_player = None
+        self._fadeout_range = None
+        self._fadeout_mirror_players = []    # channel players mirrored when Overall is selected
+        self._fadeout_overall_target = None  # Overall player mirrored when a channel is selected
         self._concat_player = None
         self._concat_range = None
         self._concat_sources = []
@@ -85,6 +91,14 @@ class EntityPlotView(QWidget):
             if player.channel_index is None:
                 return player
         return None
+
+    # ------------------------------------------------------------------
+    # Trim preview
+    # ------------------------------------------------------------------
+    # Removes the selected segment and closes the gap, keeping everything
+    # before and after it. Only valid when the Overall plot is selected
+    # (enforced by the caller via _OVERALL_ONLY_OPS), since the operation
+    # applies uniformly across every channel.
 
     def begin_trim(self) -> bool:
         if self._selected_player is None or self._selected_player.channel_index is not None:
@@ -123,6 +137,54 @@ class EntityPlotView(QWidget):
         self.clear_all_selection()   # apply clears selection
         self.entity_modified.emit()
         self.entity_trimmed.emit()
+
+    def _perform_trim(self, start, end):
+        clip = self._entity.clip
+        remove_start_idx = clip.get_index(start)
+        remove_end_idx = clip.get_index(end)
+
+        new_channels = []
+        for ch in clip.channels:
+            before = None
+            after = None
+
+            if remove_start_idx > ch.start_index:
+                before = ch.trim(ch.start_index, remove_start_idx - 1)
+            if remove_end_idx < ch.end_index():
+                after = ch.trim(remove_end_idx + 1, ch.end_index())
+
+            if before is not None and after is not None:
+                new_channels.append(before.concatenate(after))
+            elif before is not None:
+                new_channels.append(before)
+            elif after is not None:
+                new_channels.append(after)
+            else:
+                # the whole channel was inside the selection — keep a single
+                # silent sample so the clip never collapses to zero length
+                new_channels.append(Discrete_Signal(
+                    np.zeros(1, dtype=ch.samples.dtype), ch.sample_rate, ch.start_index
+                ))
+
+        self._entity.clip = AudioClip(new_channels, name=clip.name)
+
+        removed_span = end - start
+
+        def _shift_time(t):
+            if t <= start:
+                return t
+            if t >= end:
+                return t - removed_span
+            return None  # fell inside the removed span — drop it
+
+        self._entity.divisions = [
+            t for t in (_shift_time(d) for d in self._entity.divisions) if t is not None
+        ]
+        for ch_idx in list(self._entity.channel_markers.keys()):
+            self._entity.channel_markers[ch_idx] = [
+                t for t in (_shift_time(m) for m in self._entity.channel_markers[ch_idx])
+                if t is not None
+            ]
 
     # ------------------------------------------------------------------
     # Extract preview
@@ -171,6 +233,40 @@ class EntityPlotView(QWidget):
         self.clear_all_selection()   # apply clears selection
         self.entity_modified.emit()
         self.entity_extracted.emit()
+
+    def _perform_extract(self, start, end):
+        clip = self._entity.clip
+        keep_start_idx = clip.get_index(start)
+        keep_end_idx = clip.get_index(end)
+
+        new_channels = []
+        for ch in clip.channels:
+            local_start = max(keep_start_idx, ch.start_index)
+            local_end = min(keep_end_idx, ch.end_index())
+
+            if local_end < local_start:
+                # selection fell entirely outside this channel's range —
+                # keep a single silent sample so the clip never collapses
+                # to zero length
+                new_channels.append(Discrete_Signal(
+                    np.zeros(1, dtype=ch.samples.dtype), ch.sample_rate, ch.start_index
+                ))
+            else:
+                new_channels.append(ch.trim(local_start, local_end))
+
+        self._entity.clip = AudioClip(new_channels, name=clip.name)
+
+        # Sample indices (and therefore times) inside the kept segment are
+        # unchanged — only content outside [start, end] is discarded — so
+        # divisions/markers just need filtering to what still falls
+        # strictly inside the kept range, with no time-shift required.
+        self._entity.divisions = [
+            t for t in self._entity.divisions if start < t < end
+        ]
+        for ch_idx in list(self._entity.channel_markers.keys()):
+            self._entity.channel_markers[ch_idx] = [
+                t for t in self._entity.channel_markers[ch_idx] if start < t < end
+            ]
 
     # ------------------------------------------------------------------
     # Time-scale preview
@@ -372,113 +468,273 @@ class EntityPlotView(QWidget):
         self._entity.clip = new_clip
 
     # ------------------------------------------------------------------
-    # Reverse / Fade In / Fade Out preview
+    # Reverse preview
     # ------------------------------------------------------------------
     # Same architecture as vertical scale: a preview lives on the selected
     # player and, when a channel is selected, mirrors onto that channel's
     # curve in the Overall plot; when Overall is selected, mirrors onto
-    # every channel plot. The only difference from vertical scale is that
-    # none of these operations take a factor, so there's no live-update
-    # step — the preview is computed once when the op begins.
+    # every channel plot. Unlike vertical scale, reverse takes no factor,
+    # so there's no live-update step — the preview is computed once when
+    # the op begins.
 
-    def begin_effect(self, op) -> bool:
+    def begin_reverse(self) -> bool:
         if self._selected_player is None:
             return False
         segment = self._selected_player.selected_segment
         if segment is None:
             return False
 
-        self._effect_op = op
-        self._effect_player = self._selected_player
-        self._effect_range = segment
-        self._effect_player.enter_effect_preview(op, *segment)
+        self._reverse_player = self._selected_player
+        self._reverse_range = segment
+        self._reverse_player.enter_effect_preview("reverse", *segment)
 
-        self._effect_overall_target = None
-        self._effect_mirror_players = []
+        self._reverse_overall_target = None
+        self._reverse_mirror_players = []
 
-        if self._effect_player.channel_index is not None:
+        if self._reverse_player.channel_index is not None:
             # A single channel was selected — mirror the preview onto that
             # channel's curve inside the Overall plot.
             overall_player = self._find_overall_player()
-            if overall_player is not None and overall_player is not self._effect_player:
-                overall_player.preview_channel_curve_effect(self._effect_player.channel_index, op, *segment)
-                self._effect_overall_target = overall_player
+            if overall_player is not None and overall_player is not self._reverse_player:
+                overall_player.preview_channel_curve_effect(
+                    self._reverse_player.channel_index, "reverse", *segment
+                )
+                self._reverse_overall_target = overall_player
         else:
             # The Overall plot was selected — it applies the effect to
             # every channel uniformly, so mirror the same preview onto
             # each channel plot.
-            self._effect_mirror_players = [
+            self._reverse_mirror_players = [
                 p for p in self._players
-                if p is not self._effect_player and p.channel_index is not None
+                if p is not self._reverse_player and p.channel_index is not None
             ]
-            for player in self._effect_mirror_players:
-                player.enter_effect_preview(op, *segment)
+            for player in self._reverse_mirror_players:
+                player.enter_effect_preview("reverse", *segment)
 
         self._lock_selection(True)
         return True
 
-    def begin_reverse(self) -> bool:
-        return self.begin_effect("reverse")
-
-    def begin_fade_in(self) -> bool:
-        return self.begin_effect("fade_in")
-
-    def begin_fade_out(self) -> bool:
-        return self.begin_effect("fade_out")
-
-    def cancel_effect(self):
-        if self._effect_player is None:
+    def cancel_reverse(self):
+        if self._reverse_player is None:
             return
-        self._effect_player.exit_effect_preview()
-        if self._effect_overall_target is not None:
-            self._effect_overall_target.exit_channel_curve_preview()
-        for player in self._effect_mirror_players:
+        self._reverse_player.exit_effect_preview()
+        if self._reverse_overall_target is not None:
+            self._reverse_overall_target.exit_channel_curve_preview()
+        for player in self._reverse_mirror_players:
             player.exit_effect_preview()
-        self._effect_op = None
-        self._effect_player = None
-        self._effect_overall_target = None
-        self._effect_mirror_players = []
-        self._effect_range = None
+        self._reverse_player = None
+        self._reverse_overall_target = None
+        self._reverse_mirror_players = []
+        self._reverse_range = None
         self._lock_selection(False)
         if self._selected_player is not None:
             self._selected_player.restore_selection_visual()
 
-    def apply_effect(self):
-        if self._effect_player is None:
+    def apply_reverse(self):
+        if self._reverse_player is None:
             return
-        op = self._effect_op
-        channel_index = self._effect_player.channel_index
-        start, end = self._effect_range
-        self._effect_player.exit_effect_preview()
-        if self._effect_overall_target is not None:
-            self._effect_overall_target.exit_channel_curve_preview()
-        for player in self._effect_mirror_players:
+        channel_index = self._reverse_player.channel_index
+        start, end = self._reverse_range
+        self._reverse_player.exit_effect_preview()
+        if self._reverse_overall_target is not None:
+            self._reverse_overall_target.exit_channel_curve_preview()
+        for player in self._reverse_mirror_players:
             player.exit_effect_preview()
-        self._perform_effect(op, channel_index, start, end)
-        self._effect_op = None
-        self._effect_player = None
-        self._effect_overall_target = None
-        self._effect_mirror_players = []
-        self._effect_range = None
+        self._perform_reverse(channel_index, start, end)
+        self._reverse_player = None
+        self._reverse_overall_target = None
+        self._reverse_mirror_players = []
+        self._reverse_range = None
         self._lock_selection(False)
         self.clear_all_selection()
         self.entity_modified.emit()
-        if op == "reverse":
-            self.entity_reversed.emit()
-        elif op == "fade_in":
-            self.entity_faded_in.emit()
-        elif op == "fade_out":
-            self.entity_faded_out.emit()
+        self.entity_reversed.emit()
 
-    def _perform_effect(self, op, channel_index, start, end):
+    def _perform_reverse(self, channel_index, start, end):
         clip = self._entity.clip
         start_idx = clip.get_index(start)
         end_idx = clip.get_index(end)
 
         if channel_index is None:
-            new_clip = clip.apply(op, start_idx, end_idx)
+            new_clip = clip.apply("reverse", start_idx, end_idx)
         else:
-            new_clip = clip.apply(op, start_idx, end_idx, channel=channel_index)
+            new_clip = clip.apply("reverse", start_idx, end_idx, channel=channel_index)
+
+        self._entity.clip = new_clip
+
+    # ------------------------------------------------------------------
+    # Fade In preview
+    # ------------------------------------------------------------------
+    # Same architecture as Reverse: a preview lives on the selected player
+    # and mirrors onto the Overall plot's matching channel curve (channel
+    # selected) or onto every channel plot (Overall selected). No factor,
+    # so the preview is computed once when the op begins.
+
+    def begin_fade_in(self) -> bool:
+        if self._selected_player is None:
+            return False
+        segment = self._selected_player.selected_segment
+        if segment is None:
+            return False
+
+        self._fadein_player = self._selected_player
+        self._fadein_range = segment
+        self._fadein_player.enter_effect_preview("fade_in", *segment)
+
+        self._fadein_overall_target = None
+        self._fadein_mirror_players = []
+
+        if self._fadein_player.channel_index is not None:
+            overall_player = self._find_overall_player()
+            if overall_player is not None and overall_player is not self._fadein_player:
+                overall_player.preview_channel_curve_effect(
+                    self._fadein_player.channel_index, "fade_in", *segment
+                )
+                self._fadein_overall_target = overall_player
+        else:
+            self._fadein_mirror_players = [
+                p for p in self._players
+                if p is not self._fadein_player and p.channel_index is not None
+            ]
+            for player in self._fadein_mirror_players:
+                player.enter_effect_preview("fade_in", *segment)
+
+        self._lock_selection(True)
+        return True
+
+    def cancel_fade_in(self):
+        if self._fadein_player is None:
+            return
+        self._fadein_player.exit_effect_preview()
+        if self._fadein_overall_target is not None:
+            self._fadein_overall_target.exit_channel_curve_preview()
+        for player in self._fadein_mirror_players:
+            player.exit_effect_preview()
+        self._fadein_player = None
+        self._fadein_overall_target = None
+        self._fadein_mirror_players = []
+        self._fadein_range = None
+        self._lock_selection(False)
+        if self._selected_player is not None:
+            self._selected_player.restore_selection_visual()
+
+    def apply_fade_in(self):
+        if self._fadein_player is None:
+            return
+        channel_index = self._fadein_player.channel_index
+        start, end = self._fadein_range
+        self._fadein_player.exit_effect_preview()
+        if self._fadein_overall_target is not None:
+            self._fadein_overall_target.exit_channel_curve_preview()
+        for player in self._fadein_mirror_players:
+            player.exit_effect_preview()
+        self._perform_fade_in(channel_index, start, end)
+        self._fadein_player = None
+        self._fadein_overall_target = None
+        self._fadein_mirror_players = []
+        self._fadein_range = None
+        self._lock_selection(False)
+        self.clear_all_selection()
+        self.entity_modified.emit()
+        self.entity_faded_in.emit()
+
+    def _perform_fade_in(self, channel_index, start, end):
+        clip = self._entity.clip
+        start_idx = clip.get_index(start)
+        end_idx = clip.get_index(end)
+
+        if channel_index is None:
+            new_clip = clip.apply("fade_in", start_idx, end_idx)
+        else:
+            new_clip = clip.apply("fade_in", start_idx, end_idx, channel=channel_index)
+
+        self._entity.clip = new_clip
+
+    # ------------------------------------------------------------------
+    # Fade Out preview
+    # ------------------------------------------------------------------
+    # Same architecture as Reverse: a preview lives on the selected player
+    # and mirrors onto the Overall plot's matching channel curve (channel
+    # selected) or onto every channel plot (Overall selected). No factor,
+    # so the preview is computed once when the op begins.
+
+    def begin_fade_out(self) -> bool:
+        if self._selected_player is None:
+            return False
+        segment = self._selected_player.selected_segment
+        if segment is None:
+            return False
+
+        self._fadeout_player = self._selected_player
+        self._fadeout_range = segment
+        self._fadeout_player.enter_effect_preview("fade_out", *segment)
+
+        self._fadeout_overall_target = None
+        self._fadeout_mirror_players = []
+
+        if self._fadeout_player.channel_index is not None:
+            overall_player = self._find_overall_player()
+            if overall_player is not None and overall_player is not self._fadeout_player:
+                overall_player.preview_channel_curve_effect(
+                    self._fadeout_player.channel_index, "fade_out", *segment
+                )
+                self._fadeout_overall_target = overall_player
+        else:
+            self._fadeout_mirror_players = [
+                p for p in self._players
+                if p is not self._fadeout_player and p.channel_index is not None
+            ]
+            for player in self._fadeout_mirror_players:
+                player.enter_effect_preview("fade_out", *segment)
+
+        self._lock_selection(True)
+        return True
+
+    def cancel_fade_out(self):
+        if self._fadeout_player is None:
+            return
+        self._fadeout_player.exit_effect_preview()
+        if self._fadeout_overall_target is not None:
+            self._fadeout_overall_target.exit_channel_curve_preview()
+        for player in self._fadeout_mirror_players:
+            player.exit_effect_preview()
+        self._fadeout_player = None
+        self._fadeout_overall_target = None
+        self._fadeout_mirror_players = []
+        self._fadeout_range = None
+        self._lock_selection(False)
+        if self._selected_player is not None:
+            self._selected_player.restore_selection_visual()
+
+    def apply_fade_out(self):
+        if self._fadeout_player is None:
+            return
+        channel_index = self._fadeout_player.channel_index
+        start, end = self._fadeout_range
+        self._fadeout_player.exit_effect_preview()
+        if self._fadeout_overall_target is not None:
+            self._fadeout_overall_target.exit_channel_curve_preview()
+        for player in self._fadeout_mirror_players:
+            player.exit_effect_preview()
+        self._perform_fade_out(channel_index, start, end)
+        self._fadeout_player = None
+        self._fadeout_overall_target = None
+        self._fadeout_mirror_players = []
+        self._fadeout_range = None
+        self._lock_selection(False)
+        self.clear_all_selection()
+        self.entity_modified.emit()
+        self.entity_faded_out.emit()
+
+    def _perform_fade_out(self, channel_index, start, end):
+        clip = self._entity.clip
+        start_idx = clip.get_index(start)
+        end_idx = clip.get_index(end)
+
+        if channel_index is None:
+            new_clip = clip.apply("fade_out", start_idx, end_idx)
+        else:
+            new_clip = clip.apply("fade_out", start_idx, end_idx, channel=channel_index)
 
         self._entity.clip = new_clip
 
@@ -601,98 +857,20 @@ class EntityPlotView(QWidget):
                 _shift_time(t) for t in self._entity.channel_markers[ch_idx]
             ]
 
-    def _perform_trim(self, start, end):
-        clip = self._entity.clip
-        remove_start_idx = clip.get_index(start)
-        remove_end_idx = clip.get_index(end)
-
-        new_channels = []
-        for ch in clip.channels:
-            before = None
-            after = None
-
-            if remove_start_idx > ch.start_index:
-                before = ch.trim(ch.start_index, remove_start_idx - 1)
-            if remove_end_idx < ch.end_index():
-                after = ch.trim(remove_end_idx + 1, ch.end_index())
-
-            if before is not None and after is not None:
-                new_channels.append(before.concatenate(after))
-            elif before is not None:
-                new_channels.append(before)
-            elif after is not None:
-                new_channels.append(after)
-            else:
-                # the whole channel was inside the selection — keep a single
-                # silent sample so the clip never collapses to zero length
-                new_channels.append(Discrete_Signal(
-                    np.zeros(1, dtype=ch.samples.dtype), ch.sample_rate, ch.start_index
-                ))
-
-        self._entity.clip = AudioClip(new_channels, name=clip.name)
-
-        removed_span = end - start
-
-        def _shift_time(t):
-            if t <= start:
-                return t
-            if t >= end:
-                return t - removed_span
-            return None  # fell inside the removed span — drop it
-
-        self._entity.divisions = [
-            t for t in (_shift_time(d) for d in self._entity.divisions) if t is not None
-        ]
-        for ch_idx in list(self._entity.channel_markers.keys()):
-            self._entity.channel_markers[ch_idx] = [
-                t for t in (_shift_time(m) for m in self._entity.channel_markers[ch_idx])
-                if t is not None
-            ]
-
-    def _perform_extract(self, start, end):
-        clip = self._entity.clip
-        keep_start_idx = clip.get_index(start)
-        keep_end_idx = clip.get_index(end)
-
-        new_channels = []
-        for ch in clip.channels:
-            local_start = max(keep_start_idx, ch.start_index)
-            local_end = min(keep_end_idx, ch.end_index())
-
-            if local_end < local_start:
-                # selection fell entirely outside this channel's range —
-                # keep a single silent sample so the clip never collapses
-                # to zero length
-                new_channels.append(Discrete_Signal(
-                    np.zeros(1, dtype=ch.samples.dtype), ch.sample_rate, ch.start_index
-                ))
-            else:
-                new_channels.append(ch.trim(local_start, local_end))
-
-        self._entity.clip = AudioClip(new_channels, name=clip.name)
-
-        # Sample indices (and therefore times) inside the kept segment are
-        # unchanged — only content outside [start, end] is discarded — so
-        # divisions/markers just need filtering to what still falls
-        # strictly inside the kept range, with no time-shift required.
-        self._entity.divisions = [
-            t for t in self._entity.divisions if start < t < end
-        ]
-        for ch_idx in list(self._entity.channel_markers.keys()):
-            self._entity.channel_markers[ch_idx] = [
-                t for t in self._entity.channel_markers[ch_idx] if start < t < end
-            ]
-
     def _on_canvas_clicked(self):
-        if (self._trim_player is not None or self._extract_player is not None
+        # A click on empty canvas is a no-op while any preview is active —
+        # every operation (Trim included) is cancelled explicitly via its
+        # own Cancel button, not implicitly by clicking away.
+        if (self._trim_player is not None
+                or self._extract_player is not None
                 or self._timescale_preview_active
-                or self._vscale_player is not None or self._effect_player is not None
+                or self._vscale_player is not None
+                or self._reverse_player is not None
+                or self._fadein_player is not None
+                or self._fadeout_player is not None
                 or self._concat_player is not None):
             return
         self.clear_all_selection()
-        if self._trim_player is not None:
-            self.cancel_trim()
-            self.trim_cancelled.emit()
 
     def _build_ui(self):
         outer_layout = QVBoxLayout(self)
@@ -767,7 +945,9 @@ class EntityPlotView(QWidget):
         self.cancel_extract()
         self.cancel_timescale()
         self.cancel_vertical_scale()
-        self.cancel_effect()
+        self.cancel_reverse()
+        self.cancel_fade_in()
+        self.cancel_fade_out()
         self.cancel_concatenate()
         for player in self._players:
             player.force_idle()
