@@ -433,8 +433,14 @@ class WorkspacePage(QWidget):
         self._edit_btn.setFixedWidth(70)
         self._edit_btn.clicked.connect(self._on_edit_button_clicked)
 
+        self._tool_btn = QToolButton()
+        self._tool_btn.setText("Tool")
+        self._tool_btn.setFixedWidth(70)
+        self._tool_btn.clicked.connect(self._on_tool_button_clicked)
+
         top_bar.addWidget(self._file_btn)
         top_bar.addWidget(self._edit_btn)
+        top_bar.addWidget(self._tool_btn)
         top_bar.addStretch()
         root_layout.addLayout(top_bar)
 
@@ -513,6 +519,35 @@ class WorkspacePage(QWidget):
         edit_options_layout.addStretch()
         self._edit_options_panel.setVisible(False)   # shown when edit mode is active
         sidebar_layout.addWidget(self._edit_options_panel)
+
+        # ---- tool-options panel (always present; shown only in tool mode) ----
+        self._tool_options_panel = QWidget()
+        tool_options_layout = QVBoxLayout(self._tool_options_panel)
+        tool_options_layout.setContentsMargins(4, 4, 4, 4)
+        tool_options_layout.setSpacing(6)
+
+        _TOOL_SECTIONS = [
+            ("General Tools", ["Delete Divisor"]),
+            ("Filtering Tools", ["Noise Removal"]),
+            ("Echo Tools", ["Add Echo", "Remove Echo"]),
+        ]
+
+        self._tool_buttons: dict[str, QPushButton] = {}
+
+        for section_title, labels in _TOOL_SECTIONS:
+            section_label = QLabel(section_title)
+            section_label.setStyleSheet("font-weight: 600; margin-top: 8px;")
+            tool_options_layout.addWidget(section_label)
+
+            for label in labels:
+                btn = QPushButton(label)
+                btn.setEnabled(False)   # inactive — not wired to a handler yet
+                tool_options_layout.addWidget(btn)
+                self._tool_buttons[label] = btn
+
+        tool_options_layout.addStretch()
+        self._tool_options_panel.setVisible(False)   # shown when tool mode is active
+        sidebar_layout.addWidget(self._tool_options_panel)
 
         splitter.addWidget(sidebar)
 
@@ -615,6 +650,9 @@ class WorkspacePage(QWidget):
     def _on_edit_button_clicked(self):
         self._set_mode("edit")
 
+    def _on_tool_button_clicked(self):
+        self._set_mode("tool")
+
     def _force_idle_all_players(self):
         for i in range(1, self._content_stack.count()):
             widget = self._content_stack.widget(i)
@@ -654,14 +692,19 @@ class WorkspacePage(QWidget):
 
         self._file_btn.setStyleSheet(self._SELECTED_BTN_STYLE if mode == "file" else "")
         self._edit_btn.setStyleSheet(self._SELECTED_BTN_STYLE if mode == "edit" else "")
+        self._tool_btn.setStyleSheet(self._SELECTED_BTN_STYLE if mode == "tool" else "")
 
         is_edit = (mode == "edit")
-        self._new_folder_btn.setVisible(not is_edit)
-        self._new_entity_btn.setVisible(not is_edit)
-        self._tree.setVisible(not is_edit)
+        is_tool = (mode == "tool")
+        hides_tree = is_edit or is_tool
 
-        # Show / hide edit-options panel
+        self._new_folder_btn.setVisible(not hides_tree)
+        self._new_entity_btn.setVisible(not hides_tree)
+        self._tree.setVisible(not hides_tree)
+
+        # Show / hide the two mutually-exclusive sidebar panels
         self._edit_options_panel.setVisible(is_edit)
+        self._tool_options_panel.setVisible(is_tool)
         if is_edit:
             self._refresh_option_buttons(has_selection=False)
 
