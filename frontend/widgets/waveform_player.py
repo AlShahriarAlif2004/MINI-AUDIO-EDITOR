@@ -367,6 +367,7 @@ class WaveformPlayer(QWidget):
         self._preview_curve_index = None
         self._preview_curve_range = None
         self._preview_curve_effect = None  # set when the mirrored curve preview is a factor-free effect
+        self._preview_curve_engine = None  # playback engine for Overall when a channel is being edited
 
         self._timer = QTimer(self)
         self._timer.setInterval(_TICK_MS)
@@ -1093,11 +1094,28 @@ class WaveformPlayer(QWidget):
 
     def preview_channel_curve_effect(self, curve_index, effect, start, end):
         """Mirror another plot's reverse/fade_in/fade_out preview onto one
-        overlaid curve here — the effect counterpart of preview_channel_curve."""
+        overlaid curve here — the effect counterpart of preview_channel_curve.
+        Also builds _preview_curve_engine so playback hears the effect too."""
         self._preview_curve_index = curve_index
         self._preview_curve_range = (start, end)
         self._preview_curve_effect = effect
         self._update_channel_curve_effect_preview()
+        self._build_preview_curve_effect_engine(curve_index, effect, start, end)
+
+    def _build_preview_curve_effect_engine(self, curve_index, effect, start, end):
+        """Build _preview_curve_engine for this (Overall) player applying
+        `effect` to only the `curve_index` column of the audio buffer.
+        Skipped for mono-downmixed buffers (3+ channel clips) where the
+        individual channel cannot be isolated."""
+        audio = self._engine.audio_data
+        if audio.ndim != 2 or curve_index >= audio.shape[1]:
+            return
+        start_idx, end_idx = self._preview_slice_indices(start, end)
+        preview_audio = audio.copy()
+        preview_audio[start_idx:end_idx, curve_index] = self._compute_effect(
+            effect, preview_audio[start_idx:end_idx, curve_index]
+        )
+        self._preview_curve_engine = _PlaybackEngine(preview_audio, self._sample_rate)
 
     def _update_channel_curve_effect_preview(self):
         curve_index = self._preview_curve_index
@@ -1115,14 +1133,32 @@ class WaveformPlayer(QWidget):
         """Live-preview another plot's vertical-scale edit by scaling just
         that one overlaid curve here too. Used on the Overall plot so a
         channel being edited stays visible even if it's currently drawn
-        underneath an identical/overlapping channel."""
+        underneath an identical/overlapping channel.
+        Also builds _preview_curve_engine so playback hears the scaling too."""
         self._preview_curve_index = curve_index
         self._preview_curve_range = (start, end)
         self._update_channel_curve_preview(factor)
+        self._build_preview_curve_factor_engine(curve_index, factor, start, end)
+
+    def _build_preview_curve_factor_engine(self, curve_index, factor, start, end):
+        """Build _preview_curve_engine for vertical-scale preview on one
+        channel column. Skipped for mono-downmixed buffers (3+ channel clips)."""
+        audio = self._engine.audio_data
+        if audio.ndim != 2 or curve_index >= audio.shape[1]:
+            return
+        start_idx, end_idx = self._preview_slice_indices(start, end)
+        preview_audio = audio.copy()
+        preview_audio[start_idx:end_idx, curve_index] = (
+            preview_audio[start_idx:end_idx, curve_index] * factor
+        )
+        self._preview_curve_engine = _PlaybackEngine(preview_audio, self._sample_rate)
 
     def update_channel_curve_preview(self, factor: float):
         if self._preview_curve_index is not None:
             self._update_channel_curve_preview(factor)
+            self._build_preview_curve_factor_engine(
+                self._preview_curve_index, factor, *self._preview_curve_range
+            )
 
     def _update_channel_curve_preview(self, factor: float):
         curve_index = self._preview_curve_index
@@ -1132,11 +1168,15 @@ class WaveformPlayer(QWidget):
         preview = samples.copy()
         preview[start_idx:end_idx] = preview[start_idx:end_idx] * factor
         self._curve_items[curve_index].setData(self._times, preview)
-        self._autoscale_y() 
+        self._autoscale_y()
 
     def exit_channel_curve_preview(self):
         if self._preview_curve_index is None:
             return
+        if self._preview_curve_engine is not None:
+            if self._state != self.STATE_STOPPED and self._playback_engine() is self._preview_curve_engine:
+                self._do_reset()
+            self._preview_curve_engine = None
         curve_index = self._preview_curve_index
         samples = self._series[curve_index][0]
         self._curve_items[curve_index].setData(self._times, samples)
@@ -1394,6 +1434,8 @@ class WaveformPlayer(QWidget):
             return self._vscale_engine
         if self._effect_mode is not None and self._effect_engine is not None:
             return self._effect_engine
+        if self._preview_curve_engine is not None:
+            return self._preview_curve_engine
         return self._engine
 
     def _current_center_time(self):

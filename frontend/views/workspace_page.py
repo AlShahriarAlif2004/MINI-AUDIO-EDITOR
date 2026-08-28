@@ -474,7 +474,22 @@ class WorkspacePage(QWidget):
 
         self._segment_buttons: dict[str, QPushButton] = {}
 
+        # Section headers shown above the first operation of each group.
+        _SECTION_TITLES = {
+            "trim": "Cutting",
+            "timescale": "Scaling",
+            "reverse": "Reversing",
+            "fadein": "Fading",
+            "concat": "Concatenating",
+        }
+
         for spec in self._OP_SPECS:
+            section_title = _SECTION_TITLES.get(spec["key"])
+            if section_title is not None:
+                section_label = QLabel(section_title)
+                section_label.setStyleSheet("font-weight: 600; margin-top: 8px;")
+                edit_options_layout.addWidget(section_label)
+
             btn = QPushButton(spec["label"])
             btn.setEnabled(False)          # disabled until a segment is selected
             edit_options_layout.addWidget(btn)
