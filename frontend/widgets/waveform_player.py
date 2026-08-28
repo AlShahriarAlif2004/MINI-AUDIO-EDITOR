@@ -155,6 +155,11 @@ class _DraggablePlotWidget(pg.PlotWidget):
         self._segment_boundaries_getter = None
         self._on_segment_hover = None
         self._on_segment_click = None
+
+        self._marker_mode = False
+        self._marker_positions_getter = None
+        self._on_marker_click = None
+
         self.setMouseTracking(True)
 
     def set_clip_mode(self, enabled, allow_graph_drag=False,
@@ -172,6 +177,33 @@ class _DraggablePlotWidget(pg.PlotWidget):
         self._segment_boundaries_getter = boundaries_getter
         self._on_segment_hover = on_hover
         self._on_segment_click = on_click
+
+    def set_marker_mode(self, enabled, positions_getter=None, on_click=None):
+        """positions_getter() -> list[(index, time)] of *selectable*
+        markers only — boundary lines are never included, so they can
+        never be picked."""
+        self._marker_mode = enabled
+        self._marker_positions_getter = positions_getter
+        self._on_marker_click = on_click
+
+    def _marker_at_pixel(self, event_pos):
+        if not self._marker_positions_getter:
+            return None
+        positions = self._marker_positions_getter()
+        if not positions:
+            return None
+        view_box = self.getPlotItem().vb
+        scene_pos = self.mapToScene(event_pos)
+        t = view_box.mapSceneToView(scene_pos).x()
+        px_per_sec = self._compute_pixels_per_second()
+        best_index = None
+        best_dist = self._DIVISOR_HIT_TOLERANCE_PX
+        for index, pos_t in positions:
+            dist_px = abs(pos_t - t) * px_per_sec
+            if dist_px <= best_dist:
+                best_index = index
+                best_dist = dist_px
+        return best_index
 
     def _segment_at_pixel(self, event_pos):
         if not self._segment_boundaries_getter:
@@ -200,6 +232,13 @@ class _DraggablePlotWidget(pg.PlotWidget):
         return abs(event_x - divisor_px) <= self._DIVISOR_HIT_TOLERANCE_PX
 
     def mousePressEvent(self, event):
+        if self._marker_mode and event.button() == Qt.LeftButton:
+            index = self._marker_at_pixel(event.pos())
+            if self._on_marker_click:
+                self._on_marker_click(index)
+            event.accept()
+            return
+
         if self._clip_mode and event.button() == Qt.LeftButton:
             if self._near_divisor(event.pos().x()):
                 self._dragging_divisor = True
@@ -337,8 +376,13 @@ class WaveformPlayer(QWidget):
         self._divisor_time = None
         self._entered_clip_from_pause = False
         self._edit_mode = False 
+        self._tool_mode = False
         self._selected_segment = None
         self._segment_locked = False
+
+        self._delete_divisor_mode = False
+        self._selected_marker_index = None
+        self._pending_deleted_indices = set()
 
         self._trim_mode = False
         self._trim_engine = None
@@ -384,6 +428,7 @@ class WaveformPlayer(QWidget):
         self._on_group_clip_active_changed(self._group.clip_active_player)
         self._refresh_clip_enabled()
         self._refresh_segment_mode()
+        self._refresh_marker_mode()
 
     # ---------- UI ----------
 
@@ -425,6 +470,7 @@ class WaveformPlayer(QWidget):
         self._plot.addItem(self._end_boundary)
 
         self._marker_lines = []
+        self._marker_times = []
         for t in self._entity.markers_for(self._channel_index):
             self._add_marker_line(t)
 
@@ -471,11 +517,13 @@ class WaveformPlayer(QWidget):
         controls.setSpacing(6)
 
         self._play_btn = QPushButton("▶ Play")
+        self._delete_marker_btn = QPushButton("🗑 Delete")
         self._pause_btn = QPushButton("⏸ Pause")
         self._reset_btn = QPushButton("⏹ Reset")
         self._clip_btn = QPushButton("✂ Clip")
 
         self._play_btn.clicked.connect(self._on_play_clicked)
+        self._delete_marker_btn.clicked.connect(self._on_delete_marker_clicked)
         self._pause_btn.clicked.connect(self._on_pause_clicked)
         self._reset_btn.clicked.connect(self._on_reset_clicked)
         self._clip_btn.clicked.connect(self._on_clip_clicked)
@@ -487,8 +535,8 @@ class WaveformPlayer(QWidget):
         self._divide_btn.clicked.connect(self._on_divide_clicked)
         self._cancel_btn.clicked.connect(self._on_cancel_clicked)
 
-        for btn in (self._play_btn, self._pause_btn, self._reset_btn, self._clip_btn,
-                    self._divide_btn, self._cancel_btn):
+        for btn in (self._play_btn, self._pause_btn, self._reset_btn, self._delete_marker_btn,
+                    self._clip_btn, self._divide_btn, self._cancel_btn):
             btn.setFixedWidth(90)
             controls.addWidget(btn)
 
@@ -508,10 +556,16 @@ class WaveformPlayer(QWidget):
         self._pause_btn.setVisible(playing and show_playback_controls)
         self._reset_btn.setVisible((playing or paused) and show_playback_controls)
 
+        self._delete_marker_btn.setVisible(self._delete_divisor_mode)
+        self._delete_marker_btn.setEnabled(
+            self._selected_marker_index is not None and self._state == self.STATE_STOPPED
+        )
+
     def _add_marker_line(self, t):
         line = pg.InfiniteLine(pos=t, angle=90, pen=pg.mkPen(color="#ffffff", width=1))
         self._plot.addItem(line)
         self._marker_lines.append(line)
+        self._marker_times.append(t)
 
     @property
     def channel_index(self):
@@ -574,6 +628,95 @@ class WaveformPlayer(QWidget):
     def set_segment_locked(self, locked: bool):
         self._segment_locked = locked
         self._refresh_segment_mode()
+
+    # ------------------------------------------------------------------
+    # Delete-divisor mode
+    # ------------------------------------------------------------------
+
+    def _selectable_marker_positions(self):
+        """(index, time) pairs for markers not already staged for
+        deletion. Boundary lines are never in this list, so they can
+        never be selected."""
+        return [
+            (i, t) for i, t in enumerate(self._marker_times)
+            if i not in self._pending_deleted_indices
+        ]
+
+    def _refresh_marker_mode(self):
+        enabled = self._delete_divisor_mode and self._state == self.STATE_STOPPED
+        self._plot.set_marker_mode(
+            enabled,
+            positions_getter=self._selectable_marker_positions,
+            on_click=self._on_marker_clicked,
+        )
+
+    def _select_marker(self, index):
+        if self._selected_marker_index is not None:
+            self._marker_lines[self._selected_marker_index].setPen(pg.mkPen(color="#ffffff", width=1))
+        self._selected_marker_index = index
+        self._marker_lines[index].setPen(pg.mkPen(color="#ffeb3b", width=2))
+        self._update_button_visibility()
+
+    def _deselect_marker(self):
+        if self._selected_marker_index is not None:
+            self._marker_lines[self._selected_marker_index].setPen(pg.mkPen(color="#ffffff", width=1))
+            self._selected_marker_index = None
+            self._update_button_visibility()
+
+    def deselect_marker(self):
+        """Public entry point so a click on empty canvas space (handled
+        by EntityPlotView, not this widget) can clear the current
+        divisor-line selection without disturbing any staged deletions."""
+        self._deselect_marker()
+
+    def _on_marker_clicked(self, index):
+        if index is None:
+            return
+        self._select_marker(index)
+
+    def _on_delete_marker_clicked(self):
+        if self._selected_marker_index is None:
+            return
+        index = self._selected_marker_index
+        self._marker_lines[index].setVisible(False)   # staged, not yet committed
+        self._pending_deleted_indices.add(index)
+        self._selected_marker_index = None
+        self._update_button_visibility()
+
+    def enter_delete_divisor_mode(self):
+        self._delete_divisor_mode = True
+        self._selected_marker_index = None
+        self._pending_deleted_indices = set()
+        self._update_button_visibility()
+        self._refresh_marker_mode()
+
+    def exit_delete_divisor_mode(self):
+        """Cancel path: un-hide any staged (but not applied) deletions."""
+        if not self._delete_divisor_mode:
+            return
+        self._delete_divisor_mode = False
+        self._deselect_marker()
+        for index in self._pending_deleted_indices:
+            self._marker_lines[index].setVisible(True)
+        self._pending_deleted_indices = set()
+        self._update_button_visibility()
+        self._refresh_marker_mode()
+
+    def commit_delete_divisor(self):
+        """Apply path: permanently removes the staged lines and returns
+        the set of times that were deleted, for the caller to strip out
+        of the entity's division/marker list."""
+        deleted_times = {self._marker_times[i] for i in self._pending_deleted_indices}
+        for index in sorted(self._pending_deleted_indices, reverse=True):
+            line = self._marker_lines.pop(index)
+            self._plot.removeItem(line)
+            del self._marker_times[index]
+        self._delete_divisor_mode = False
+        self._selected_marker_index = None
+        self._pending_deleted_indices = set()
+        self._update_button_visibility()
+        self._refresh_marker_mode()
+        return deleted_times
 
     def _preview_slice_indices(self, start, end):
         start_idx = int(np.searchsorted(self._times, start, side="left"))
@@ -1192,7 +1335,7 @@ class WaveformPlayer(QWidget):
             self._selection_region.setVisible(True)
 
     def _update_clip_related_visibility(self):
-        self._clip_btn.setVisible(not self._clip_mode and not self._edit_mode)
+        self._clip_btn.setVisible(not self._clip_mode and not self._edit_mode and not self._tool_mode)
         self._divide_btn.setVisible(self._clip_mode)
         self._cancel_btn.setVisible(self._clip_mode)
 
@@ -1290,6 +1433,8 @@ class WaveformPlayer(QWidget):
     def force_idle(self):
         if self._clip_mode:
             self._exit_clip_mode()
+        if self._delete_divisor_mode:
+            self.exit_delete_divisor_mode()
         if self._trim_mode:
             self.exit_trim_preview()
         if self._extract_mode:
@@ -1315,6 +1460,12 @@ class WaveformPlayer(QWidget):
         self._refresh_segment_mode()
         if not enabled:
             self.clear_selection()
+
+    def set_tool_mode(self, enabled: bool):
+        self._tool_mode = enabled
+        self._update_clip_related_visibility()
+        if not enabled:
+            self.exit_delete_divisor_mode()
 
     # ---------- view helpers ----------
 
@@ -1350,6 +1501,7 @@ class WaveformPlayer(QWidget):
         self._update_button_visibility()
         self._refresh_clip_enabled()
         self._refresh_segment_mode()
+        self._refresh_marker_mode()
 
     def _on_pause_clicked(self):
         self._playback_engine().pause()
@@ -1364,6 +1516,7 @@ class WaveformPlayer(QWidget):
         self._update_button_visibility()
         self._refresh_clip_enabled()
         self._refresh_segment_mode()  
+        self._refresh_marker_mode()
 
     def _on_reset_clicked(self):
         self._do_reset()
@@ -1391,6 +1544,7 @@ class WaveformPlayer(QWidget):
         self._group.release(self)
         self._refresh_clip_enabled()
         self._refresh_segment_mode()  
+        self._refresh_marker_mode()
 
     def _on_tick(self):
         engine = self._playback_engine()

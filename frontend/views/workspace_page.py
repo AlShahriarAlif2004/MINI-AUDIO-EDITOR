@@ -219,6 +219,15 @@ class WorkspacePage(QWidget):
              rebuild_signal="entity_concatenated", factor=False, needs_dialog=True),
     ]
 
+    # Tool-mode operations. Only entries with a matching label here get
+    # real Apply/Cancel wiring; every other Tool button stays a plain
+    # disabled placeholder (see _build_ui).
+    _TOOL_OP_SPECS = [
+        dict(key="deldivisor", label="Delete Divisor",
+             begin="begin_delete_divisor", apply="apply_delete_divisor", cancel="cancel_delete_divisor",
+             rebuild_signal="entity_divisor_deleted", factor=False, needs_dialog=False),
+    ]
+
     new_workspace_requested = Signal()
     open_workspace_requested = Signal()
     exit_requested = Signal()
@@ -531,6 +540,7 @@ class WorkspacePage(QWidget):
             ("Filtering Tools", ["Noise Removal"]),
             ("Echo Tools", ["Add Echo", "Remove Echo"]),
         ]
+        _tool_specs_by_label = {spec["label"]: spec for spec in self._TOOL_OP_SPECS}
 
         self._tool_buttons: dict[str, QPushButton] = {}
 
@@ -540,10 +550,25 @@ class WorkspacePage(QWidget):
             tool_options_layout.addWidget(section_label)
 
             for label in labels:
+                spec = _tool_specs_by_label.get(label)
                 btn = QPushButton(label)
-                btn.setEnabled(False)   # inactive — not wired to a handler yet
                 tool_options_layout.addWidget(btn)
                 self._tool_buttons[label] = btn
+
+                if spec is None:
+                    btn.setEnabled(False)   # not implemented yet
+                    continue
+
+                panel, apply_btn, cancel_btn, factor_input = self._build_op_panel(spec)
+                tool_options_layout.addWidget(panel)
+
+                entry = _OpEntry(spec, btn, panel, apply_btn, cancel_btn, factor_input)
+                self._ops[spec["key"]] = entry
+
+                key = spec["key"]
+                btn.clicked.connect(lambda checked=False, k=key: self._on_op_clicked(k))
+                apply_btn.clicked.connect(lambda checked=False, k=key: self._on_op_apply_clicked(k))
+                cancel_btn.clicked.connect(lambda checked=False, k=key: self._on_op_cancel_clicked(k))
 
         tool_options_layout.addStretch()
         self._tool_options_panel.setVisible(False)   # shown when tool mode is active
@@ -672,16 +697,26 @@ class WorkspacePage(QWidget):
             if hasattr(widget, "clear_all_selection"):
                 widget.clear_all_selection()
 
+    def _deselect_all_divisor_selections(self):
+        """Deselect any highlighted divisor line on every open tab —
+        called unconditionally on mode switch, before anything else."""
+        for i in range(1, self._content_stack.count()):
+            widget = self._content_stack.widget(i)
+            if hasattr(widget, "clear_divisor_selection"):
+                widget.clear_divisor_selection()
+
     def _on_playback_active_changed(self, active_player):
         """Any plot playing or paused anywhere freezes the whole sidebar
         options panel (Trim, Time Scale, Apply/Cancel, etc). It only comes
         back once every plot is fully stopped."""
         self._edit_options_panel.setEnabled(active_player is None)
+        self._tool_options_panel.setEnabled(active_player is None)
 
     def _set_mode(self, mode: str):
         if mode == self._mode:
             return
 
+        self._deselect_all_divisor_selections()
         self._cancel_all_ops()
         self._clear_all_plot_selections()
 
@@ -712,6 +747,8 @@ class WorkspacePage(QWidget):
             widget = self._content_stack.widget(i)
             if hasattr(widget, "set_edit_mode"):
                 widget.set_edit_mode(is_edit)
+            if hasattr(widget, "set_tool_mode"):
+                widget.set_tool_mode(is_tool)
 
     # ------------------------------------------------------------------
     # Workspace / tab management
@@ -913,6 +950,7 @@ class WorkspacePage(QWidget):
             signal = getattr(entity_view, entry.spec["rebuild_signal"])
             signal.connect(lambda entity=entity: self._rebuild_entity_tab(entity))
         entity_view.set_edit_mode(self._mode == "edit")
+        entity_view.set_tool_mode(self._mode == "tool")
         return entity_view
 
     def _open_entity_tab(self, entity: Entity):

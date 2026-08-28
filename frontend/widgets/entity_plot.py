@@ -34,6 +34,7 @@ class EntityPlotView(QWidget):
     entity_faded_out = Signal()
     entity_concatenated = Signal()
     entity_extracted = Signal()
+    entity_divisor_deleted = Signal()
     segment_selected = Signal(object, object, float, float)
     segment_deselected = Signal()
     """
@@ -76,6 +77,7 @@ class EntityPlotView(QWidget):
         self._concat_range = None
         self._concat_sources = []
         self._concat_extra_channel_samples = None
+        self._delete_divisor_active = False
         self._build_ui()
 
     @property
@@ -91,6 +93,61 @@ class EntityPlotView(QWidget):
             if player.channel_index is None:
                 return player
         return None
+
+    # ------------------------------------------------------------------
+    # Delete divisor
+    # ------------------------------------------------------------------
+    # Unlike Trim/Extract/etc., this needs no pre-selected segment: it
+    # simply arms every plot (channel + Overall) for divisor-line
+    # selection. Each plot stages its own deletions locally (hidden but
+    # not yet removed); Apply here collects whatever was staged across
+    # every plot and strips those times out of the entity's real
+    # division/marker lists in one go.
+
+    def begin_delete_divisor(self) -> bool:
+        self._delete_divisor_active = True
+        for player in self._players:
+            player.enter_delete_divisor_mode()
+        return True
+
+    def cancel_delete_divisor(self):
+        if not self._delete_divisor_active:
+            return
+        self._delete_divisor_active = False
+        for player in self._players:
+            player.exit_delete_divisor_mode()
+
+    def _deselect_all_markers(self):
+        for player in self._players:
+            player.deselect_marker()
+
+    def clear_divisor_selection(self):
+        """Public entry point so WorkspacePage can deselect any
+        highlighted divisor line on mode/menu switch, independent of
+        whether the Delete Divisor op panel is currently bookkept as
+        active."""
+        self._deselect_all_markers()
+
+    def apply_delete_divisor(self):
+        if not self._delete_divisor_active:
+            return
+        self._delete_divisor_active = False
+        for player in self._players:
+            deleted_times = player.commit_delete_divisor()
+            if not deleted_times:
+                continue
+            if player.channel_index is None:
+                self._entity.divisions = [
+                    t for t in self._entity.divisions if t not in deleted_times
+                ]
+            else:
+                ch = player.channel_index
+                if ch in self._entity.channel_markers:
+                    self._entity.channel_markers[ch] = [
+                        t for t in self._entity.channel_markers[ch] if t not in deleted_times
+                    ]
+        self.entity_modified.emit()
+        self.entity_divisor_deleted.emit()
 
     # ------------------------------------------------------------------
     # Trim preview
@@ -870,6 +927,9 @@ class EntityPlotView(QWidget):
                 or self._fadeout_player is not None
                 or self._concat_player is not None):
             return
+        if self._delete_divisor_active:
+            self._deselect_all_markers()
+            return
         self.clear_all_selection()
 
     def _build_ui(self):
@@ -943,6 +1003,7 @@ class EntityPlotView(QWidget):
     def shutdown(self):
         self.cancel_trim()
         self.cancel_extract()
+        self.cancel_delete_divisor()
         self.cancel_timescale()
         self.cancel_vertical_scale()
         self.cancel_reverse()
@@ -973,6 +1034,11 @@ class EntityPlotView(QWidget):
         switches between File and Edit top-level modes."""
         for player in self._players:
             player.set_edit_mode(enabled)
+
+    def set_tool_mode(self, enabled: bool):
+        """Same idea, for the Tool top-level mode."""
+        for player in self._players:
+            player.set_tool_mode(enabled)
 
     @staticmethod
     def _time_axis(channel):
