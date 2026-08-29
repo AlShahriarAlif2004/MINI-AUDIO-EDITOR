@@ -24,6 +24,7 @@ from frontend.dialogs.create_entity_dialog import CreateEntityDialog
 from frontend.dialogs.create_folder_dialog import CreateFolderDialog
 from frontend.dialogs.concatenate_dialog import ConcatenateDialog
 from frontend.dialogs.download_format_dialog import DownloadFormatDialog
+from frontend.dialogs.noise_source_dialog import NoiseSourceDialog
 from frontend.widgets.sidebar_tree import SidebarTree
 from frontend.widgets.entity_plot import EntityPlotView
 from frontend.widgets.waveform_player import PlaybackGroup
@@ -950,6 +951,24 @@ class WorkspacePage(QWidget):
             if not sources:
                 return
             began = getattr(view, entry.spec["begin"])(sources)
+        elif key == "noise":
+            # Noise Removal: ask where the noise profile comes from first.
+            # Picking an entity channel skips the Filter stage entirely —
+            # the panel opens straight into Apply/Cancel.
+            source_dialog = NoiseSourceDialog(self._workspace, view.entity, self)
+            if source_dialog.exec() != QDialog.DialogCode.Accepted:
+                return
+            if source_dialog.selected_mode() == "entity":
+                source_entity, source_channel = source_dialog.selected_entity_channel()
+                if source_entity is None:
+                    return
+                began = view.begin_noise_removal_from_entity(source_entity, source_channel)
+                if began:
+                    entry.apply_btn.setText("Apply")
+            else:
+                began = view.begin_noise_removal()
+                if began:
+                    entry.apply_btn.setText("Filter")
         else:
             began = getattr(view, entry.spec["begin"])()
 
@@ -1012,15 +1031,8 @@ class WorkspacePage(QWidget):
         if not entry.active or entry.active_view is None:
             return
         view = entry.active_view
-
-        if entry.apply_btn.text() == "Apply":
-            # Past Filter — go back to range selection, panel stays open.
-            view.back_to_noise_selection()
-            entry.apply_btn.setText("Filter")
-        else:
-            # Still in selection phase — close the panel entirely.
-            self._collapse_op_ui(key)
-            view.cancel_noise_removal()
+        self._collapse_op_ui(key)
+        view.cancel_noise_removal()
 
     # ------------------------------------------------------------------
     # Entity-view factory / tab lifecycle

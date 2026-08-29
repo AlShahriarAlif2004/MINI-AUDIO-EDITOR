@@ -85,6 +85,8 @@ class EntityPlotView(QWidget):
 
         self._noise_removal_active = False   # True for either phase (selection or filtered)
         self._noise_filtered = False         # True once Filter has been clicked
+        self._noise_from_entity = False      # True when the noise source is another entity's channel
+        self._noise_reference_signal = None  # the other entity's channel, when _noise_from_entity
         self._noise_overall_player = None
         self._noise_range = None             # (start_time, end_time) chosen by the user
         self._noise_original_clip = None     # clip snapshot taken at Filter time
@@ -366,6 +368,7 @@ class EntityPlotView(QWidget):
 
         self._noise_removal_active = True
         self._noise_filtered = False
+        self._noise_from_entity = False
         self._noise_overall_player = overall
         self._noise_range = None
         self._noise_original_clip = None
@@ -384,6 +387,55 @@ class EntityPlotView(QWidget):
         overall.enter_noise_range_mode(default_start, default_end)
         self._lock_selection(True)
         return True
+
+    def begin_noise_removal_from_entity(self, source_entity, source_channel_index) -> bool:
+        """Noise-source == another entity's channel: no range-selection
+        stage — the whole reference channel is used as the noise
+        profile, and the view opens straight into the filtered/Apply
+        phase (see _build_noise_tabs / noise_removal_is_from_entity)."""
+        if self._noise_removal_active:
+            return False
+        overall = self._find_overall_player()
+        if overall is None:
+            return False
+        if source_entity is None:
+            return False
+
+        source_channels = source_entity.clip.channels
+        if source_channel_index is None:
+            noise_signal = source_channels[0]
+        elif 0 <= source_channel_index < len(source_channels):
+            noise_signal = source_channels[source_channel_index]
+        else:
+            return False
+
+        self._noise_removal_active = True
+        self._noise_filtered = True
+        self._noise_from_entity = True
+        self._noise_reference_signal = noise_signal
+        self._noise_overall_player = overall
+        self._noise_range = None
+
+        clip = self._entity.clip
+        self._noise_original_clip = clip
+
+        filtered = clip
+        for ch_idx in range(clip.num_channels):
+            filtered = filtered.apply(
+                "remove_noise", channel=ch_idx, noise_reference=noise_signal
+            )
+        self._noise_filtered_clip = filtered
+
+        for player in self._players:
+            player.setVisible(False)
+
+        self._build_noise_tabs()
+        self._lock_selection(True)
+        return True
+
+    @property
+    def noise_removal_is_from_entity(self) -> bool:
+        return self._noise_from_entity
 
     def cancel_noise_removal(self):
         """Fully closes the panel, from either phase."""
@@ -460,6 +512,8 @@ class EntityPlotView(QWidget):
     def _reset_noise_state(self):
         self._noise_removal_active = False
         self._noise_filtered = False
+        self._noise_from_entity = False
+        self._noise_reference_signal = None
         self._noise_overall_player = None
         self._noise_range = None
         self._noise_original_clip = None
@@ -495,8 +549,12 @@ class EntityPlotView(QWidget):
         tabs.append(("Overall", None))
         tabs.append(("Noise", "noise"))
 
-        noise_start_idx = clip.get_index(self._noise_range[0])
-        noise_end_idx = clip.get_index(self._noise_range[1])
+        if self._noise_range is not None:
+            noise_start_idx = clip.get_index(self._noise_range[0])
+            noise_end_idx = clip.get_index(self._noise_range[1])
+        else:
+            noise_start_idx = None
+            noise_end_idx = None
 
         container = QWidget()
         outer = QVBoxLayout(container)
@@ -541,6 +599,9 @@ class EntityPlotView(QWidget):
         orig_clip = self._noise_original_clip
         filt_clip = self._noise_filtered_clip
 
+        if key == "noise" and self._noise_reference_signal is not None:
+            return self._build_noise_reference_page()
+
         if key == "noise":
             prev_channels = [ch.trim(noise_start_idx, noise_end_idx) for ch in orig_clip.channels]
             filt_channels = [ch.trim(noise_start_idx, noise_end_idx) for ch in filt_clip.channels]
@@ -557,7 +618,7 @@ class EntityPlotView(QWidget):
         layout.setContentsMargins(0, 0, 0, 0)
         layout.setSpacing(8)
 
-        for title, channels in (("Previous", prev_channels), ("Filtered", filt_channels)):
+        for title, channels in (("Previous Signal", prev_channels), ("Filtered Signal", filt_channels)):
             series, audio = self._channels_to_series_and_audio(channels, only_index)
 
             label = QLabel(title)
@@ -578,6 +639,39 @@ class EntityPlotView(QWidget):
             player.set_tool_mode(True)
             layout.addWidget(player)
             self._noise_preview_players.append(player)
+
+        return page
+
+    def _build_noise_reference_page(self):
+        """Noise tab page for the entity-channel source: no Previous/
+        Filtered pair (the reference signal itself isn't being filtered)
+        — just the borrowed noise profile, on its own time axis."""
+        ref = self._noise_reference_signal
+        times = self._time_axis(ref)
+
+        page = QWidget()
+        layout = QVBoxLayout(page)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(8)
+
+        label = QLabel("Noise Reference")
+        label.setStyleSheet("font-size: 13px; font-weight: 600;")
+        layout.addWidget(label)
+
+        player = WaveformPlayer(
+            times=times,
+            series=[(ref.samples, _CHANNEL_COLORS[0], "Noise")],
+            sample_rate=ref.sample_rate,
+            audio_data=ref.samples.astype(np.float32),
+            group=self._group,
+            entity=self._entity,
+            channel_index=None,
+            is_driver=False,
+            show_markers=False,
+        )
+        player.set_tool_mode(True)
+        layout.addWidget(player)
+        self._noise_preview_players.append(player)
 
         return page
 
@@ -1221,10 +1315,6 @@ class EntityPlotView(QWidget):
         times = self._time_axis(clip.channels[0])
 
         if num_channels > 1:
-            channels_label = QLabel("Channels")
-            channels_label.setStyleSheet("font-size: 16px; font-weight: 600;")
-            layout.addWidget(channels_label)
-
             for i, channel in enumerate(clip.channels):
                 color = _CHANNEL_COLORS[i % len(_CHANNEL_COLORS)]
                 player = WaveformPlayer(
@@ -1242,10 +1332,6 @@ class EntityPlotView(QWidget):
                 player.segment_selected.connect(self._on_segment_selected)
                 player.segment_deselected.connect(self._on_segment_deselected)
                 self._players.append(player)
-
-        overall_label = QLabel("Overall")
-        overall_label.setStyleSheet("font-size: 16px; font-weight: 600;")
-        layout.addWidget(overall_label)
 
         overall_series = [
             (channel.samples, _CHANNEL_COLORS[i % len(_CHANNEL_COLORS)], f"Ch {i + 1}")

@@ -304,26 +304,26 @@ class Discrete_Signal:
         """
         return np.fft.fft(self.samples)
 
-    def remove_noise(self, noise_start_index, noise_end_index, frame_size=1024):
+    def remove_noise(self, noise_start_index=None, noise_end_index=None,
+                      frame_size=1024, noise_reference=None):
         """
         Spectral-subtraction noise removal.
 
-        The samples in [noise_start_index, noise_end_index] are treated
-        as a representative noise sample: the average magnitude
-        spectrum over that range becomes the "noise profile" that gets
-        subtracted from every frame of the signal (original phase is
-        always kept).
+        The noise profile (average magnitude spectrum subtracted from
+        every frame of the signal, original phase always kept) can come
+        from either of two sources:
+
+          - A range [noise_start_index, noise_end_index] within this
+            same signal (the original behavior).
+          - An external `noise_reference` Discrete_Signal — its entire
+            length is used to build the profile. This lets a noise
+            "fingerprint" be borrowed from a different signal/entity
+            entirely, instead of a self-contained noisy stretch.
 
         Framing uses a Hann window at 50% overlap (hop = frame_size // 2),
         which satisfies the constant-overlap-add condition, so the
         overlap-add reconstruction needs no extra normalization.
         """
-        if noise_start_index < self.start_index or noise_end_index > self.end_index():
-            raise ValueError("Invalid noise range in remove_noise/Discrete_Signal.")
-
-        if noise_start_index > noise_end_index:
-            raise ValueError("Invalid noise range in remove_noise/Discrete_Signal.")
-
         if frame_size < 2:
             raise ValueError("Invalid frame_size in remove_noise/Discrete_Signal.")
 
@@ -341,26 +341,63 @@ class Discrete_Signal:
         def framed(start):
             return padded[start:start + frame_size] * window
 
-        local_noise_start = noise_start_index - self.start_index
-        local_noise_end = noise_end_index - self.start_index
+        if noise_reference is not None:
+            # --- Build the noise profile from an external reference signal ---
+            ref = noise_reference.resample(self.sample_rate).samples
+            ref_n = len(ref)
 
-        # --- Build the noise profile from frames overlapping the range ---
-        noise_spectra = []
-        frame_start = 0
-        while frame_start + frame_size <= padded_len:
-            frame_end = frame_start + frame_size
-            if frame_end > local_noise_start and frame_start <= local_noise_end:
-                spectrum = Discrete_Signal(framed(frame_start), self.sample_rate).fft()
+            ref_n_frames = max(1, int(np.ceil(max(ref_n - frame_size, 0) / hop_size)) + 1)
+            ref_padded_len = (ref_n_frames - 1) * hop_size + frame_size
+            ref_padded = np.zeros(ref_padded_len)
+            ref_padded[:ref_n] = ref
+
+            def ref_framed(start):
+                return ref_padded[start:start + frame_size] * window
+
+            noise_spectra = []
+            frame_start = 0
+            while frame_start + frame_size <= ref_padded_len:
+                spectrum = Discrete_Signal(ref_framed(frame_start), self.sample_rate).fft()
                 noise_spectra.append(np.abs(spectrum))
-            frame_start += hop_size
+                frame_start += hop_size
 
-        if not noise_spectra:
-            # Range shorter than one frame — sample a single frame around it.
-            anchor = max(0, min(padded_len - frame_size, local_noise_start))
-            spectrum = Discrete_Signal(framed(anchor), self.sample_rate).fft()
-            noise_spectra.append(np.abs(spectrum))
+            if not noise_spectra:
+                spectrum = Discrete_Signal(ref_framed(0), self.sample_rate).fft()
+                noise_spectra.append(np.abs(spectrum))
 
-        noise_profile = np.mean(noise_spectra, axis=0)
+            noise_profile = np.mean(noise_spectra, axis=0)
+        else:
+            if noise_start_index is None or noise_end_index is None:
+                raise ValueError(
+                    "remove_noise requires either a noise range or a noise_reference."
+                )
+
+            if noise_start_index < self.start_index or noise_end_index > self.end_index():
+                raise ValueError("Invalid noise range in remove_noise/Discrete_Signal.")
+
+            if noise_start_index > noise_end_index:
+                raise ValueError("Invalid noise range in remove_noise/Discrete_Signal.")
+
+            local_noise_start = noise_start_index - self.start_index
+            local_noise_end = noise_end_index - self.start_index
+
+            # --- Build the noise profile from frames overlapping the range ---
+            noise_spectra = []
+            frame_start = 0
+            while frame_start + frame_size <= padded_len:
+                frame_end = frame_start + frame_size
+                if frame_end > local_noise_start and frame_start <= local_noise_end:
+                    spectrum = Discrete_Signal(framed(frame_start), self.sample_rate).fft()
+                    noise_spectra.append(np.abs(spectrum))
+                frame_start += hop_size
+
+            if not noise_spectra:
+                # Range shorter than one frame — sample a single frame around it.
+                anchor = max(0, min(padded_len - frame_size, local_noise_start))
+                spectrum = Discrete_Signal(framed(anchor), self.sample_rate).fft()
+                noise_spectra.append(np.abs(spectrum))
+
+            noise_profile = np.mean(noise_spectra, axis=0)
 
         # --- Spectral subtraction with overlap-add reconstruction ---
         output = np.zeros(padded_len)
