@@ -19,10 +19,11 @@ from PySide6.QtWidgets import (
 )
 
 from backend.workspace_model import Entity, Folder, Workspace
-from backend.audio_io import WavIO
+from backend.audio_io import WavIO, MP3IO
 from frontend.dialogs.create_entity_dialog import CreateEntityDialog
 from frontend.dialogs.create_folder_dialog import CreateFolderDialog
 from frontend.dialogs.concatenate_dialog import ConcatenateDialog
+from frontend.dialogs.download_format_dialog import DownloadFormatDialog
 from frontend.widgets.sidebar_tree import SidebarTree
 from frontend.widgets.entity_plot import EntityPlotView
 from frontend.widgets.waveform_player import PlaybackGroup
@@ -394,19 +395,34 @@ class WorkspacePage(QWidget):
         return entities
 
     def _download_entity(self, entity: Entity):
+        format_dialog = DownloadFormatDialog(self)
+        if format_dialog.exec() != QDialog.DialogCode.Accepted:
+            return
+        file_format = format_dialog.selected_format()   # "wav" or "mp3"
+
+        if file_format == "mp3":
+            default_name = f"{entity.name}.mp3"
+            file_filter = "MP3 Files (*.mp3)"
+        elif file_format == "wav":
+            default_name = f"{entity.name}.wav"
+            file_filter = "WAV Files (*.wav)"
+
         path, _ = QFileDialog.getSaveFileName(
             self,
             "Download Entity",
-            f"{entity.name}.wav",
-            "WAV Files (*.wav)",
+            default_name,
+            file_filter,
         )
         if not path:
             return
-        if not path.lower().endswith(".wav"):
-            path += ".wav"
+        if not path.lower().endswith(f".{file_format}"):
+            path += f".{file_format}"
 
         try:
-            WavIO.unload(entity.clip, path)
+            if file_format == "mp3":
+                MP3IO.unload(entity.clip, path)
+            else:
+                WavIO.unload(entity.clip, path)
         except (ValueError, OSError) as exc:
             QMessageBox.critical(
                 self,
