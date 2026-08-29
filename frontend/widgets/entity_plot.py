@@ -643,35 +643,43 @@ class EntityPlotView(QWidget):
         return page
 
     def _build_noise_reference_page(self):
-        """Noise tab page for the entity-channel source: no Previous/
-        Filtered pair (the reference signal itself isn't being filtered)
-        — just the borrowed noise profile, on its own time axis."""
-        ref = self._noise_reference_signal
-        times = self._time_axis(ref)
+        """Noise tab page for the entity-channel source: shows the 
+        current entity's before/after filtering using the borrowed noise 
+        profile, mirroring the existing-signal layout."""
+        orig_clip = self._noise_original_clip
+        filt_clip = self._noise_filtered_clip
+        
+        prev_channels = orig_clip.channels
+        filt_channels = filt_clip.channels
+        
+        times = self._time_axis(prev_channels[0])
 
         page = QWidget()
         layout = QVBoxLayout(page)
         layout.setContentsMargins(0, 0, 0, 0)
         layout.setSpacing(8)
 
-        label = QLabel("Noise Reference")
-        label.setStyleSheet("font-size: 13px; font-weight: 600;")
-        layout.addWidget(label)
+        for title, channels in (("Previous Signal", prev_channels), ("Filtered Signal", filt_channels)):
+            label = QLabel(title)
+            label.setStyleSheet("font-size: 13px; font-weight: 600;")
+            layout.addWidget(label)
 
-        player = WaveformPlayer(
-            times=times,
-            series=[(ref.samples, _CHANNEL_COLORS[0], "Noise")],
-            sample_rate=ref.sample_rate,
-            audio_data=ref.samples.astype(np.float32),
-            group=self._group,
-            entity=self._entity,
-            channel_index=None,
-            is_driver=False,
-            show_markers=False,
-        )
-        player.set_tool_mode(True)
-        layout.addWidget(player)
-        self._noise_preview_players.append(player)
+            series, audio = self._channels_to_series_and_audio(channels, None)
+
+            player = WaveformPlayer(
+                times=times,
+                series=series,
+                sample_rate=channels[0].sample_rate,
+                audio_data=audio,
+                group=self._group,
+                entity=self._entity,
+                channel_index=None,
+                is_driver=False,
+                show_markers=False,
+            )
+            player.set_tool_mode(True)
+            layout.addWidget(player)
+            self._noise_preview_players.append(player)
 
         return page
 
