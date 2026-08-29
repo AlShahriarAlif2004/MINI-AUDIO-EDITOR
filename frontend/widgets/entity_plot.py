@@ -604,11 +604,9 @@ class EntityPlotView(QWidget):
 
         if key == "noise":
             prev_channels = [ch.trim(noise_start_idx, noise_end_idx) for ch in orig_clip.channels]
-            filt_channels = [ch.trim(noise_start_idx, noise_end_idx) for ch in filt_clip.channels]
             only_index = None
         else:
             prev_channels = orig_clip.channels
-            filt_channels = filt_clip.channels
             only_index = key if isinstance(key, int) else None
 
         times = self._time_axis(prev_channels[0] if only_index is None else prev_channels[only_index])
@@ -618,17 +616,18 @@ class EntityPlotView(QWidget):
         layout.setContentsMargins(0, 0, 0, 0)
         layout.setSpacing(8)
 
-        for title, channels in (("Previous Signal", prev_channels), ("Filtered Signal", filt_channels)):
-            series, audio = self._channels_to_series_and_audio(channels, only_index)
-
-            label = QLabel(title)
+        if key == "noise":
+            # For noise window: show only Noise Reference
+            label = QLabel("Noise Reference")
             label.setStyleSheet("font-size: 13px; font-weight: 600;")
             layout.addWidget(label)
+
+            series, audio = self._channels_to_series_and_audio(prev_channels, only_index)
 
             player = WaveformPlayer(
                 times=times,
                 series=series,
-                sample_rate=channels[0].sample_rate,
+                sample_rate=prev_channels[0].sample_rate,
                 audio_data=audio,
                 group=self._group,
                 entity=self._entity,
@@ -639,47 +638,63 @@ class EntityPlotView(QWidget):
             player.set_tool_mode(True)
             layout.addWidget(player)
             self._noise_preview_players.append(player)
+        else:
+            # For channel/overall: show Previous and Filtered
+            filt_channels = filt_clip.channels
+
+            for title, channels in (("Previous Signal", prev_channels), ("Filtered Signal", filt_channels)):
+                series, audio = self._channels_to_series_and_audio(channels, only_index)
+
+                label = QLabel(title)
+                label.setStyleSheet("font-size: 13px; font-weight: 600;")
+                layout.addWidget(label)
+
+                player = WaveformPlayer(
+                    times=times,
+                    series=series,
+                    sample_rate=channels[0].sample_rate,
+                    audio_data=audio,
+                    group=self._group,
+                    entity=self._entity,
+                    channel_index=None,
+                    is_driver=False,
+                    show_markers=False,
+                )
+                player.set_tool_mode(True)
+                layout.addWidget(player)
+                self._noise_preview_players.append(player)
 
         return page
 
     def _build_noise_reference_page(self):
-        """Noise tab page for the entity-channel source: shows the 
-        current entity's before/after filtering using the borrowed noise 
-        profile, mirroring the existing-signal layout."""
-        orig_clip = self._noise_original_clip
-        filt_clip = self._noise_filtered_clip
-        
-        prev_channels = orig_clip.channels
-        filt_channels = filt_clip.channels
-        
-        times = self._time_axis(prev_channels[0])
+        """Noise tab page for the entity-channel source: shows only the 
+        reference noise entity (Noise Reference)."""
+        ref = self._noise_reference_signal
+        times = self._time_axis(ref)
 
         page = QWidget()
         layout = QVBoxLayout(page)
         layout.setContentsMargins(0, 0, 0, 0)
         layout.setSpacing(8)
 
-        for title, channels in (("Previous Signal", prev_channels), ("Filtered Signal", filt_channels)):
-            label = QLabel(title)
-            label.setStyleSheet("font-size: 13px; font-weight: 600;")
-            layout.addWidget(label)
+        label = QLabel("Noise Reference")
+        label.setStyleSheet("font-size: 13px; font-weight: 600;")
+        layout.addWidget(label)
 
-            series, audio = self._channels_to_series_and_audio(channels, None)
-
-            player = WaveformPlayer(
-                times=times,
-                series=series,
-                sample_rate=channels[0].sample_rate,
-                audio_data=audio,
-                group=self._group,
-                entity=self._entity,
-                channel_index=None,
-                is_driver=False,
-                show_markers=False,
-            )
-            player.set_tool_mode(True)
-            layout.addWidget(player)
-            self._noise_preview_players.append(player)
+        player = WaveformPlayer(
+            times=times,
+            series=[(ref.samples, _CHANNEL_COLORS[0], "Noise Profile")],
+            sample_rate=ref.sample_rate,
+            audio_data=ref.samples.astype(np.float32),
+            group=self._group,
+            entity=self._entity,
+            channel_index=None,
+            is_driver=False,
+            show_markers=False,
+        )
+        player.set_tool_mode(True)
+        layout.addWidget(player)
+        self._noise_preview_players.append(player)
 
         return page
 
