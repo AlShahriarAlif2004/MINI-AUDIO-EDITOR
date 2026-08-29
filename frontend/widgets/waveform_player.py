@@ -160,6 +160,14 @@ class _DraggablePlotWidget(pg.PlotWidget):
         self._marker_positions_getter = None
         self._on_marker_click = None
 
+        self._range_mode = False
+        self._range_left_getter = None
+        self._range_left_setter = None
+        self._range_right_getter = None
+        self._range_right_setter = None
+        self._range_time_to_pixel = None
+        self._dragging_range = None   # "left" | "right" | None
+
         self.setMouseTracking(True)
 
     def set_clip_mode(self, enabled, allow_graph_drag=False,
@@ -171,6 +179,21 @@ class _DraggablePlotWidget(pg.PlotWidget):
         self._time_to_pixel = time_to_pixel
         self._dragging_divisor = False
         self._dragging = False
+
+    def set_range_mode(self, enabled, left_getter=None, left_setter=None,
+                        right_getter=None, right_setter=None, time_to_pixel=None):
+        """Two independently draggable vertical lines (used by noise-range
+        selection): left_getter/right_getter report each line's current
+        time, left_setter/right_setter are called with the proposed new
+        time while dragging. Clamping so left never crosses right is the
+        setters' responsibility (see WaveformPlayer._set_noise_start/_end)."""
+        self._range_mode = enabled
+        self._range_left_getter = left_getter
+        self._range_left_setter = left_setter
+        self._range_right_getter = right_getter
+        self._range_right_setter = right_setter
+        self._range_time_to_pixel = time_to_pixel
+        self._dragging_range = None
 
     def set_segment_mode(self, enabled, boundaries_getter=None, on_hover=None, on_click=None):
         self._segment_mode = enabled
@@ -239,6 +262,19 @@ class _DraggablePlotWidget(pg.PlotWidget):
             event.accept()
             return
 
+        if self._range_mode and event.button() == Qt.LeftButton:
+            x = event.pos().x()
+            left_px = self._range_time_to_pixel(self._range_left_getter())
+            right_px = self._range_time_to_pixel(self._range_right_getter())
+            if abs(x - left_px) <= self._DIVISOR_HIT_TOLERANCE_PX:
+                self._dragging_range = "left"
+            elif abs(x - right_px) <= self._DIVISOR_HIT_TOLERANCE_PX:
+                self._dragging_range = "right"
+            else:
+                self._dragging_range = None
+            event.accept()
+            return
+
         if self._clip_mode and event.button() == Qt.LeftButton:
             if self._near_divisor(event.pos().x()):
                 self._dragging_divisor = True
@@ -272,6 +308,18 @@ class _DraggablePlotWidget(pg.PlotWidget):
         super().mousePressEvent(event)
 
     def mouseMoveEvent(self, event):
+        if self._range_mode:
+            if self._dragging_range:
+                view_box = self.getPlotItem().vb
+                scene_pos = self.mapToScene(event.pos())
+                t = view_box.mapSceneToView(scene_pos).x()
+                if self._dragging_range == "left":
+                    self._range_left_setter(t)
+                else:
+                    self._range_right_setter(t)
+            event.accept()
+            return
+
         if self._clip_mode:
             if self._dragging_divisor and self._divisor_setter:
                 view_box = self.getPlotItem().vb
@@ -309,6 +357,11 @@ class _DraggablePlotWidget(pg.PlotWidget):
         super().mouseMoveEvent(event)
 
     def mouseReleaseEvent(self, event):
+        if self._range_mode and event.button() == Qt.LeftButton:
+            self._dragging_range = None
+            event.accept()
+            return
+
         if self._clip_mode and event.button() == Qt.LeftButton:
             was_graph_drag = self._dragging and self._clip_allow_graph_drag and not self._dragging_divisor
             self._dragging_divisor = False
@@ -355,6 +408,7 @@ class WaveformPlayer(QWidget):
         entity,
         channel_index=None,       # None = Overall plot
         is_driver: bool = False,
+        show_markers: bool = True,
         parent=None,
     ):
         super().__init__(parent)
@@ -365,6 +419,7 @@ class WaveformPlayer(QWidget):
         self._is_driver = is_driver
         self._entity = entity
         self._channel_index = channel_index
+        self._show_markers = show_markers
 
         self._start_time = float(times[0]) if len(times) else 0.0
         self._end_time = float(times[-1]) if len(times) else 0.0
@@ -412,6 +467,10 @@ class WaveformPlayer(QWidget):
         self._preview_curve_range = None
         self._preview_curve_effect = None  # set when the mirrored curve preview is a factor-free effect
         self._preview_curve_engine = None  # playback engine for Overall when a channel is being edited
+
+        self._noise_mode = False       # True while the two green range handles are live
+        self._noise_start = None
+        self._noise_end = None
 
         self._timer = QTimer(self)
         self._timer.setInterval(_TICK_MS)
@@ -511,6 +570,23 @@ class WaveformPlayer(QWidget):
         self._extract_playhead.setVisible(False)
         self._plot.addItem(self._extract_playhead)
 
+        # Two independently draggable green handles bounding the noise
+        # range during Noise Removal's selection phase (left must never
+        # cross right — enforced in _set_noise_start/_set_noise_end).
+        self._noise_start_line = pg.InfiniteLine(angle=90, movable=False,
+                                                  pen=pg.mkPen(color="#4caf50", width=2))
+        self._noise_start_line.addMarker('^', position=0.0, size=14)
+        self._noise_start_line.addMarker('v', position=1.0, size=14)
+        self._noise_start_line.setVisible(False)
+        self._plot.addItem(self._noise_start_line)
+
+        self._noise_end_line = pg.InfiniteLine(angle=90, movable=False,
+                                                pen=pg.mkPen(color="#4caf50", width=2))
+        self._noise_end_line.addMarker('^', position=0.0, size=14)
+        self._noise_end_line.addMarker('v', position=1.0, size=14)
+        self._noise_end_line.setVisible(False)
+        self._plot.addItem(self._noise_end_line)
+
         layout.addWidget(self._plot)
 
         controls = QHBoxLayout()
@@ -545,12 +621,21 @@ class WaveformPlayer(QWidget):
         layout.addLayout(controls)
         self._update_button_visibility()
 
+        if not self._show_markers:
+            # Used for the Previous/Filtered preview pairs shown inside the
+            # Noise Removal tab strip: plain play/pause/reset only, no
+            # white boundary/division lines cluttering the comparison.
+            self._start_boundary.setVisible(False)
+            self._end_boundary.setVisible(False)
+            for line in self._marker_lines:
+                line.setVisible(False)
+
     def _update_button_visibility(self):
         playing = self._state == self.STATE_PLAYING
         paused = self._state == self.STATE_PAUSED
         self._plot.drag_enabled = playing or paused
 
-        show_playback_controls = True          # ← was: self._trim_mode or not self._edit_mode
+        show_playback_controls = not self._noise_mode  # was: self._trim_mode or not self._edit_mode
         self._play_btn.setVisible(not playing and show_playback_controls)
         self._play_btn.setText("▶ Resume" if paused else "▶ Play")
         self._pause_btn.setVisible(playing and show_playback_controls)
@@ -615,6 +700,7 @@ class WaveformPlayer(QWidget):
             and not self._vscale_mode
             and self._effect_mode is None
             and not self._segment_locked
+            and not self._noise_mode
         )
         self._plot.set_segment_mode(
             enabled,
@@ -894,6 +980,83 @@ class WaveformPlayer(QWidget):
             line.setVisible(True)
 
         self._show_overview()
+        self._refresh_segment_mode()
+        self._update_button_visibility()
+
+    # ------------------------------------------------------------------
+    # Noise-removal range selection
+    # ------------------------------------------------------------------
+    # Unlike every other preview mode, this doesn't touch the drawn curve
+    # at all — it only arms two draggable green handles (start/end of the
+    # noise window) and hides everything that would otherwise clutter the
+    # selection view: playback controls, the playhead, and every white
+    # boundary/division line.
+
+    def enter_noise_range_mode(self, start, end):
+        self._noise_mode = True
+
+        start = self._clamp_time(start)
+        end = self._clamp_time(end)
+        if start > end:
+            start, end = end, start
+        self._noise_start = start
+        self._noise_end = end
+
+        self._start_boundary.setVisible(False)
+        self._end_boundary.setVisible(False)
+        for line in self._marker_lines:
+            line.setVisible(False)
+        self._playhead.setVisible(False)
+
+        self._noise_start_line.setPos(self._noise_start)
+        self._noise_end_line.setPos(self._noise_end)
+        self._noise_start_line.setVisible(True)
+        self._noise_end_line.setVisible(True)
+
+        self._plot.set_range_mode(
+            enabled=True,
+            left_getter=lambda: self._noise_start,
+            left_setter=self._set_noise_start,
+            right_getter=lambda: self._noise_end,
+            right_setter=self._set_noise_end,
+            time_to_pixel=self._plot_time_to_pixel,
+        )
+
+        self._hover_region.setVisible(False)
+        self._selection_region.setVisible(False)
+
+        self._refresh_segment_mode()
+        self._update_button_visibility()
+
+    def _set_noise_start(self, t):
+        t = self._clamp_time(t)
+        self._noise_start = min(t, self._noise_end)
+        self._noise_start_line.setPos(self._noise_start)
+
+    def _set_noise_end(self, t):
+        t = self._clamp_time(t)
+        self._noise_end = max(t, self._noise_start)
+        self._noise_end_line.setPos(self._noise_end)
+
+    def get_noise_range(self):
+        return self._noise_start, self._noise_end
+
+    def exit_noise_range_mode(self):
+        if not self._noise_mode:
+            return
+        self._noise_mode = False
+        self._noise_start = None
+        self._noise_end = None
+
+        self._noise_start_line.setVisible(False)
+        self._noise_end_line.setVisible(False)
+        self._plot.set_range_mode(enabled=False)
+
+        self._start_boundary.setVisible(True)
+        self._end_boundary.setVisible(True)
+        for line in self._marker_lines:
+            line.setVisible(True)
+
         self._refresh_segment_mode()
         self._update_button_visibility()
 
@@ -1449,6 +1612,8 @@ class WaveformPlayer(QWidget):
             self.exit_effect_preview()
         if self._preview_curve_index is not None:     # ← add
             self.exit_channel_curve_preview()
+        if self._noise_mode:
+            self.exit_noise_range_mode()
         if self._state != self.STATE_STOPPED:
             self._do_reset()
         self.clear_selection()

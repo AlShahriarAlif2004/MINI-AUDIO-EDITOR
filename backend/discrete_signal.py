@@ -296,6 +296,93 @@ class Discrete_Signal:
             self.start_index
         )
 
+    def fft(self):
+        """
+        Placeholder FFT wrapper — delegates to NumPy for now. Kept as a
+        separate method so it can later be swapped for a from-scratch
+        implementation without touching any of its callers.
+        """
+        return np.fft.fft(self.samples)
+
+    def remove_noise(self, noise_start_index, noise_end_index, frame_size=1024):
+        """
+        Spectral-subtraction noise removal.
+
+        The samples in [noise_start_index, noise_end_index] are treated
+        as a representative noise sample: the average magnitude
+        spectrum over that range becomes the "noise profile" that gets
+        subtracted from every frame of the signal (original phase is
+        always kept).
+
+        Framing uses a Hann window at 50% overlap (hop = frame_size // 2),
+        which satisfies the constant-overlap-add condition, so the
+        overlap-add reconstruction needs no extra normalization.
+        """
+        if noise_start_index < self.start_index or noise_end_index > self.end_index():
+            raise ValueError("Invalid noise range in remove_noise/Discrete_Signal.")
+
+        if noise_start_index > noise_end_index:
+            raise ValueError("Invalid noise range in remove_noise/Discrete_Signal.")
+
+        if frame_size < 2:
+            raise ValueError("Invalid frame_size in remove_noise/Discrete_Signal.")
+
+        hop_size = frame_size // 2
+        window = np.hanning(frame_size)
+
+        samples = self.samples
+        n = len(samples)
+
+        n_frames = max(1, int(np.ceil(max(n - frame_size, 0) / hop_size)) + 1)
+        padded_len = (n_frames - 1) * hop_size + frame_size
+        padded = np.zeros(padded_len)
+        padded[:n] = samples
+
+        def framed(start):
+            return padded[start:start + frame_size] * window
+
+        local_noise_start = noise_start_index - self.start_index
+        local_noise_end = noise_end_index - self.start_index
+
+        # --- Build the noise profile from frames overlapping the range ---
+        noise_spectra = []
+        frame_start = 0
+        while frame_start + frame_size <= padded_len:
+            frame_end = frame_start + frame_size
+            if frame_end > local_noise_start and frame_start <= local_noise_end:
+                spectrum = Discrete_Signal(framed(frame_start), self.sample_rate).fft()
+                noise_spectra.append(np.abs(spectrum))
+            frame_start += hop_size
+
+        if not noise_spectra:
+            # Range shorter than one frame — sample a single frame around it.
+            anchor = max(0, min(padded_len - frame_size, local_noise_start))
+            spectrum = Discrete_Signal(framed(anchor), self.sample_rate).fft()
+            noise_spectra.append(np.abs(spectrum))
+
+        noise_profile = np.mean(noise_spectra, axis=0)
+
+        # --- Spectral subtraction with overlap-add reconstruction ---
+        output = np.zeros(padded_len)
+        frame_start = 0
+        while frame_start + frame_size <= padded_len:
+            frame = framed(frame_start)
+            spectrum = Discrete_Signal(frame, self.sample_rate).fft()
+
+            magnitude = np.abs(spectrum)
+            phase = np.angle(spectrum)
+
+            cleaned_magnitude = np.maximum(magnitude - noise_profile, 0.0)
+            cleaned_spectrum = cleaned_magnitude * np.exp(1j * phase)
+
+            cleaned_frame = np.fft.ifft(cleaned_spectrum).real
+            output[frame_start:frame_start + frame_size] += cleaned_frame
+
+            frame_start += hop_size
+
+        output = output[:n]
+
+        return Discrete_Signal(output, self.sample_rate, self.start_index)
 
     def fade_out(self, start_index=None, end_index=None):
         if start_index is None:

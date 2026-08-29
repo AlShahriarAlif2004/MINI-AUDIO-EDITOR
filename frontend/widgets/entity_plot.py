@@ -1,6 +1,9 @@
 import numpy as np
 from PySide6.QtCore import Signal
-from PySide6.QtWidgets import QWidget, QVBoxLayout, QLabel, QScrollArea
+from PySide6.QtWidgets import (
+    QWidget, QVBoxLayout, QHBoxLayout, QLabel, QScrollArea,
+    QPushButton, QStackedWidget,
+)
 
 from backend.workspace_model import Entity
 from backend.audio_clip import AudioClip
@@ -35,6 +38,7 @@ class EntityPlotView(QWidget):
     entity_concatenated = Signal()
     entity_extracted = Signal()
     entity_divisor_deleted = Signal()
+    entity_noise_removed = Signal()
     segment_selected = Signal(object, object, float, float)
     segment_deselected = Signal()
     """
@@ -78,6 +82,19 @@ class EntityPlotView(QWidget):
         self._concat_sources = []
         self._concat_extra_channel_samples = None
         self._delete_divisor_active = False
+
+        self._noise_removal_active = False   # True for either phase (selection or filtered)
+        self._noise_filtered = False         # True once Filter has been clicked
+        self._noise_overall_player = None
+        self._noise_range = None             # (start_time, end_time) chosen by the user
+        self._noise_original_clip = None     # clip snapshot taken at Filter time
+        self._noise_filtered_clip = None     # AudioClip produced by Filter
+        self._noise_tab_widget = None        # container inserted above the normal players
+        self._noise_tab_stack = None
+        self._noise_tab_buttons = {}
+        self._noise_tab_pages = {}
+        self._noise_preview_players = []     # every WaveformPlayer built for the tab strip
+
         self._build_ui()
 
     @property
@@ -324,6 +341,258 @@ class EntityPlotView(QWidget):
             self._entity.channel_markers[ch_idx] = [
                 t for t in self._entity.channel_markers[ch_idx] if start < t < end
             ]
+
+    # ------------------------------------------------------------------
+    # Noise removal
+    # ------------------------------------------------------------------
+    # Two phases:
+    #   1. Selection  — only the Overall plot is shown, with no play
+    #      button and no white lines, just two draggable green handles
+    #      marking the noise window. Ends in Filter (-> phase 2) or
+    #      Cancel (closes the panel entirely).
+    #   2. Filtered   — every normal player is hidden and replaced by a
+    #      tab strip (Channel 1/Channel 2/Overall/Noise, or just
+    #      Overall/Noise for mono) where each tab shows a Previous/
+    #      Filtered pair of read-only players. Ends in Apply (commits
+    #      the filtered clip) or Cancel (returns to phase 1, keeping the
+    #      previously chosen range).
+
+    def begin_noise_removal(self) -> bool:
+        if self._noise_removal_active:
+            return False
+        overall = self._find_overall_player()
+        if overall is None:
+            return False
+
+        self._noise_removal_active = True
+        self._noise_filtered = False
+        self._noise_overall_player = overall
+        self._noise_range = None
+        self._noise_original_clip = None
+        self._noise_filtered_clip = None
+
+        for player in self._players:
+            player.setVisible(player is overall)
+
+        clip = self._entity.clip
+        start_time = clip.get_time(clip.start_index)
+        end_time = clip.get_time(clip.end_index())
+        span = end_time - start_time
+        default_start = start_time + span * 0.25
+        default_end = start_time + span * 0.75
+
+        overall.enter_noise_range_mode(default_start, default_end)
+        self._lock_selection(True)
+        return True
+
+    def cancel_noise_removal(self):
+        """Fully closes the panel, from either phase."""
+        if not self._noise_removal_active:
+            return
+        if self._noise_filtered:
+            self._teardown_noise_tabs()
+        elif self._noise_overall_player is not None:
+            self._noise_overall_player.exit_noise_range_mode()
+        self._restore_normal_players()
+        self._reset_noise_state()
+
+    def back_to_noise_selection(self):
+        """Cancel pressed during the Filter/Apply phase: returns to the
+        range-selection phase (with the previous range restored) instead
+        of closing the whole panel."""
+        if not self._noise_removal_active or not self._noise_filtered:
+            return
+
+        saved_range = self._noise_range
+        overall = self._noise_overall_player
+
+        self._teardown_noise_tabs()
+        for player in self._players:
+            player.setVisible(player is overall)
+
+        self._noise_filtered = False
+        self._noise_original_clip = None
+        self._noise_filtered_clip = None
+
+        overall.enter_noise_range_mode(*saved_range)
+
+    def filter_noise(self):
+        if not self._noise_removal_active or self._noise_filtered:
+            return
+
+        overall = self._noise_overall_player
+        start, end = overall.get_noise_range()
+        self._noise_range = (start, end)
+
+        clip = self._entity.clip
+        self._noise_original_clip = clip
+
+        start_idx = clip.get_index(start)
+        end_idx = clip.get_index(end)
+
+        filtered = clip
+        for ch_idx in range(clip.num_channels):
+            filtered = filtered.apply("remove_noise", start_idx, end_idx, channel=ch_idx)
+        self._noise_filtered_clip = filtered
+
+        overall.exit_noise_range_mode()
+        for player in self._players:
+            player.setVisible(False)
+
+        self._noise_filtered = True
+        self._build_noise_tabs()
+
+    def apply_noise_removal(self):
+        if not self._noise_removal_active or not self._noise_filtered:
+            return
+        self._entity.clip = self._noise_filtered_clip
+        self._teardown_noise_tabs()
+        self._restore_normal_players()
+        self._reset_noise_state()
+        self.entity_modified.emit()
+        self.entity_noise_removed.emit()
+
+    def _restore_normal_players(self):
+        for player in self._players:
+            player.setVisible(True)
+        self._lock_selection(False)
+
+    def _reset_noise_state(self):
+        self._noise_removal_active = False
+        self._noise_filtered = False
+        self._noise_overall_player = None
+        self._noise_range = None
+        self._noise_original_clip = None
+        self._noise_filtered_clip = None
+
+    @staticmethod
+    def _channels_to_series_and_audio(channels, only_index=None):
+        """Mirrors _build_ui's per-channel / Overall series+audio setup,
+        for the read-only preview players in the Noise tab strip."""
+        if only_index is not None:
+            ch = channels[only_index]
+            color = _CHANNEL_COLORS[only_index % len(_CHANNEL_COLORS)]
+            series = [(ch.samples, color, f"Ch {only_index + 1}")]
+            audio = ch.samples.astype(np.float32)
+            return series, audio
+
+        series = [
+            (ch.samples, _CHANNEL_COLORS[i % len(_CHANNEL_COLORS)], f"Ch {i + 1}")
+            for i, ch in enumerate(channels)
+        ]
+        stacked = np.stack([ch.samples for ch in channels], axis=1).astype(np.float32)
+        audio = stacked if stacked.shape[1] <= 2 else stacked.mean(axis=1).astype(np.float32)
+        return series, audio
+
+    def _build_noise_tabs(self):
+        clip = self._entity.clip
+        num_channels = clip.num_channels
+
+        tabs = []
+        if num_channels > 1:
+            for i in range(num_channels):
+                tabs.append((f"Channel {i + 1}", i))
+        tabs.append(("Overall", None))
+        tabs.append(("Noise", "noise"))
+
+        noise_start_idx = clip.get_index(self._noise_range[0])
+        noise_end_idx = clip.get_index(self._noise_range[1])
+
+        container = QWidget()
+        outer = QVBoxLayout(container)
+        outer.setContentsMargins(0, 0, 0, 0)
+        outer.setSpacing(8)
+
+        tab_row = QHBoxLayout()
+        tab_row.setSpacing(6)
+        stack = QStackedWidget()
+
+        self._noise_tab_buttons = {}
+        self._noise_tab_pages = {}
+        self._noise_preview_players = []
+
+        for label, key in tabs:
+            btn = QPushButton(label)
+            btn.setCheckable(True)
+            btn.clicked.connect(lambda checked=False, k=key: self._select_noise_tab(k))
+            tab_row.addWidget(btn)
+            self._noise_tab_buttons[key] = btn
+
+            page = self._build_noise_tab_page(key, noise_start_idx, noise_end_idx)
+            stack.addWidget(page)
+            self._noise_tab_pages[key] = page
+
+        tab_row.addStretch()
+        outer.addLayout(tab_row)
+        outer.addWidget(stack)
+
+        self._noise_tab_stack = stack
+        self._noise_tab_widget = container
+        self._content_layout.insertWidget(0, container)
+
+        self._select_noise_tab(tabs[0][1])
+
+    def _select_noise_tab(self, key):
+        for k, btn in self._noise_tab_buttons.items():
+            btn.setChecked(k == key)
+        self._noise_tab_stack.setCurrentWidget(self._noise_tab_pages[key])
+
+    def _build_noise_tab_page(self, key, noise_start_idx, noise_end_idx):
+        orig_clip = self._noise_original_clip
+        filt_clip = self._noise_filtered_clip
+
+        if key == "noise":
+            prev_channels = [ch.trim(noise_start_idx, noise_end_idx) for ch in orig_clip.channels]
+            filt_channels = [ch.trim(noise_start_idx, noise_end_idx) for ch in filt_clip.channels]
+            only_index = None
+        else:
+            prev_channels = orig_clip.channels
+            filt_channels = filt_clip.channels
+            only_index = key if isinstance(key, int) else None
+
+        times = self._time_axis(prev_channels[0] if only_index is None else prev_channels[only_index])
+
+        page = QWidget()
+        layout = QVBoxLayout(page)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(8)
+
+        for title, channels in (("Previous", prev_channels), ("Filtered", filt_channels)):
+            series, audio = self._channels_to_series_and_audio(channels, only_index)
+
+            label = QLabel(title)
+            label.setStyleSheet("font-size: 13px; font-weight: 600;")
+            layout.addWidget(label)
+
+            player = WaveformPlayer(
+                times=times,
+                series=series,
+                sample_rate=channels[0].sample_rate,
+                audio_data=audio,
+                group=self._group,
+                entity=self._entity,
+                channel_index=None,
+                is_driver=False,
+                show_markers=False,
+            )
+            player.set_tool_mode(True)
+            layout.addWidget(player)
+            self._noise_preview_players.append(player)
+
+        return page
+
+    def _teardown_noise_tabs(self):
+        if self._noise_tab_widget is None:
+            return
+        for player in self._noise_preview_players:
+            player.force_idle()
+        self._content_layout.removeWidget(self._noise_tab_widget)
+        self._noise_tab_widget.deleteLater()
+        self._noise_tab_widget = None
+        self._noise_tab_stack = None
+        self._noise_tab_buttons = {}
+        self._noise_tab_pages = {}
+        self._noise_preview_players = []
 
     # ------------------------------------------------------------------
     # Time-scale preview
@@ -925,7 +1194,8 @@ class EntityPlotView(QWidget):
                 or self._reverse_player is not None
                 or self._fadein_player is not None
                 or self._fadeout_player is not None
-                or self._concat_player is not None):
+                or self._concat_player is not None
+                or self._noise_removal_active):
             return
         if self._delete_divisor_active:
             self._deselect_all_markers()
@@ -999,11 +1269,13 @@ class EntityPlotView(QWidget):
 
         layout.addStretch()
         scroll.setWidget(container)
+        self._content_layout = layout
 
     def shutdown(self):
         self.cancel_trim()
         self.cancel_extract()
         self.cancel_delete_divisor()
+        self.cancel_noise_removal()
         self.cancel_timescale()
         self.cancel_vertical_scale()
         self.cancel_reverse()

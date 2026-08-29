@@ -227,6 +227,16 @@ class WorkspacePage(QWidget):
         dict(key="deldivisor", label="Delete Divisor",
              begin="begin_delete_divisor", apply="apply_delete_divisor", cancel="cancel_delete_divisor",
              rebuild_signal="entity_divisor_deleted", factor=False, needs_dialog=False),
+        # Noise Removal doesn't fit the generic single-shot Apply/Cancel
+        # shape: it has a Filter/Cancel stage followed by an Apply/Cancel
+        # stage. It still uses the shared begin/active/tab-lock machinery
+        # (see _on_op_clicked), but its panel and button wiring are
+        # custom — see _build_noise_panel/_on_noise_action_clicked/
+        # _on_noise_cancel_clicked below.
+        dict(key="noise", label="Noise Removal",
+             begin="begin_noise_removal", apply="apply_noise_removal", cancel="cancel_noise_removal",
+             rebuild_signal="entity_noise_removed", factor=False, needs_dialog=False,
+             custom_panel=True),
     ]
 
     new_workspace_requested = Signal()
@@ -575,7 +585,10 @@ class WorkspacePage(QWidget):
                     btn.setEnabled(False)   # not implemented yet
                     continue
 
-                panel, apply_btn, cancel_btn, factor_input = self._build_op_panel(spec)
+                if spec.get("custom_panel"):
+                    panel, apply_btn, cancel_btn, factor_input = self._build_noise_panel()
+                else:
+                    panel, apply_btn, cancel_btn, factor_input = self._build_op_panel(spec)
                 tool_options_layout.addWidget(panel)
 
                 entry = _OpEntry(spec, btn, panel, apply_btn, cancel_btn, factor_input)
@@ -583,8 +596,12 @@ class WorkspacePage(QWidget):
 
                 key = spec["key"]
                 btn.clicked.connect(lambda checked=False, k=key: self._on_op_clicked(k))
-                apply_btn.clicked.connect(lambda checked=False, k=key: self._on_op_apply_clicked(k))
-                cancel_btn.clicked.connect(lambda checked=False, k=key: self._on_op_cancel_clicked(k))
+                if spec.get("custom_panel"):
+                    apply_btn.clicked.connect(lambda checked=False, k=key: self._on_noise_action_clicked(k))
+                    cancel_btn.clicked.connect(lambda checked=False, k=key: self._on_noise_cancel_clicked(k))
+                else:
+                    apply_btn.clicked.connect(lambda checked=False, k=key: self._on_op_apply_clicked(k))
+                    cancel_btn.clicked.connect(lambda checked=False, k=key: self._on_op_cancel_clicked(k))
 
         tool_options_layout.addStretch()
         self._tool_options_panel.setVisible(False)   # shown when tool mode is active
@@ -677,6 +694,24 @@ class WorkspacePage(QWidget):
 
         panel.setVisible(False)
         return panel, apply_btn, cancel_btn, factor_input
+
+    def _build_noise_panel(self):
+        """Noise Removal's panel: starts as Filter/Cancel; after Filter is
+        clicked the left button's label is swapped to Apply (see
+        _on_noise_action_clicked) and Cancel's meaning changes from
+        "close the panel" to "go back to range selection" (see
+        _on_noise_cancel_clicked) — both keyed off the button's own text,
+        so no extra state needs to live on _OpEntry."""
+        panel = QWidget()
+        layout = QHBoxLayout(panel)
+        layout.setContentsMargins(16, 0, 0, 0)
+        layout.setSpacing(6)
+        action_btn = QPushButton("Filter")
+        cancel_btn = QPushButton("Cancel")
+        layout.addWidget(action_btn)
+        layout.addWidget(cancel_btn)
+        panel.setVisible(False)
+        return panel, action_btn, cancel_btn, None
 
     # ------------------------------------------------------------------
     # Mode switching
@@ -875,6 +910,8 @@ class WorkspacePage(QWidget):
         entry.panel.setVisible(False)
         if entry.factor_input is not None:
             entry.factor_input.setValue(1.0)
+        if entry.spec.get("custom_panel"):
+            entry.apply_btn.setText("Filter")
         self._refresh_tab_bar_lock()
 
     def _cancel_op_if_active(self, key: str):
@@ -952,6 +989,38 @@ class WorkspacePage(QWidget):
         view = entry.active_view
         self._collapse_op_ui(key)
         getattr(view, entry.spec["cancel"])()              # restores graph + keeps selection
+
+    # ------------------------------------------------------------------
+    # Noise Removal's two-stage panel (Filter/Cancel -> Apply/Cancel)
+    # ------------------------------------------------------------------
+
+    def _on_noise_action_clicked(self, key: str):
+        entry = self._ops[key]
+        if not entry.active or entry.active_view is None:
+            return
+        view = entry.active_view
+
+        if entry.apply_btn.text() == "Filter":
+            view.filter_noise()
+            entry.apply_btn.setText("Apply")
+        else:
+            self._collapse_op_ui(key)
+            view.apply_noise_removal()          # → rebuild (clears selection)
+
+    def _on_noise_cancel_clicked(self, key: str):
+        entry = self._ops[key]
+        if not entry.active or entry.active_view is None:
+            return
+        view = entry.active_view
+
+        if entry.apply_btn.text() == "Apply":
+            # Past Filter — go back to range selection, panel stays open.
+            view.back_to_noise_selection()
+            entry.apply_btn.setText("Filter")
+        else:
+            # Still in selection phase — close the panel entirely.
+            self._collapse_op_ui(key)
+            view.cancel_noise_removal()
 
     # ------------------------------------------------------------------
     # Entity-view factory / tab lifecycle
