@@ -498,7 +498,7 @@ class WaveformPlayer(QWidget):
         layout.setContentsMargins(0, 0, 0, 0)
         layout.setSpacing(4)
 
-        self._plot = _DraggablePlotWidget()
+        self._plot = _DraggablePlotWidget(self)
         self._plot.on_drag_start = self._on_drag_start
         self._plot.on_seek = self._on_seek
         self._plot.on_drag_end = self._on_drag_end

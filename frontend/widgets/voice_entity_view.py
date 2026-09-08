@@ -38,7 +38,7 @@ class VoiceEntityView(QWidget):
         speakers added so far (shown even when empty, so it's clear
         there's nothing there yet). Selecting an entry shows that
         speaker's averaged waveform. "Add Sample Speaker" / "Delete
-        Sample Speaker" live under the dropdown, right-aligned, and are
+        Sample Speaker" live at the bottom-right of the view and are
         only shown while this view is active.
       - "Similarity" — disabled placeholder for a later feature.
 
@@ -54,6 +54,7 @@ class VoiceEntityView(QWidget):
         "QPushButton { background-color: #2f81f7; color: white; font-weight: 600; }"
     )
     _BTN_MIN_SIZE = (150, 34)   # (width, height) — a bit wider than the Qt default
+    _SAMPLE_ACTION_MIN_SIZE = (190, 38)
 
     VIEW_TARGET = "target"
     VIEW_SAMPLE = "sample"
@@ -109,7 +110,7 @@ class VoiceEntityView(QWidget):
         button_row.addStretch()
         layout.addLayout(button_row)
 
-        # ---- Sample Speakers panel: dropdown + Add/Delete (only when active) ----
+        # ---- Sample Speakers panel: dropdown (only when active) ----
         self._sample_panel = QWidget()
         panel_layout = QVBoxLayout(self._sample_panel)
         panel_layout.setContentsMargins(0, 0, 0, 0)
@@ -117,21 +118,13 @@ class VoiceEntityView(QWidget):
 
         self._dropdown_list = QListWidget()
         self._dropdown_list.setMaximumHeight(120)
+        self._dropdown_list.setStyleSheet(
+            "QListWidget::item { padding-left: 10px; }"
+            "QListWidget::item:selected { background-color: #2f81f7; color: white; }"
+        )
         self._dropdown_list.itemClicked.connect(self._on_dropdown_item_clicked)
         self._dropdown_list.setVisible(False)
         panel_layout.addWidget(self._dropdown_list)
-
-        action_row = QHBoxLayout()
-        action_row.addStretch()
-        action_col = QVBoxLayout()
-        self._add_sample_btn = QPushButton("Add Sample Speaker")
-        self._delete_sample_btn = QPushButton("Delete Sample Speaker")
-        self._add_sample_btn.clicked.connect(self._on_add_sample_speaker_clicked)
-        self._delete_sample_btn.clicked.connect(self._on_delete_sample_speaker_clicked)
-        action_col.addWidget(self._add_sample_btn)
-        action_col.addWidget(self._delete_sample_btn)
-        action_row.addLayout(action_col)
-        panel_layout.addLayout(action_row)
 
         self._sample_panel.setVisible(False)
         layout.addWidget(self._sample_panel)
@@ -148,6 +141,22 @@ class VoiceEntityView(QWidget):
         layout.addWidget(self._plot_container)
         layout.addStretch()
 
+        # ---- Sample speaker actions: bottom-right of the whole view ----
+        action_row = QHBoxLayout()
+        action_row.addStretch()
+        self._add_sample_btn = QPushButton("Add Sample Speaker")
+        self._delete_sample_btn = QPushButton("Delete Sample Speaker")
+        for button in (self._add_sample_btn, self._delete_sample_btn):
+            button.setMinimumSize(*self._SAMPLE_ACTION_MIN_SIZE)
+        self._add_sample_btn.clicked.connect(self._on_add_sample_speaker_clicked)
+        self._delete_sample_btn.clicked.connect(self._on_delete_sample_speaker_clicked)
+        action_row.addWidget(self._add_sample_btn)
+        action_row.addWidget(self._delete_sample_btn)
+        self._sample_actions = QWidget()
+        self._sample_actions.setLayout(action_row)
+        self._sample_actions.setVisible(True)
+        layout.addWidget(self._sample_actions)
+
     # ------------------------------------------------------------------
     # Target Speaker / Sample Speakers toggle
     # ------------------------------------------------------------------
@@ -158,6 +167,7 @@ class VoiceEntityView(QWidget):
         self._active_view = self.VIEW_TARGET
         self._set_dropdown_visible(False)
         self._sample_panel.setVisible(False)
+        self._sample_actions.setVisible(True)
         self._refresh_button_styles()
         self._refresh_title()
         self._refresh_plot()
@@ -166,6 +176,7 @@ class VoiceEntityView(QWidget):
         if self._active_view != self.VIEW_SAMPLE:
             self._active_view = self.VIEW_SAMPLE
             self._sample_panel.setVisible(True)
+            self._sample_actions.setVisible(False)
             self._set_dropdown_visible(False)
             self._refresh_button_styles()
             self._refresh_title()
@@ -201,6 +212,9 @@ class VoiceEntityView(QWidget):
             item = QListWidgetItem(speaker.name)
             item.setData(Qt.UserRole, speaker)
             self._dropdown_list.addItem(item)
+            if speaker is self._selected_sample_speaker:
+                item.setSelected(True)
+                self._dropdown_list.setCurrentItem(item)
 
     def _on_dropdown_item_clicked(self, item: QListWidgetItem):
         speaker = item.data(Qt.UserRole)
@@ -216,15 +230,20 @@ class VoiceEntityView(QWidget):
     # ------------------------------------------------------------------
 
     def _on_add_sample_speaker_clicked(self):
-        dialog = AddSampleSpeakerDialog(self._workspace, self)
+        dialog = AddSampleSpeakerDialog(
+            self._workspace,
+            parent=self,
+            excluded_entities=self._sample_speakers,
+        )
         if dialog.exec() != QDialog.DialogCode.Accepted:
             return
         entity = dialog.selected_entity()
         if entity is None:
             return
 
-        if entity not in self._sample_speakers:
-            self._sample_speakers.append(entity)
+        if entity in self._sample_speakers:
+            return
+        self._sample_speakers.append(entity)
         self._selected_sample_speaker = entity
 
         if self._dropdown_visible:
@@ -299,6 +318,7 @@ class VoiceEntityView(QWidget):
             is_driver=True,
             show_markers=False,
             show_clip_button=False,
+            parent=self._plot_container,
         )
         self._player.marker_added.connect(self.entity_modified.emit)
         self._plot_layout.addWidget(self._player)

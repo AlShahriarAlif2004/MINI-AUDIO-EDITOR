@@ -15,15 +15,22 @@ class AddSampleSpeakerDialog(QDialog):
     workflow: lets the user pick any entity in the workspace to add to the
     current tab's Sample Speakers list.
 
-    Every entity in the workspace is offered (unlike NoiseSourceDialog,
-    there's no channel-count restriction here), listed by name. If the
-    workspace has no entities at all, the combo box is empty and OK stays
-    disabled — there's nothing valid to pick.
+    Every eligible entity in the workspace is offered (unlike
+    NoiseSourceDialog, there's no channel-count restriction here), listed by
+    name. Entities already present in the current tab's Sample Speakers list
+    are excluded. If there are no eligible entities, the combo box is empty
+    and OK stays disabled.
     """
 
-    def __init__(self, workspace: Workspace, parent=None):
+    def __init__(
+        self,
+        workspace: Workspace,
+        parent=None,
+        excluded_entities: list[Entity] | None = None,
+    ):
         super().__init__(parent)
         self._workspace = workspace
+        self._excluded_entities = set(excluded_entities or [])
 
         self.setWindowTitle("Add Sample Speaker")
         self.setMinimumWidth(320)
@@ -37,6 +44,8 @@ class AddSampleSpeakerDialog(QDialog):
 
         self._combo = QComboBox()
         for entity in self._collect_entities():
+            if entity in self._excluded_entities:
+                continue
             self._combo.addItem(entity.name, entity)
         layout.addWidget(self._combo)
 
