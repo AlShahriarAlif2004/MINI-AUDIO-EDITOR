@@ -4,12 +4,12 @@ from PySide6.QtCore import Qt, Signal
 
 class HomePage(QWidget):
     """
-    Landing page: app title + New Workspace / Open Workspace buttons.
-    Emits signals; MainWindow decides what happens next.
+    Landing page: app title + a single Editor Mode button. Emits a
+    signal; MainWindow decides what happens next (enters the workspace
+    editor with no workspace loaded — see WorkspacePage.clear_workspace).
     """
 
-    new_workspace_requested = Signal()
-    open_workspace_requested = Signal()
+    editor_mode_requested = Signal()
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -24,16 +24,10 @@ class HomePage(QWidget):
         title.setAlignment(Qt.AlignCenter)
         title.setStyleSheet("font-size: 28px; font-weight: 600;")
 
-        new_btn = QPushButton("New Workspace")
-        open_btn = QPushButton("Open Workspace")
-
-        for btn in (new_btn, open_btn):
-            btn.setFixedWidth(220)
-            btn.setFixedHeight(40)
-
-        new_btn.clicked.connect(self.new_workspace_requested.emit)
-        open_btn.clicked.connect(self.open_workspace_requested.emit)
+        editor_btn = QPushButton("Editor Mode")
+        editor_btn.setFixedWidth(220)
+        editor_btn.setFixedHeight(40)
+        editor_btn.clicked.connect(self.editor_mode_requested.emit)
 
         layout.addWidget(title)
-        layout.addWidget(new_btn, alignment=Qt.AlignCenter)
-        layout.addWidget(open_btn, alignment=Qt.AlignCenter)
+        layout.addWidget(editor_btn, alignment=Qt.AlignCenter)

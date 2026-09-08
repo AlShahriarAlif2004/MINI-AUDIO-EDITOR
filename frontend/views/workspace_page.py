@@ -441,6 +441,7 @@ class WorkspacePage(QWidget):
         self._mode = "file"
         self._ops: dict[str, _OpEntry] = {}   # populated in _build_ui
         self._build_ui()
+        self._update_sidebar_for_workspace()
         self._playback_group = PlaybackGroup.get_instance()
         self._playback_group.active_changed.connect(self._on_playback_active_changed)
 
@@ -673,10 +674,16 @@ class WorkspacePage(QWidget):
 
         self._file_btn.setStyleSheet(self._SELECTED_BTN_STYLE)
 
-        splitter = QSplitter(Qt.Horizontal)
+        self._splitter = QSplitter(Qt.Horizontal)
 
         # ---- sidebar ----
         sidebar = QWidget()
+        # Match the light color QTreeWidget normally paints itself with
+        # (Fusion style's "base" color) directly on the container, so the
+        # sidebar stays visually distinct from the editor pane even when
+        # the tree is hidden and only the "No Workspace" label is shown.
+        sidebar.setAutoFillBackground(True)
+        sidebar.setStyleSheet("background-color: palette(base);")
         sidebar_layout = QVBoxLayout(sidebar)
         sidebar_layout.setContentsMargins(4, 4, 4, 4)
 
@@ -694,6 +701,19 @@ class WorkspacePage(QWidget):
         self._tree.folder_context_menu_requested.connect(self._show_folder_context_menu)
         self._tree.entity_context_menu_requested.connect(self._show_entity_context_menu)
         sidebar_layout.addWidget(self._tree)
+
+        # Shown instead of the (then-empty) tree when no workspace is
+        # loaded, so an unopened editor is visually distinct from a real
+        # workspace that just happens to have zero folders/entities.
+        self._no_workspace_label = QLabel("No Workspace")
+        self._no_workspace_label.setAlignment(Qt.AlignCenter)
+        # palette(mid) reads too faint against the sidebar's light
+        # palette(base) background — use a fixed, higher-contrast gray
+        # instead so the placeholder text stays clearly legible there.
+        self._no_workspace_label.setStyleSheet(
+            "color: #57606a; font-style: italic; padding: 24px 0;"
+        )
+        sidebar_layout.addWidget(self._no_workspace_label)
 
         # ---- edit-options panel (always present; shown only in edit mode) ----
         self._edit_options_panel = QWidget()
@@ -807,7 +827,7 @@ class WorkspacePage(QWidget):
         self._tool_options_panel.setVisible(False)   # shown when tool mode is active
         sidebar_layout.addWidget(self._tool_options_panel)
 
-        splitter.addWidget(sidebar)
+        self._splitter.addWidget(sidebar)
 
         # ---- editor area ----
         editor = QWidget()
@@ -850,12 +870,12 @@ class WorkspacePage(QWidget):
         self._content_stack.addWidget(self._empty_label)
         editor_layout.addWidget(self._content_stack)
 
-        splitter.addWidget(editor)
-        splitter.setStretchFactor(0, 0)
-        splitter.setStretchFactor(1, 1)
-        splitter.setSizes([240, 960])
+        self._splitter.addWidget(editor)
+        self._splitter.setStretchFactor(0, 0)
+        self._splitter.setStretchFactor(1, 1)
+        self._splitter.setSizes([240, 960])
 
-        root_layout.addWidget(splitter)
+        root_layout.addWidget(self._splitter)
 
     def _build_op_panel(self, spec):
         """Build the Apply/Cancel (and, for factor ops, the factor row)
@@ -1008,11 +1028,8 @@ class WorkspacePage(QWidget):
 
         is_edit = (mode == "edit")
         is_tool = (mode == "tool")
-        hides_tree = is_edit or is_tool
 
-        self._new_folder_btn.setVisible(not hides_tree)
-        self._new_entity_btn.setVisible(not hides_tree)
-        self._tree.setVisible(not hides_tree)
+        self._update_sidebar_for_workspace()
 
         # Show / hide the two mutually-exclusive sidebar panels
         self._edit_options_panel.setVisible(is_edit)
@@ -1037,9 +1054,46 @@ class WorkspacePage(QWidget):
         self._set_mode("file")
         self._tree.populate(workspace.root)
         self._content_stack.setCurrentWidget(self._empty_label)
+        self._update_sidebar_for_workspace()
+        self._splitter.setSizes([240, 960])
+
+    def clear_workspace(self):
+        """Return to the empty, no-workspace-loaded state — distinct from
+        a real workspace with zero folders/entities, since the sidebar
+        shows the 'No Workspace' placeholder instead of an empty tree."""
+        self._workspace = None
+        self._clear_tabs()
+        self._set_mode("file")
+        self._tree.clear()
+        self._content_stack.setCurrentWidget(self._empty_label)
+        self._update_sidebar_for_workspace()
+        self._splitter.setSizes([240, 960])
 
     def workspace(self) -> Workspace | None:
         return self._workspace
+
+    def _update_sidebar_for_workspace(self):
+        """
+        Tree and the 'No Workspace' placeholder are mutually exclusive
+        and only ever shown in File mode. New Folder/New Entity stay
+        visible in File mode regardless — they're just disabled until a
+        workspace is actually loaded, rather than disappearing. Edit/Tool
+        modes are themselves disabled with nothing loaded, since both
+        operate on entities.
+        """
+        has_workspace = self._workspace is not None
+        in_file_mode = self._mode == "file"
+
+        self._edit_btn.setEnabled(has_workspace)
+        self._tool_btn.setEnabled(has_workspace)
+
+        self._tree.setVisible(in_file_mode and has_workspace)
+        self._no_workspace_label.setVisible(in_file_mode and not has_workspace)
+
+        self._new_folder_btn.setVisible(in_file_mode)
+        self._new_entity_btn.setVisible(in_file_mode)
+        self._new_folder_btn.setEnabled(has_workspace)
+        self._new_entity_btn.setEnabled(has_workspace)
 
     def _clear_tabs(self):
         while self._tab_bar.count() > 0:

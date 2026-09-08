@@ -22,12 +22,23 @@ class MainWindow(QMainWindow):
         self.stack.addWidget(self.home_page)
         self.stack.addWidget(self.workspace_page)
 
-        self.home_page.new_workspace_requested.connect(self._on_new_workspace)
-        self.home_page.open_workspace_requested.connect(self._on_open_workspace)
+        self.home_page.editor_mode_requested.connect(self._on_editor_mode)
 
         self.workspace_page.new_workspace_requested.connect(self._on_new_workspace)
         self.workspace_page.open_workspace_requested.connect(self._on_open_workspace)
         self.workspace_page.exit_requested.connect(self._on_exit_workspace)
+
+    def _on_editor_mode(self):
+        """Enter the workspace editor with nothing loaded yet — the
+        sidebar shows its 'No Workspace' placeholder until the user
+        picks File > New or File > Open from inside the editor."""
+        if not self._confirm_leave_workspace():
+            return
+
+        self._current_workspace = None
+        self.workspace_page.clear_workspace()
+        self.stack.setCurrentWidget(self.workspace_page)
+        self.setWindowTitle("Mini Audio Editor")
 
     def _on_new_workspace(self):
         if not self._confirm_leave_workspace():
