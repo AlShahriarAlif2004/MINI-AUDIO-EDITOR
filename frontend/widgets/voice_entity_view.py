@@ -1,4 +1,5 @@
 import numpy as np
+import sounddevice as sd
 from PySide6.QtCore import Qt, Signal
 from PySide6.QtWidgets import (
     QDialog,
@@ -7,11 +8,14 @@ from PySide6.QtWidgets import (
     QListWidget,
     QListWidgetItem,
     QPushButton,
+    QFrame,
+    QGridLayout,
     QVBoxLayout,
     QWidget,
 )
 
 from backend.workspace_model import Entity, Workspace
+from backend.speaker_similarity import rank_sample_speakers
 from frontend.dialogs.add_sample_speaker_dialog import AddSampleSpeakerDialog
 from frontend.dialogs.delete_sample_speaker_dialog import DeleteSampleSpeakerDialog
 from frontend.widgets.waveform_player import PlaybackGroup, WaveformPlayer
@@ -40,7 +44,8 @@ class VoiceEntityView(QWidget):
         speaker's averaged waveform. "Add Sample Speaker" / "Delete
         Sample Speaker" live at the bottom-right of the view and are
         only shown while this view is active.
-      - "Similarity" — disabled placeholder for a later feature.
+            - "Similarity" — the ranked result view, enabled after a ranking has
+                been calculated for the current sample-speaker list.
 
     A title label above the plot names whichever waveform is currently
     shown: the target entity's name, the selected sample speaker's name,
@@ -58,6 +63,7 @@ class VoiceEntityView(QWidget):
 
     VIEW_TARGET = "target"
     VIEW_SAMPLE = "sample"
+    VIEW_SIMILARITY = "similarity"
 
     def __init__(self, entity: Entity, workspace: Workspace | None = None, parent=None):
         super().__init__(parent)
@@ -70,6 +76,8 @@ class VoiceEntityView(QWidget):
         self._sample_speakers: list[Entity] = []      # per-tab, not persisted
         self._selected_sample_speaker: Entity | None = None
         self._dropdown_visible = False
+        self._similarity_results = []
+        self._similarity_ready = False
 
         self._build_ui()
         self._refresh_button_styles()
@@ -96,13 +104,14 @@ class VoiceEntityView(QWidget):
         self._target_speaker_btn = QPushButton("Target Speaker")
         self._sample_speakers_btn = QPushButton("Sample Speakers")
         self._similarity_btn = QPushButton("Similarity")
-        self._similarity_btn.setEnabled(False)  # inactive placeholder
+        self._similarity_btn.setEnabled(False)
 
         for btn in (self._target_speaker_btn, self._sample_speakers_btn, self._similarity_btn):
             btn.setMinimumSize(*self._BTN_MIN_SIZE)
 
         self._target_speaker_btn.clicked.connect(self._on_target_speaker_clicked)
         self._sample_speakers_btn.clicked.connect(self._on_sample_speakers_clicked)
+        self._similarity_btn.clicked.connect(self._on_similarity_clicked)
 
         button_row.addWidget(self._target_speaker_btn)
         button_row.addWidget(self._sample_speakers_btn)
@@ -119,7 +128,7 @@ class VoiceEntityView(QWidget):
         self._dropdown_list = QListWidget()
         self._dropdown_list.setMaximumHeight(120)
         self._dropdown_list.setStyleSheet(
-            "QListWidget::item { padding-left: 10px; }"
+            "QListWidget::item { padding-left: 30px; }"
             "QListWidget::item:selected { background-color: #2f81f7; color: white; }"
         )
         self._dropdown_list.itemClicked.connect(self._on_dropdown_item_clicked)
@@ -128,6 +137,13 @@ class VoiceEntityView(QWidget):
 
         self._sample_panel.setVisible(False)
         layout.addWidget(self._sample_panel)
+
+        self._similarity_panel = QWidget()
+        self._similarity_layout = QVBoxLayout(self._similarity_panel)
+        self._similarity_layout.setContentsMargins(0, 0, 0, 0)
+        self._similarity_layout.setSpacing(6)
+        self._similarity_panel.setVisible(False)
+        layout.addWidget(self._similarity_panel)
 
         # ---- title above the plot ----
         self._title_label = QLabel("")
@@ -146,12 +162,17 @@ class VoiceEntityView(QWidget):
         action_row.addStretch()
         self._add_sample_btn = QPushButton("Add Sample Speaker")
         self._delete_sample_btn = QPushButton("Delete Sample Speaker")
+        self._find_similarity_btn = QPushButton("Find Similarity")
+        self._find_similarity_btn.setEnabled(False)
         for button in (self._add_sample_btn, self._delete_sample_btn):
             button.setMinimumSize(*self._SAMPLE_ACTION_MIN_SIZE)
+        self._find_similarity_btn.setMinimumSize(*self._SAMPLE_ACTION_MIN_SIZE)
         self._add_sample_btn.clicked.connect(self._on_add_sample_speaker_clicked)
         self._delete_sample_btn.clicked.connect(self._on_delete_sample_speaker_clicked)
+        self._find_similarity_btn.clicked.connect(self._on_find_similarity_clicked)
         action_row.addWidget(self._add_sample_btn)
         action_row.addWidget(self._delete_sample_btn)
+        action_row.addWidget(self._find_similarity_btn)
         self._sample_actions = QWidget()
         self._sample_actions.setLayout(action_row)
         self._sample_actions.setVisible(True)
@@ -167,6 +188,7 @@ class VoiceEntityView(QWidget):
         self._active_view = self.VIEW_TARGET
         self._set_dropdown_visible(False)
         self._sample_panel.setVisible(False)
+        self._similarity_panel.setVisible(False)
         self._sample_actions.setVisible(True)
         self._refresh_button_styles()
         self._refresh_title()
@@ -176,6 +198,7 @@ class VoiceEntityView(QWidget):
         if self._active_view != self.VIEW_SAMPLE:
             self._active_view = self.VIEW_SAMPLE
             self._sample_panel.setVisible(True)
+            self._similarity_panel.setVisible(False)
             self._sample_actions.setVisible(False)
             self._set_dropdown_visible(False)
             self._refresh_button_styles()
@@ -185,11 +208,37 @@ class VoiceEntityView(QWidget):
             # Already active — toggle the dropdown open/closed instead.
             self._set_dropdown_visible(not self._dropdown_visible)
 
+    def _on_similarity_clicked(self):
+        if not self._similarity_ready:
+            return
+        self._active_view = self.VIEW_SIMILARITY
+        self._set_dropdown_visible(False)
+        self._sample_panel.setVisible(False)
+        self._sample_actions.setVisible(False)
+        self._similarity_panel.setVisible(True)
+        self._refresh_button_styles()
+        self._refresh_title()
+        self._refresh_plot()
+        self._refresh_similarity_panel()
+
+    def _on_find_similarity_clicked(self):
+        if not self._sample_speakers:
+            return
+        self._similarity_results = rank_sample_speakers(
+            self._entity.clip, self._sample_speakers
+        )
+        self._similarity_ready = True
+        self._similarity_btn.setEnabled(True)
+        self._on_similarity_clicked()
+
     def _refresh_button_styles(self):
         is_target = self._active_view == self.VIEW_TARGET
         is_sample = self._active_view == self.VIEW_SAMPLE
         self._target_speaker_btn.setStyleSheet(self._ACTIVE_BTN_STYLE if is_target else "")
         self._sample_speakers_btn.setStyleSheet(self._ACTIVE_BTN_STYLE if is_sample else "")
+        self._similarity_btn.setStyleSheet(
+            self._ACTIVE_BTN_STYLE if self._active_view == self.VIEW_SIMILARITY else ""
+        )
 
     # ------------------------------------------------------------------
     # Dropdown (list of this tab's added sample speakers)
@@ -245,6 +294,7 @@ class VoiceEntityView(QWidget):
             return
         self._sample_speakers.append(entity)
         self._selected_sample_speaker = entity
+        self._reset_similarity()
 
         if self._dropdown_visible:
             self._populate_dropdown()
@@ -264,6 +314,7 @@ class VoiceEntityView(QWidget):
         self._sample_speakers = [
             speaker for speaker in self._sample_speakers if speaker not in to_delete
         ]
+        self._reset_similarity()
 
         if removed_current:
             self._selected_sample_speaker = None
@@ -279,9 +330,61 @@ class VoiceEntityView(QWidget):
     # Title + plot
     # ------------------------------------------------------------------
 
+    def _reset_similarity(self):
+        self._similarity_results = []
+        self._similarity_ready = False
+        self._similarity_btn.setEnabled(False)
+        self._find_similarity_btn.setEnabled(bool(self._sample_speakers))
+        if self._active_view == self.VIEW_SIMILARITY:
+            self._active_view = self.VIEW_TARGET
+            self._similarity_panel.setVisible(False)
+            self._sample_actions.setVisible(True)
+            self._refresh_button_styles()
+            self._refresh_title()
+            self._refresh_plot()
+
+    def _refresh_similarity_panel(self):
+        while self._similarity_layout.count():
+            item = self._similarity_layout.takeAt(0)
+            if item.widget() is not None:
+                item.widget().deleteLater()
+
+        self._add_similarity_section("Target Speaker", [(self._entity, None)])
+        if not self._similarity_results:
+            return
+        best_score = self._similarity_results[0][1]
+        nearest = [
+            result for result in self._similarity_results
+            if np.isclose(result[1], best_score, rtol=1e-5, atol=1e-8)
+        ]
+        self._add_similarity_section("Nearest Sample Speaker", nearest)
+
+    def _add_similarity_section(self, title, rows):
+        self._similarity_layout.addWidget(QLabel(title))
+        for entity, score in rows:
+            row = QFrame()
+            row_layout = QGridLayout(row)
+            row_layout.setContentsMargins(8, 4, 8, 4)
+            name = QLabel(entity.name)
+            if score is not None:
+                name.setToolTip(f"Average quantization distortion: {score:.6g}")
+            play = QPushButton("Play")
+            play.clicked.connect(lambda checked=False, item=entity: self._play_entity(item))
+            row_layout.addWidget(name, 0, 0)
+            row_layout.addWidget(play, 0, 1)
+            self._similarity_layout.addWidget(row)
+
+    @staticmethod
+    def _play_entity(entity):
+        signal = entity.clip.average_channel_signal()
+        sd.stop()
+        sd.play(signal.samples.astype(np.float32), signal.sample_rate)
+
     def _refresh_title(self):
         if self._active_view == self.VIEW_TARGET:
             self._title_label.setText(self._entity.name)
+        elif self._active_view == self.VIEW_SIMILARITY:
+            self._title_label.setText("Speaker Similarity")
         else:
             if self._selected_sample_speaker is not None:
                 self._title_label.setText(self._selected_sample_speaker.name)
