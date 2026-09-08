@@ -707,11 +707,10 @@ class WorkspacePage(QWidget):
         # workspace that just happens to have zero folders/entities.
         self._no_workspace_label = QLabel("No Workspace")
         self._no_workspace_label.setAlignment(Qt.AlignCenter)
-        # palette(mid) reads too faint against the sidebar's light
-        # palette(base) background — use a fixed, higher-contrast gray
-        # instead so the placeholder text stays clearly legible there.
+        # Keep the empty-state label readable against the light sidebar
+        # background in both the workspace and voice-recognition shells.
         self._no_workspace_label.setStyleSheet(
-            "color: #57606a; font-style: italic; padding: 24px 0;"
+            "color: white; font-style: italic; padding: 24px 0;"
         )
         sidebar_layout.addWidget(self._no_workspace_label)
 
