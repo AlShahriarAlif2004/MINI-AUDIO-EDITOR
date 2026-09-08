@@ -409,6 +409,7 @@ class WaveformPlayer(QWidget):
         channel_index=None,       # None = Overall plot
         is_driver: bool = False,
         show_markers: bool = True,
+        show_clip_button: bool = True,
         parent=None,
     ):
         super().__init__(parent)
@@ -420,6 +421,7 @@ class WaveformPlayer(QWidget):
         self._entity = entity
         self._channel_index = channel_index
         self._show_markers = show_markers
+        self._show_clip_button = show_clip_button
 
         self._start_time = float(times[0]) if len(times) else 0.0
         self._end_time = float(times[-1]) if len(times) else 0.0
@@ -620,6 +622,7 @@ class WaveformPlayer(QWidget):
 
         layout.addLayout(controls)
         self._update_button_visibility()
+        self._update_clip_related_visibility()
 
         if not self._show_markers:
             # Used for the Previous/Filtered preview pairs shown inside the
@@ -1498,7 +1501,12 @@ class WaveformPlayer(QWidget):
             self._selection_region.setVisible(True)
 
     def _update_clip_related_visibility(self):
-        self._clip_btn.setVisible(not self._clip_mode and not self._edit_mode and not self._tool_mode)
+        self._clip_btn.setVisible(
+            self._show_clip_button
+            and not self._clip_mode
+            and not self._edit_mode
+            and not self._tool_mode
+        )
         self._divide_btn.setVisible(self._clip_mode)
         self._cancel_btn.setVisible(self._clip_mode)
 

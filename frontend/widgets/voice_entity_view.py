@@ -1,15 +1,19 @@
 import numpy as np
+from PySide6.QtCore import Qt, Signal
 from PySide6.QtWidgets import (
-    QWidget,
-    QVBoxLayout,
+    QDialog,
     QHBoxLayout,
+    QLabel,
+    QListWidget,
+    QListWidgetItem,
     QPushButton,
-    QToolButton,
-    QMenu,
+    QVBoxLayout,
+    QWidget,
 )
-from PySide6.QtCore import Signal
 
-from backend.workspace_model import Entity
+from backend.workspace_model import Entity, Workspace
+from frontend.dialogs.add_sample_speaker_dialog import AddSampleSpeakerDialog
+from frontend.dialogs.delete_sample_speaker_dialog import DeleteSampleSpeakerDialog
 from frontend.widgets.waveform_player import PlaybackGroup, WaveformPlayer
 
 
@@ -18,18 +22,30 @@ class VoiceEntityView(QWidget):
     Shown when an entity tab is open in Voice Recognition mode.
 
     Unlike EntityPlotView (per-channel plots + the full edit-op
-    toolbox), this is a read-only, playback-only view: a single plot of
-    the sample-by-sample average across every channel, driven by the
-    same WaveformPlayer used elsewhere. It gets Play/Pause/Reset and the
-    Clip marker control "for free" in their default (File-mode) state,
-    since Voice Recognition mode has no Edit/Tool menu and never calls
-    set_edit_mode(True) / set_tool_mode(True) on it — those controls
-    stay hidden automatically.
+    toolbox), this is a read-only, playback-only view driven by the same
+    WaveformPlayer used elsewhere, with no Clip control and no white
+    boundary/division lines (this is a listen-only speaker-recognition
+    view, not an editing surface).
 
-    Above the plot: three buttons for the speaker-recognition workflow.
-    Only "Target Speaker" — this averaged waveform — is functional
-    today; "Sample Speakers" is a dropdown with no entries yet, and
-    "Similarity" is a disabled placeholder for a later feature.
+    Above the plot sit three buttons for the speaker-recognition workflow:
+
+      - "Target Speaker" — the entity's own sample-by-sample averaged
+        waveform. Selected by default.
+      - "Sample Speakers" — a per-tab list of other entities picked as
+        comparison samples. The first click on this button (while Target
+        Speaker is active) switches to it; a second click, while it's
+        already active, expands/collapses a dropdown list of the
+        speakers added so far (shown even when empty, so it's clear
+        there's nothing there yet). Selecting an entry shows that
+        speaker's averaged waveform. "Add Sample Speaker" / "Delete
+        Sample Speaker" live under the dropdown, right-aligned, and are
+        only shown while this view is active.
+      - "Similarity" — disabled placeholder for a later feature.
+
+    A title label above the plot names whichever waveform is currently
+    shown: the target entity's name, the selected sample speaker's name,
+    or "No selected sample speaker" when the Sample Speakers view is
+    active but nothing (yet) is selected.
     """
 
     entity_modified = Signal()
@@ -37,39 +53,55 @@ class VoiceEntityView(QWidget):
     _ACTIVE_BTN_STYLE = (
         "QPushButton { background-color: #2f81f7; color: white; font-weight: 600; }"
     )
+    _BTN_MIN_SIZE = (150, 34)   # (width, height) — a bit wider than the Qt default
 
-    def __init__(self, entity: Entity, parent=None):
+    VIEW_TARGET = "target"
+    VIEW_SAMPLE = "sample"
+
+    def __init__(self, entity: Entity, workspace: Workspace | None = None, parent=None):
         super().__init__(parent)
         self._entity = entity
+        self._workspace = workspace
         self._group = PlaybackGroup.get_instance()
-        self._player = None
+
+        self._player: WaveformPlayer | None = None   # whichever waveform is currently shown
+        self._active_view = self.VIEW_TARGET
+        self._sample_speakers: list[Entity] = []      # per-tab, not persisted
+        self._selected_sample_speaker: Entity | None = None
+        self._dropdown_visible = False
+
         self._build_ui()
+        self._refresh_button_styles()
+        self._refresh_title()
+        self._refresh_plot()
 
     @property
     def entity(self) -> Entity:
         return self._entity
 
+    # ------------------------------------------------------------------
+    # UI construction
+    # ------------------------------------------------------------------
+
     def _build_ui(self):
         layout = QVBoxLayout(self)
         layout.setContentsMargins(12, 12, 12, 12)
-        layout.setSpacing(12)
+        layout.setSpacing(8)
 
         # ---- Target Speaker / Sample Speakers / Similarity ----
         button_row = QHBoxLayout()
         button_row.setSpacing(6)
 
         self._target_speaker_btn = QPushButton("Target Speaker")
-        self._target_speaker_btn.setStyleSheet(self._ACTIVE_BTN_STYLE)
-        self._target_speaker_btn.setEnabled(False)  # already the (only) active view
-
-        self._sample_speakers_btn = QToolButton()
-        self._sample_speakers_btn.setText("Sample Speakers")
-        self._sample_speakers_btn.setPopupMode(QToolButton.InstantPopup)
-        self._sample_speakers_menu = QMenu(self._sample_speakers_btn)
-        self._sample_speakers_btn.setMenu(self._sample_speakers_menu)  # empty for now
-
+        self._sample_speakers_btn = QPushButton("Sample Speakers")
         self._similarity_btn = QPushButton("Similarity")
         self._similarity_btn.setEnabled(False)  # inactive placeholder
+
+        for btn in (self._target_speaker_btn, self._sample_speakers_btn, self._similarity_btn):
+            btn.setMinimumSize(*self._BTN_MIN_SIZE)
+
+        self._target_speaker_btn.clicked.connect(self._on_target_speaker_clicked)
+        self._sample_speakers_btn.clicked.connect(self._on_sample_speakers_clicked)
 
         button_row.addWidget(self._target_speaker_btn)
         button_row.addWidget(self._sample_speakers_btn)
@@ -77,8 +109,183 @@ class VoiceEntityView(QWidget):
         button_row.addStretch()
         layout.addLayout(button_row)
 
-        # ---- single averaged-channel plot ----
-        averaged_signal = self._entity.clip.average_channel_signal()
+        # ---- Sample Speakers panel: dropdown + Add/Delete (only when active) ----
+        self._sample_panel = QWidget()
+        panel_layout = QVBoxLayout(self._sample_panel)
+        panel_layout.setContentsMargins(0, 0, 0, 0)
+        panel_layout.setSpacing(4)
+
+        self._dropdown_list = QListWidget()
+        self._dropdown_list.setMaximumHeight(120)
+        self._dropdown_list.itemClicked.connect(self._on_dropdown_item_clicked)
+        self._dropdown_list.setVisible(False)
+        panel_layout.addWidget(self._dropdown_list)
+
+        action_row = QHBoxLayout()
+        action_row.addStretch()
+        action_col = QVBoxLayout()
+        self._add_sample_btn = QPushButton("Add Sample Speaker")
+        self._delete_sample_btn = QPushButton("Delete Sample Speaker")
+        self._add_sample_btn.clicked.connect(self._on_add_sample_speaker_clicked)
+        self._delete_sample_btn.clicked.connect(self._on_delete_sample_speaker_clicked)
+        action_col.addWidget(self._add_sample_btn)
+        action_col.addWidget(self._delete_sample_btn)
+        action_row.addLayout(action_col)
+        panel_layout.addLayout(action_row)
+
+        self._sample_panel.setVisible(False)
+        layout.addWidget(self._sample_panel)
+
+        # ---- title above the plot ----
+        self._title_label = QLabel("")
+        self._title_label.setStyleSheet("font-size: 15px; font-weight: 600;")
+        layout.addWidget(self._title_label)
+
+        # ---- plot area (swapped between target / sample speaker waveforms) ----
+        self._plot_container = QWidget()
+        self._plot_layout = QVBoxLayout(self._plot_container)
+        self._plot_layout.setContentsMargins(0, 0, 0, 0)
+        layout.addWidget(self._plot_container)
+        layout.addStretch()
+
+    # ------------------------------------------------------------------
+    # Target Speaker / Sample Speakers toggle
+    # ------------------------------------------------------------------
+
+    def _on_target_speaker_clicked(self):
+        if self._active_view == self.VIEW_TARGET:
+            return
+        self._active_view = self.VIEW_TARGET
+        self._set_dropdown_visible(False)
+        self._sample_panel.setVisible(False)
+        self._refresh_button_styles()
+        self._refresh_title()
+        self._refresh_plot()
+
+    def _on_sample_speakers_clicked(self):
+        if self._active_view != self.VIEW_SAMPLE:
+            self._active_view = self.VIEW_SAMPLE
+            self._sample_panel.setVisible(True)
+            self._set_dropdown_visible(False)
+            self._refresh_button_styles()
+            self._refresh_title()
+            self._refresh_plot()
+        else:
+            # Already active — toggle the dropdown open/closed instead.
+            self._set_dropdown_visible(not self._dropdown_visible)
+
+    def _refresh_button_styles(self):
+        is_target = self._active_view == self.VIEW_TARGET
+        is_sample = self._active_view == self.VIEW_SAMPLE
+        self._target_speaker_btn.setStyleSheet(self._ACTIVE_BTN_STYLE if is_target else "")
+        self._sample_speakers_btn.setStyleSheet(self._ACTIVE_BTN_STYLE if is_sample else "")
+
+    # ------------------------------------------------------------------
+    # Dropdown (list of this tab's added sample speakers)
+    # ------------------------------------------------------------------
+
+    def _set_dropdown_visible(self, visible: bool):
+        self._dropdown_visible = visible
+        if visible:
+            self._populate_dropdown()
+        self._dropdown_list.setVisible(visible)
+
+    def _populate_dropdown(self):
+        self._dropdown_list.clear()
+        if not self._sample_speakers:
+            placeholder = QListWidgetItem("No sample speakers added yet")
+            placeholder.setFlags(Qt.NoItemFlags)
+            self._dropdown_list.addItem(placeholder)
+            return
+        for speaker in self._sample_speakers:
+            item = QListWidgetItem(speaker.name)
+            item.setData(Qt.UserRole, speaker)
+            self._dropdown_list.addItem(item)
+
+    def _on_dropdown_item_clicked(self, item: QListWidgetItem):
+        speaker = item.data(Qt.UserRole)
+        if speaker is None:
+            return
+        self._selected_sample_speaker = speaker
+        self._set_dropdown_visible(False)
+        self._refresh_title()
+        self._refresh_plot()
+
+    # ------------------------------------------------------------------
+    # Add / Delete sample speaker
+    # ------------------------------------------------------------------
+
+    def _on_add_sample_speaker_clicked(self):
+        dialog = AddSampleSpeakerDialog(self._workspace, self)
+        if dialog.exec() != QDialog.DialogCode.Accepted:
+            return
+        entity = dialog.selected_entity()
+        if entity is None:
+            return
+
+        if entity not in self._sample_speakers:
+            self._sample_speakers.append(entity)
+        self._selected_sample_speaker = entity
+
+        if self._dropdown_visible:
+            self._populate_dropdown()
+
+        self._refresh_title()
+        self._refresh_plot()
+
+    def _on_delete_sample_speaker_clicked(self):
+        dialog = DeleteSampleSpeakerDialog(self._sample_speakers, self)
+        if dialog.exec() != QDialog.DialogCode.Accepted:
+            return
+        to_delete = dialog.selected_entities()
+        if not to_delete:
+            return
+
+        removed_current = self._selected_sample_speaker in to_delete
+        self._sample_speakers = [
+            speaker for speaker in self._sample_speakers if speaker not in to_delete
+        ]
+
+        if removed_current:
+            self._selected_sample_speaker = None
+
+        if self._dropdown_visible:
+            self._populate_dropdown()
+
+        self._refresh_title()
+        if removed_current:
+            self._refresh_plot()
+
+    # ------------------------------------------------------------------
+    # Title + plot
+    # ------------------------------------------------------------------
+
+    def _refresh_title(self):
+        if self._active_view == self.VIEW_TARGET:
+            self._title_label.setText(self._entity.name)
+        else:
+            if self._selected_sample_speaker is not None:
+                self._title_label.setText(self._selected_sample_speaker.name)
+            else:
+                self._title_label.setText("No selected sample speaker")
+
+    def _refresh_plot(self):
+        if self._player is not None:
+            self._player.force_idle()
+            self._plot_layout.removeWidget(self._player)
+            self._player.deleteLater()
+            self._player = None
+
+        shown_entity = None
+        if self._active_view == self.VIEW_TARGET:
+            shown_entity = self._entity
+        elif self._selected_sample_speaker is not None:
+            shown_entity = self._selected_sample_speaker
+
+        if shown_entity is None:
+            return
+
+        averaged_signal = shown_entity.clip.average_channel_signal()
         times = self._time_axis(averaged_signal)
 
         self._player = WaveformPlayer(
@@ -87,13 +294,18 @@ class VoiceEntityView(QWidget):
             sample_rate=averaged_signal.sample_rate,
             audio_data=averaged_signal.samples.astype(np.float32),
             group=self._group,
-            entity=self._entity,
+            entity=shown_entity,
             channel_index=None,
             is_driver=True,
+            show_markers=False,
+            show_clip_button=False,
         )
         self._player.marker_added.connect(self.entity_modified.emit)
-        layout.addWidget(self._player)
-        layout.addStretch()
+        self._plot_layout.addWidget(self._player)
+
+    # ------------------------------------------------------------------
+    # Lifecycle hooks (called by VoiceRecognitionPage)
+    # ------------------------------------------------------------------
 
     def shutdown(self):
         """Called when the tab is closed — stop playback, mirroring

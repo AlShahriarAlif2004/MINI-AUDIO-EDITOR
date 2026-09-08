@@ -425,7 +425,7 @@ class VoiceRecognitionPage(QWidget):
         index = self._tab_bar.addTab(entity.name)
         self._tab_bar.setTabData(index, entity.id)
 
-        entity_view = VoiceEntityView(entity)
+        entity_view = VoiceEntityView(entity, self._workspace)
         entity_view.entity_modified.connect(self._on_entity_modified)
         self._content_stack.addWidget(entity_view)
         self._tab_bar.setCurrentIndex(index)
