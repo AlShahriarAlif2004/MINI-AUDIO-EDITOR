@@ -1,5 +1,7 @@
 import numpy as np
 
+from backend.fft_algorithms import BluesteinFFT
+
 class Discrete_Signal:
     """
     Represents a single-channel (mono) discrete-time audio signal.
@@ -297,14 +299,6 @@ class Discrete_Signal:
             self.start_index
         )
 
-    def fft(self):
-        """
-        Placeholder FFT wrapper — delegates to NumPy for now. Kept as a
-        separate method so it can later be swapped for a from-scratch
-        implementation without touching any of its callers.
-        """
-        return np.fft.fft(self.samples)
-
     def remove_noise(self, noise_start_index=None, noise_end_index=None,
                       frame_size=1024, noise_reference=None):
         """
@@ -358,12 +352,12 @@ class Discrete_Signal:
             noise_spectra = []
             frame_start = 0
             while frame_start + frame_size <= ref_padded_len:
-                spectrum = Discrete_Signal(ref_framed(frame_start), self.sample_rate).fft()
+                spectrum = BluesteinFFT.fft(ref_framed(frame_start))
                 noise_spectra.append(np.abs(spectrum))
                 frame_start += hop_size
 
             if not noise_spectra:
-                spectrum = Discrete_Signal(ref_framed(0), self.sample_rate).fft()
+                spectrum = BluesteinFFT.fft(ref_framed(0))
                 noise_spectra.append(np.abs(spectrum))
 
             noise_profile = np.mean(noise_spectra, axis=0)
@@ -388,14 +382,14 @@ class Discrete_Signal:
             while frame_start + frame_size <= padded_len:
                 frame_end = frame_start + frame_size
                 if frame_end > local_noise_start and frame_start <= local_noise_end:
-                    spectrum = Discrete_Signal(framed(frame_start), self.sample_rate).fft()
+                    spectrum = BluesteinFFT.fft(framed(frame_start))
                     noise_spectra.append(np.abs(spectrum))
                 frame_start += hop_size
 
             if not noise_spectra:
                 # Range shorter than one frame — sample a single frame around it.
                 anchor = max(0, min(padded_len - frame_size, local_noise_start))
-                spectrum = Discrete_Signal(framed(anchor), self.sample_rate).fft()
+                spectrum = BluesteinFFT.fft(framed(anchor))
                 noise_spectra.append(np.abs(spectrum))
 
             noise_profile = np.mean(noise_spectra, axis=0)
@@ -405,7 +399,7 @@ class Discrete_Signal:
         frame_start = 0
         while frame_start + frame_size <= padded_len:
             frame = framed(frame_start)
-            spectrum = Discrete_Signal(frame, self.sample_rate).fft()
+            spectrum = BluesteinFFT.fft(frame)
 
             magnitude = np.abs(spectrum)
             phase = np.angle(spectrum)
@@ -413,7 +407,7 @@ class Discrete_Signal:
             cleaned_magnitude = np.maximum(magnitude - noise_profile, 0.0)
             cleaned_spectrum = cleaned_magnitude * np.exp(1j * phase)
 
-            cleaned_frame = np.fft.ifft(cleaned_spectrum).real
+            cleaned_frame = BluesteinFFT.ifft(cleaned_spectrum).real
             output[frame_start:frame_start + frame_size] += cleaned_frame
 
             frame_start += hop_size
