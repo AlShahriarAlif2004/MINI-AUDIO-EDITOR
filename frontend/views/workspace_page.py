@@ -770,11 +770,11 @@ class WorkspacePage(QWidget):
             for label in labels:
                 spec = _tool_specs_by_label.get(label)
                 btn = QPushButton(label)
+                btn.setEnabled(False)
                 tool_options_layout.addWidget(btn)
                 self._tool_buttons[label] = btn
 
                 if spec is None:
-                    btn.setEnabled(False)   # not implemented yet
                     continue
 
                 if spec.get("key") == "echo":
@@ -842,6 +842,7 @@ class WorkspacePage(QWidget):
             }
         """)
         editor_layout.addWidget(self._tab_bar)
+        self._refresh_tool_buttons()
 
         self._content_stack = QStackedWidget()
         self._empty_label = QLabel("No entity selected")
@@ -1091,6 +1092,14 @@ class WorkspacePage(QWidget):
     def _refresh_tab_bar_lock(self):
         locked = any(entry.active for entry in self._ops.values())
         self._tab_bar.setEnabled(not locked)
+
+    def _refresh_tool_buttons(self):
+        has_selected_tab = self._tab_bar.currentIndex() >= 0
+        implemented_labels = {
+            spec["label"] for spec in self._TOOL_OP_SPECS
+        }
+        for label, btn in self._tool_buttons.items():
+            btn.setEnabled(has_selected_tab and label in implemented_labels)
 
     def _on_segment_selected(self, entity, channel_index, start, end):
         # Update label to include the time range
@@ -1404,6 +1413,7 @@ class WorkspacePage(QWidget):
         self._cancel_all_ops()
         self._force_stop_active_playback()
         self._clear_all_plot_selections()
+        self._refresh_tool_buttons()
 
         if index < 0:
             self._content_stack.setCurrentWidget(self._empty_label)
