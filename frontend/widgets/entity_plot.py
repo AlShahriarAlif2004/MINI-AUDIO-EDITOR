@@ -1252,7 +1252,6 @@ class EntityPlotView(QWidget):
         self._reset_echo_state()
         self._lock_selection(False)
         self.clear_all_selection()
-        self.entity_modified.emit()
         self.entity_echo_added.emit()
 
     def _reset_echo_state(self):
