@@ -246,21 +246,22 @@ class Discrete_Signal:
         )
 
     def convolution(self, other):
+        """
+        Compute convolution using FFT (fast convolution).
+        Much more efficient than naive O(n²) approach: O(n log n).
+        """
         other = other.resample(self.sample_rate)
-    
-        result = None
-    
-        for i, value in enumerate(other.samples):
-            global_index = other.start_index + i
-    
-            term = self.shift(global_index).vertical_scale(value)
-    
-            if result is None:
-                result = term
-            else:
-                result = result.add(term)
-    
-        return result
+
+        # Use FFT-based convolution for efficiency
+        self_fft = np.fft.fft(self.samples, n=len(self.samples) + len(other.samples) - 1)
+        other_fft = np.fft.fft(other.samples, n=len(self.samples) + len(other.samples) - 1)
+        
+        result_samples = np.fft.ifft(self_fft * other_fft).real
+        
+        # The start index of the convolution result
+        result_start_index = self.start_index + other.start_index
+        
+        return Discrete_Signal(result_samples, self.sample_rate, result_start_index)
 
     def fade_in(self, start_index=None, end_index=None):
         if start_index is None:
@@ -454,3 +455,60 @@ class Discrete_Signal:
             self.sample_rate,
             self.start_index
         )
+
+    def echo(self, occurrence, delay, decay):
+        """
+        Apply echo effect using convolution with an impulse response.
+        
+        Parameters:
+          - occurrence: Number of echo repetitions (int >= 1)
+          - delay: Time between echoes in seconds (float > 0)
+          - decay: Amplitude decay factor per echo (0.0 <= decay <= 1.0)
+                   Represents the fraction lost; remaining amplitude = (1-decay)
+        
+        The impulse response h is constructed as:
+          h[0] = 1.0
+          h[d*sr] = (1-decay)
+          h[2*d*sr] = (1-decay)^2
+          ...
+          h[(occurrence-1)*d*sr] = (1-decay)^(occurrence-1)
+        
+        where sr is the sample rate and d*sr is the delay in samples.
+        
+        Example: delay=5 samples, occurrence=3, decay=0.2:
+          h[0] = 1.0
+          h[5] = 0.8
+          h[10] = 0.64
+        """
+        occurrence = int(occurrence)
+        delay = float(delay)
+        decay = float(decay)
+
+        if occurrence < 1:
+            raise ValueError("occurrence must be at least 1 in echo/Discrete_Signal.")
+        if delay <= 0:
+            raise ValueError("delay must be positive in echo/Discrete_Signal.")
+        if decay < 0.0 or decay > 1.0:
+            raise ValueError("decay must be between 0.0 and 1.0 in echo/Discrete_Signal.")
+
+        # Convert delay from seconds to samples
+        delay_samples = int(delay * self.sample_rate)
+        if delay_samples < 1:
+            delay_samples = 1
+
+        # Total length of the impulse response (in samples)
+        total_length = (occurrence - 1) * delay_samples + 1
+
+        # Construct impulse response: h[0]=1, h[delay_samples]=(1-decay), etc.
+        h_samples = np.zeros(total_length)
+        h_samples[0] = 1.0
+        remaining = 1.0 - decay  # Amplitude remaining per echo
+        for i in range(1, occurrence):
+            idx = i * delay_samples
+            h_samples[idx] = remaining ** i
+
+        # Create the impulse response signal and convolve
+        h_signal = Discrete_Signal(h_samples, self.sample_rate, start_index=0)
+        result = self.convolution(h_signal)
+
+        return result

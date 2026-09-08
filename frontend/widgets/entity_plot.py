@@ -39,6 +39,7 @@ class EntityPlotView(QWidget):
     entity_extracted = Signal()
     entity_divisor_deleted = Signal()
     entity_noise_removed = Signal()
+    entity_echo_added = Signal()
     segment_selected = Signal(object, object, float, float)
     segment_deselected = Signal()
     """
@@ -82,6 +83,9 @@ class EntityPlotView(QWidget):
         self._concat_sources = []
         self._concat_extra_channel_samples = None
         self._delete_divisor_active = False
+        
+        self._echo_original_clip = None      # clip snapshot before echo is applied
+        self._echo_parameters = None         # (occurrence, delay, decay) tuple
 
         self._noise_removal_active = False   # True for either phase (selection or filtered)
         self._noise_filtered = False         # True once Filter has been clicked
@@ -1182,8 +1186,79 @@ class EntityPlotView(QWidget):
         self._entity.clip = new_clip
 
     # ------------------------------------------------------------------
-    # Concatenate
+    # Echo
     # ------------------------------------------------------------------
+    # Tool operation: applies echo effect to the entire entity clip with
+    # live preview. As parameters (occurrence, delay, decay) change in the
+    # sidebar, the preview updates instantly showing both original and
+    # echoed versions in the waveform players.
+
+    def begin_echo(self) -> bool:
+        """Start echo preview mode."""
+        if self._echo_original_clip is not None:
+            return False
+
+        clip = self._entity.clip
+        self._echo_original_clip = clip.copy()
+        self._echo_parameters = (2, 1.0, 0.0)  # default: occurrence=2, delay=1s, decay=0
+        self._lock_selection(True)
+        return True
+
+    def update_echo_preview(self, occurrence: int, delay: float, decay: float):
+        """Update the preview as echo parameters change. Shows both original
+        and echoed versions overlaid in the waveform players."""
+        if self._echo_original_clip is None:
+            return
+
+        self._echo_parameters = (occurrence, delay, decay)
+        
+        try:
+            # Apply the same operation to all channels at once so their
+            # resulting lengths remain identical.
+            preview_clip = self._echo_original_clip.apply(
+                "echo", occurrence, delay, decay
+            )
+            
+            # Update entity with preview clip
+            self._entity.clip = preview_clip
+            # Emit signal to trigger UI refresh
+            self.entity_echo_added.emit()
+        except Exception as e:
+            # If parameters are invalid, keep original
+            print(f"Echo preview error: {e}")
+            if self._entity.clip != self._echo_original_clip:
+                self._entity.clip = self._echo_original_clip.copy()
+                self.entity_echo_added.emit()
+
+    def apply_echo(self):
+        """Apply the echo effect to the entity."""
+        if self._echo_original_clip is None or self._echo_parameters is None:
+            return
+
+        # Clip already has preview, just finalize it
+        self._reset_echo_state()
+        self._lock_selection(False)
+        self.clear_all_selection()
+        self.entity_modified.emit()
+        self.entity_echo_added.emit()
+
+    def cancel_echo(self):
+        """Cancel the echo effect and restore original."""
+        if self._echo_original_clip is None:
+            return
+        
+        # Restore original clip
+        self._entity.clip = self._echo_original_clip.copy()
+        self._reset_echo_state()
+        self._lock_selection(False)
+        self.clear_all_selection()
+        self.entity_modified.emit()
+        self.entity_echo_added.emit()
+
+    def _reset_echo_state(self):
+        """Reset echo-related state variables."""
+        self._echo_original_clip = None
+        self._echo_parameters = None
     # Only valid when the Overall plot is selected (enforced by the caller
     # via _OVERALL_ONLY_OPS). Each chosen source is a division-bounded
     # *segment* of some entity's Overall plot (not necessarily the whole
@@ -1390,6 +1465,7 @@ class EntityPlotView(QWidget):
         self.cancel_reverse()
         self.cancel_fade_in()
         self.cancel_fade_out()
+        self.cancel_echo()
         self.cancel_concatenate()
         for player in self._players:
             player.force_idle()

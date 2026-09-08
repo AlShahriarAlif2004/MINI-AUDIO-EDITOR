@@ -1,5 +1,5 @@
 from PySide6.QtCore import Qt, Signal
-from PySide6.QtGui import QDoubleValidator
+from PySide6.QtGui import QDoubleValidator, QIntValidator
 from PySide6.QtWidgets import (
     QDialog,
     QFileDialog,
@@ -136,6 +136,190 @@ class _FactorInput(QWidget):
 
 
 # ---------------------------------------------------------------------------
+# Echo parameters input: three fields for occurrence, delay, decay
+# ---------------------------------------------------------------------------
+
+class _EchoParametersInput(QWidget):
+    """Three input fields for echo effect parameters with +/- spinners.
+    Emits parameters_changed(occurrence, delay, decay) on every change."""
+
+    parameters_changed = Signal(int, float, float)
+
+    def __init__(self, default_delay: float, parent=None):
+        super().__init__(parent)
+        self._occurrence = 2
+        self._delay = default_delay
+        self._decay = 0.0
+        self._build(default_delay)
+
+    def _build(self, default_delay: float):
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(4)
+
+        # Occurrence field with +/- buttons
+        occ_row = QHBoxLayout()
+        occ_label = QLabel("Occurrence:")
+        occ_label.setFixedWidth(80)
+        
+        btn_style = (
+            "QPushButton {"
+            "  min-width: 24px; max-width: 24px;"
+            "  min-height: 24px; max-height: 24px;"
+            "  font-size: 13px; font-weight: 700;"
+            "  border: 1px solid palette(mid);"
+            "  background: palette(button);"
+            "}"
+            "QPushButton:hover  { background: palette(light); }"
+            "QPushButton:pressed{ background: palette(dark);  }"
+        )
+        
+        self._occ_dec_btn = QPushButton("−")
+        self._occ_dec_btn.setStyleSheet(btn_style)
+        self._occ_dec_btn.setFixedWidth(24)
+        self._occ_dec_btn.setFixedHeight(24)
+        self._occ_dec_btn.clicked.connect(self._decrement_occurrence)
+        
+        self._occurrence_input = QLineEdit(str(self._occurrence))
+        self._occurrence_input.setValidator(QIntValidator(1, 1000, self._occurrence_input))
+        self._occurrence_input.setMaximumWidth(60)
+        self._occurrence_input.setFixedHeight(24)
+        self._occurrence_input.textChanged.connect(self._on_occurrence_changed)
+        
+        self._occ_inc_btn = QPushButton("+")
+        self._occ_inc_btn.setStyleSheet(btn_style)
+        self._occ_inc_btn.setFixedWidth(24)
+        self._occ_inc_btn.setFixedHeight(24)
+        self._occ_inc_btn.clicked.connect(self._increment_occurrence)
+        
+        occ_row.addWidget(occ_label)
+        occ_row.addWidget(self._occ_dec_btn)
+        occ_row.addWidget(self._occurrence_input)
+        occ_row.addWidget(self._occ_inc_btn)
+        occ_row.addStretch()
+        layout.addLayout(occ_row)
+
+        # Delay field
+        delay_row = QHBoxLayout()
+        delay_label = QLabel("Delay (s):")
+        delay_label.setFixedWidth(80)
+        self._delay_input = QLineEdit(f"{default_delay:.4f}")
+        delay_validator = QDoubleValidator(0.001, 100.0, 4, self._delay_input)
+        delay_validator.setNotation(QDoubleValidator.StandardNotation)
+        self._delay_input.setValidator(delay_validator)
+        self._delay_input.setMaximumWidth(100)
+        self._delay_input.setFixedHeight(24)
+        self._delay_input.textChanged.connect(self._on_delay_changed)
+        delay_row.addWidget(delay_label)
+        delay_row.addWidget(self._delay_input)
+        delay_row.addStretch()
+        layout.addLayout(delay_row)
+
+        # Decay field with +/- buttons
+        decay_row = QHBoxLayout()
+        decay_label = QLabel("Decay:")
+        decay_label.setFixedWidth(80)
+        
+        self._decay_dec_btn = QPushButton("−")
+        self._decay_dec_btn.setStyleSheet(btn_style)
+        self._decay_dec_btn.setFixedWidth(24)
+        self._decay_dec_btn.setFixedHeight(24)
+        self._decay_dec_btn.clicked.connect(self._decrement_decay)
+        
+        self._decay_input = QLineEdit(f"{self._decay:.1f}")
+        decay_validator = QDoubleValidator(0.0, 1.0, 1, self._decay_input)
+        decay_validator.setNotation(QDoubleValidator.StandardNotation)
+        self._decay_input.setValidator(decay_validator)
+        self._decay_input.setMaximumWidth(60)
+        self._decay_input.setFixedHeight(24)
+        self._decay_input.textChanged.connect(self._on_decay_changed)
+        
+        self._decay_inc_btn = QPushButton("+")
+        self._decay_inc_btn.setStyleSheet(btn_style)
+        self._decay_inc_btn.setFixedWidth(24)
+        self._decay_inc_btn.setFixedHeight(24)
+        self._decay_inc_btn.clicked.connect(self._increment_decay)
+        
+        decay_row.addWidget(decay_label)
+        decay_row.addWidget(self._decay_dec_btn)
+        decay_row.addWidget(self._decay_input)
+        decay_row.addWidget(self._decay_inc_btn)
+        decay_row.addStretch()
+        layout.addLayout(decay_row)
+
+    def _decrement_occurrence(self):
+        val = max(1, self._occurrence - 1)
+        self._occurrence = val
+        self._occurrence_input.setText(str(val))
+
+    def _increment_occurrence(self):
+        val = min(1000, self._occurrence + 1)
+        self._occurrence = val
+        self._occurrence_input.setText(str(val))
+
+    def _decrement_decay(self):
+        val = max(0.0, round(self._decay - 0.1, 1))
+        self._decay = val
+        self._decay_input.setText(f"{val:.1f}")
+
+    def _increment_decay(self):
+        val = min(1.0, round(self._decay + 0.1, 1))
+        self._decay = val
+        self._decay_input.setText(f"{val:.1f}")
+
+    def _on_occurrence_changed(self):
+        try:
+            val = int(self._occurrence_input.text())
+            if val >= 1:
+                self._occurrence = val
+                self.parameters_changed.emit(self._occurrence, self._delay, self._decay)
+        except ValueError:
+            pass
+
+    def _on_delay_changed(self):
+        try:
+            val = float(self._delay_input.text())
+            if val > 0:
+                self._delay = val
+                self.parameters_changed.emit(self._occurrence, self._delay, self._decay)
+        except ValueError:
+            pass
+
+    def _on_decay_changed(self):
+        try:
+            val = float(self._decay_input.text())
+            if 0.0 <= val <= 1.0:
+                self._decay = round(val, 1)
+                self.parameters_changed.emit(self._occurrence, self._delay, self._decay)
+        except ValueError:
+            pass
+
+    def set_parameters(self, occurrence: int, delay: float, decay: float):
+        """Set all parameters at once (used for initial setup)."""
+        self._occurrence = occurrence
+        self._delay = delay
+        self._decay = round(decay, 1)
+        self._occurrence_input.blockSignals(True)
+        self._delay_input.blockSignals(True)
+        self._decay_input.blockSignals(True)
+        
+        self._occurrence_input.setText(str(occurrence))
+        self._delay_input.setText(f"{delay:.4f}")
+        self._decay_input.setText(f"{decay:.1f}")
+        
+        self._occurrence_input.blockSignals(False)
+        self._delay_input.blockSignals(False)
+        self._decay_input.blockSignals(False)
+        
+        # Emit the signal after setting
+        self.parameters_changed.emit(self._occurrence, self._delay, self._decay)
+
+    def get_parameters(self) -> tuple[int, float, float]:
+        """Return current parameters."""
+        return self._occurrence, self._delay, self._decay
+
+
+# ---------------------------------------------------------------------------
 # Per-operation runtime state (one instance per entry in _OP_SPECS)
 # ---------------------------------------------------------------------------
 
@@ -145,16 +329,19 @@ class _OpEntry:
 
     __slots__ = (
         "spec", "button", "panel", "apply_btn", "cancel_btn",
-        "factor_input", "active", "active_view",
+        "factor_input", "echo_parameters_input", "echo_parameters_slot",
+        "active", "active_view",
     )
 
-    def __init__(self, spec, button, panel, apply_btn, cancel_btn, factor_input):
+    def __init__(self, spec, button, panel, apply_btn, cancel_btn, factor_input, echo_parameters_input=None):
         self.spec = spec
         self.button = button
         self.panel = panel
         self.apply_btn = apply_btn
         self.cancel_btn = cancel_btn
         self.factor_input = factor_input
+        self.echo_parameters_input = echo_parameters_input
+        self.echo_parameters_slot = None
         self.active = False
         self.active_view = None
 
@@ -238,6 +425,10 @@ class WorkspacePage(QWidget):
              begin="begin_noise_removal", apply="apply_noise_removal", cancel="cancel_noise_removal",
              rebuild_signal="entity_noise_removed", factor=False, needs_dialog=False,
              custom_panel=True),
+        dict(key="echo", label="Add Echo",
+             begin="begin_echo", apply="apply_echo", cancel="cancel_echo",
+             rebuild_signal="entity_echo_added", factor=False, needs_dialog=False,
+             preview="update_echo_preview"),
     ]
 
     new_workspace_requested = Signal()
@@ -565,7 +756,7 @@ class WorkspacePage(QWidget):
         _TOOL_SECTIONS = [
             ("General Tools", ["Delete Divisor"]),
             ("Filtering Tools", ["Noise Removal"]),
-            ("Echo Tools", ["Add Echo", "Remove Echo"]),
+            ("Echo Tools", ["Add Echo", "Detect Echo"]),
         ]
         _tool_specs_by_label = {spec["label"]: spec for spec in self._TOOL_OP_SPECS}
 
@@ -586,13 +777,21 @@ class WorkspacePage(QWidget):
                     btn.setEnabled(False)   # not implemented yet
                     continue
 
-                if spec.get("custom_panel"):
-                    panel, apply_btn, cancel_btn, factor_input = self._build_noise_panel()
+                if spec.get("key") == "echo":
+                    # Echo panel with three parameter inputs
+                    # Default delay will be set dynamically in begin_echo
+                    panel, apply_btn, cancel_btn, echo_input = self._build_echo_panel(1.0)
+                elif spec.get("custom_panel"):
+                    panel, apply_btn, cancel_btn, echo_input = self._build_noise_panel()
+                    echo_input = None
                 else:
                     panel, apply_btn, cancel_btn, factor_input = self._build_op_panel(spec)
+                    echo_input = None
                 tool_options_layout.addWidget(panel)
 
-                entry = _OpEntry(spec, btn, panel, apply_btn, cancel_btn, factor_input)
+                entry = _OpEntry(spec, btn, panel, apply_btn, cancel_btn, 
+                                factor_input if spec.get("key") != "echo" else None,
+                                echo_input if spec.get("key") == "echo" else None)
                 self._ops[spec["key"]] = entry
 
                 key = spec["key"]
@@ -713,6 +912,31 @@ class WorkspacePage(QWidget):
         layout.addWidget(cancel_btn)
         panel.setVisible(False)
         return panel, action_btn, cancel_btn, None
+
+    def _build_echo_panel(self, default_delay: float):
+        """Echo panel: three input fields (occurrence, delay, decay) with
+        Apply/Cancel buttons. Parameters are shown vertically and update
+        preview in real time."""
+        panel = QWidget()
+        layout = QVBoxLayout(panel)
+        layout.setContentsMargins(16, 0, 0, 0)
+        layout.setSpacing(4)
+
+        # Echo parameters inputs
+        echo_input = _EchoParametersInput(default_delay)
+        layout.addWidget(echo_input)
+
+        # Apply/Cancel buttons
+        btn_row = QHBoxLayout()
+        btn_row.setSpacing(6)
+        apply_btn = QPushButton("Apply")
+        cancel_btn = QPushButton("Cancel")
+        btn_row.addWidget(apply_btn)
+        btn_row.addWidget(cancel_btn)
+        layout.addLayout(btn_row)
+
+        panel.setVisible(False)
+        return panel, apply_btn, cancel_btn, echo_input
 
     # ------------------------------------------------------------------
     # Mode switching
@@ -911,6 +1135,12 @@ class WorkspacePage(QWidget):
         entry.panel.setVisible(False)
         if entry.factor_input is not None:
             entry.factor_input.setValue(1.0)
+        if entry.echo_parameters_input is not None and entry.echo_parameters_slot is not None:
+            try:
+                entry.echo_parameters_input.parameters_changed.disconnect(entry.echo_parameters_slot)
+            except TypeError:
+                pass
+            entry.echo_parameters_slot = None
         if entry.spec.get("custom_panel"):
             entry.apply_btn.setText("Filter")
         self._refresh_tab_bar_lock()
@@ -942,15 +1172,18 @@ class WorkspacePage(QWidget):
             return
 
         if entry.spec["needs_dialog"]:
-            # Concatenate: collect source portions via dialog first.
-            channel_count = view.entity.clip.num_channels
-            dialog = ConcatenateDialog(self._workspace, channel_count, self)
-            if dialog.exec() != QDialog.DialogCode.Accepted:
+            if key == "concat":
+                # Concatenate: collect source portions via dialog first.
+                channel_count = view.entity.clip.num_channels
+                dialog = ConcatenateDialog(self._workspace, channel_count, self)
+                if dialog.exec() != QDialog.DialogCode.Accepted:
+                    return
+                sources = dialog.selected_portions()
+                if not sources:
+                    return
+                began = getattr(view, entry.spec["begin"])(sources)
+            else:
                 return
-            sources = dialog.selected_portions()
-            if not sources:
-                return
-            began = getattr(view, entry.spec["begin"])(sources)
         elif key == "noise":
             # Noise Removal: ask where the noise profile comes from first.
             # Picking an entity channel skips the Filter stage entirely —
@@ -969,6 +1202,22 @@ class WorkspacePage(QWidget):
                 began = view.begin_noise_removal()
                 if began:
                     entry.apply_btn.setText("Filter")
+        elif key == "echo":
+            # Echo: get default delay from entity, then start echo mode
+            clip = view.entity.clip
+            start_time = clip.get_time(clip.start_index)
+            end_time = clip.get_time(clip.end_index())
+            default_delay = end_time - start_time
+            
+            # Begin echo with default parameters
+            began = getattr(view, entry.spec["begin"])()
+            if began:
+                # Connect parameter changes to preview
+                entry.echo_parameters_slot = lambda o, d, dc, k=key: self._on_echo_parameters_changed(k, o, d, dc)
+                entry.echo_parameters_input.parameters_changed.connect(entry.echo_parameters_slot)
+                
+                # Set parameters and trigger initial preview
+                entry.echo_parameters_input.set_parameters(2, default_delay, 0.0)
         else:
             began = getattr(view, entry.spec["begin"])()
 
@@ -982,12 +1231,21 @@ class WorkspacePage(QWidget):
         entry.button.setStyleSheet(self._SELECTED_OPTION_STYLE)
         entry.panel.setVisible(True)
         self._refresh_tab_bar_lock()
+        if key == "echo":
+            occurrence, delay, decay = entry.echo_parameters_input.get_parameters()
+            view.update_echo_preview(occurrence, delay, decay)
 
     def _on_op_factor_changed(self, key: str, factor: float):
         """Live-preview: update the plot instantly as the factor changes."""
         entry = self._ops[key]
         if entry.active and entry.active_view is not None:
             getattr(entry.active_view, entry.spec["preview"])(factor)
+
+    def _on_echo_parameters_changed(self, key: str, occurrence: int, delay: float, decay: float):
+        """Live-preview for echo: update the plot as parameters change."""
+        entry = self._ops[key]
+        if entry.active and entry.active_view is not None:
+            entry.active_view.update_echo_preview(occurrence, delay, decay)
 
     def _on_op_apply_clicked(self, key: str):
         entry = self._ops[key]
@@ -1064,13 +1322,16 @@ class WorkspacePage(QWidget):
         self._tab_bar.setCurrentIndex(index)
         self._content_stack.setCurrentWidget(entity_view)
 
-    def _collapse_ops_for_widget(self, widget):
+    def _collapse_ops_for_widget(self, widget, skip_keys: set = None):
         """Collapse any operation panel that's mid-flight on `widget`,
         for every one of the 8 ops (not just Trim/Extract/Time Scale —
         see the discussion on the earlier stale-reference bug)."""
+        if skip_keys is None:
+            skip_keys = set()
         for key, entry in self._ops.items():
             if widget is entry.active_view:
-                self._collapse_op_ui(key)
+                if key not in skip_keys:
+                    self._collapse_op_ui(key)
 
     def _rebuild_entity_tab(self, entity: Entity):
         index = self._find_entity_tab(entity.id)
@@ -1080,12 +1341,40 @@ class WorkspacePage(QWidget):
         old_widget   = self._content_stack.widget(widget_index)
         was_current  = (self._tab_bar.currentIndex() == index)
 
-        self._collapse_ops_for_widget(old_widget)
+        # Check if echo is active on old widget
+        echo_active = False
+        echo_params_input = None
+        echo_original_clip = None
+        echo_parameters = None
+        if old_widget is self._ops["echo"].active_view:
+            echo_active = True
+            echo_params_input = self._ops["echo"].echo_parameters_input
+            echo_original_clip = old_widget._echo_original_clip.copy()
+            echo_parameters = old_widget._echo_parameters
+
+        self._collapse_ops_for_widget(old_widget, skip_keys={"echo"})
 
         self._content_stack.removeWidget(old_widget)
         old_widget.deleteLater()
 
         entity_view = self._make_entity_view(entity)
+        
+        # If echo was active, restore the connection to the new view
+        if echo_active and echo_params_input is not None:
+            entry = self._ops["echo"]
+            entry.active_view = entity_view
+            entry.active = True
+            entity_view._echo_original_clip = echo_original_clip
+            entity_view._echo_parameters = echo_parameters
+            entity_view._lock_selection(True)
+            if entry.echo_parameters_slot is not None:
+                try:
+                    echo_params_input.parameters_changed.disconnect(entry.echo_parameters_slot)
+                except TypeError:
+                    pass
+            entry.echo_parameters_slot = lambda o, d, dc, k="echo": self._on_echo_parameters_changed(k, o, d, dc)
+            echo_params_input.parameters_changed.connect(entry.echo_parameters_slot)
+        
         self._content_stack.insertWidget(widget_index, entity_view)
         if was_current:
             self._content_stack.setCurrentWidget(entity_view)
