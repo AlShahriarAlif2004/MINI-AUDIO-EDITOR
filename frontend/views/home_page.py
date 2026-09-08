@@ -10,6 +10,7 @@ class HomePage(QWidget):
     """
 
     editor_mode_requested = Signal()
+    voice_recognition_mode_requested = Signal()
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -25,9 +26,15 @@ class HomePage(QWidget):
         title.setStyleSheet("font-size: 28px; font-weight: 600;")
 
         editor_btn = QPushButton("Editor Mode")
-        editor_btn.setFixedWidth(220)
-        editor_btn.setFixedHeight(40)
+        voice_btn = QPushButton("Voice Recognition Mode")
+
+        for btn in (editor_btn, voice_btn):
+            btn.setFixedWidth(220)
+            btn.setFixedHeight(40)
+
         editor_btn.clicked.connect(self.editor_mode_requested.emit)
+        voice_btn.clicked.connect(self.voice_recognition_mode_requested.emit)
 
         layout.addWidget(title)
         layout.addWidget(editor_btn, alignment=Qt.AlignCenter)
+        layout.addWidget(voice_btn, alignment=Qt.AlignCenter)

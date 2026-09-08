@@ -87,6 +87,23 @@ class AudioClip:
 
         return AudioClip([mono_signal], name=self.name)
 
+    def average_channel_signal(self):
+        """
+        A single Discrete_Signal that is the sample-by-sample average of
+        every channel — used by Voice Recognition mode's single-plot
+        view, which shows one averaged waveform instead of per-channel
+        plots. Same math as to_mono(), but returns the raw signal instead
+        of wrapping it back in a new AudioClip, since callers here only
+        need samples/sample_rate/start_index for plotting and playback.
+        """
+        import numpy as np
+        stacked = np.stack([ch.samples for ch in self.channels])
+        averaged_samples = stacked.mean(axis=0)
+
+        averaged_signal = self.channels[0].copy()
+        averaged_signal.samples = averaged_samples
+        return averaged_signal
+
     def to_stereo(self):
         if self.num_channels != 1:
             raise ValueError("to_stereo requires a mono AudioClip.")
