@@ -190,6 +190,8 @@ class VoiceEntityView(QWidget):
         self._sample_panel.setVisible(False)
         self._similarity_panel.setVisible(False)
         self._sample_actions.setVisible(True)
+        self._title_label.setVisible(True)
+        self._plot_container.setVisible(True)
         self._refresh_button_styles()
         self._refresh_title()
         self._refresh_plot()
@@ -201,6 +203,8 @@ class VoiceEntityView(QWidget):
             self._similarity_panel.setVisible(False)
             self._sample_actions.setVisible(False)
             self._set_dropdown_visible(False)
+            self._title_label.setVisible(True)
+            self._plot_container.setVisible(True)
             self._refresh_button_styles()
             self._refresh_title()
             self._refresh_plot()
@@ -216,8 +220,9 @@ class VoiceEntityView(QWidget):
         self._sample_panel.setVisible(False)
         self._sample_actions.setVisible(False)
         self._similarity_panel.setVisible(True)
+        self._title_label.setVisible(False)
+        self._plot_container.setVisible(False)
         self._refresh_button_styles()
-        self._refresh_title()
         self._refresh_plot()
         self._refresh_similarity_panel()
 
@@ -346,12 +351,14 @@ class VoiceEntityView(QWidget):
     def _refresh_similarity_panel(self):
         while self._similarity_layout.count():
             item = self._similarity_layout.takeAt(0)
-            if item.widget() is not None:
-                item.widget().deleteLater()
+            widget = item.widget()
+            if widget is not None:
+                widget.deleteLater()
 
         self._add_similarity_section("Target Speaker", [(self._entity, None)])
         if not self._similarity_results:
             return
+
         best_score = self._similarity_results[0][1]
         nearest = [
             result for result in self._similarity_results
@@ -360,19 +367,44 @@ class VoiceEntityView(QWidget):
         self._add_similarity_section("Nearest Sample Speaker", nearest)
 
     def _add_similarity_section(self, title, rows):
-        self._similarity_layout.addWidget(QLabel(title))
+        section = QLabel(title)
+        section.setStyleSheet("font-size: 17px; font-weight: 700;")
+        self._similarity_layout.addWidget(section)
+
         for entity, score in rows:
-            row = QFrame()
-            row_layout = QGridLayout(row)
-            row_layout.setContentsMargins(8, 4, 8, 4)
+            row = QWidget()
+            row_layout = QVBoxLayout(row)
+            row_layout.setContentsMargins(4, 4, 4, 4)
+            row_layout.setSpacing(6)
+
             name = QLabel(entity.name)
+            name.setStyleSheet("font-size: 15px; font-weight: 600;")
             if score is not None:
                 name.setToolTip(f"Average quantization distortion: {score:.6g}")
-            play = QPushButton("Play")
-            play.clicked.connect(lambda checked=False, item=entity: self._play_entity(item))
-            row_layout.addWidget(name, 0, 0)
-            row_layout.addWidget(play, 0, 1)
+            row_layout.addWidget(name)
+
+            player = self._build_similarity_player(entity)
+            row_layout.addWidget(player)
             self._similarity_layout.addWidget(row)
+
+    def _build_similarity_player(self, entity):
+        signal = entity.clip.average_channel_signal()
+        times = self._time_axis(signal)
+        player = WaveformPlayer(
+            times=times,
+            series=[(signal.samples, "#4fc3f7", "Average")],
+            sample_rate=signal.sample_rate,
+            audio_data=signal.samples.astype(np.float32),
+            group=self._group,
+            entity=entity,
+            channel_index=None,
+            is_driver=False,
+            show_markers=False,
+            show_clip_button=False,
+            parent=self._similarity_panel,
+        )
+        player.marker_added.connect(self.entity_modified.emit)
+        return player
 
     @staticmethod
     def _play_entity(entity):

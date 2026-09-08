@@ -294,7 +294,7 @@ class VoiceRecognitionPage(QWidget):
         self._no_workspace_label = QLabel("No Workspace")
         self._no_workspace_label.setAlignment(Qt.AlignCenter)
         self._no_workspace_label.setStyleSheet(
-            "color: #57606a; font-style: italic; padding: 24px 0;"
+            "color: white; font-style: italic; padding: 24px 0;"
         )
         sidebar_layout.addWidget(self._no_workspace_label)
 
