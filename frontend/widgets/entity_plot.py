@@ -40,6 +40,7 @@ class EntityPlotView(QWidget):
     entity_divisor_deleted = Signal()
     entity_noise_removed = Signal()
     entity_echo_added = Signal()
+    entity_echo_detected = Signal()
     segment_selected = Signal(object, object, float, float)
     segment_deselected = Signal()
     """
@@ -86,6 +87,8 @@ class EntityPlotView(QWidget):
         
         self._echo_original_clip = None      # clip snapshot before echo is applied
         self._echo_parameters = None         # (occurrence, delay, decay) tuple
+        self._detect_echo_original_clip = None
+        self._detect_echo_result = None
 
         self._noise_removal_active = False   # True for either phase (selection or filtered)
         self._noise_filtered = False         # True once Filter has been clicked
@@ -1258,6 +1261,52 @@ class EntityPlotView(QWidget):
         """Reset echo-related state variables."""
         self._echo_original_clip = None
         self._echo_parameters = None
+
+    def begin_detect_echo(self) -> bool:
+        """Prepare the clip for echo detection without changing it yet."""
+        if self._detect_echo_original_clip is not None:
+            return False
+        self._detect_echo_original_clip = self._entity.clip.copy()
+        self._detect_echo_result = None
+        self._lock_selection(True)
+        return True
+
+    def apply_detect_echo(self):
+        """Detect the echo and append the isolated echo as a new channel."""
+        if self._detect_echo_original_clip is None:
+            return
+
+        original_clip = self._detect_echo_original_clip
+        mono = original_clip.to_mono().channels[0]
+        result = mono.detect_echo()
+        self._detect_echo_result = result
+        self._detect_echo_original_clip = None
+        self._lock_selection(False)
+        self.clear_all_selection()
+
+        delay, _decay, _confidence = result
+        if delay > 0.0:
+            echo_channel = mono.extract_delayed_component(delay)
+            self._entity.echo_channel_index = original_clip.num_channels
+            self._entity.clip = AudioClip(
+                [*original_clip.channels, echo_channel],
+                name=original_clip.name,
+            )
+            self.entity_modified.emit()
+
+        self.entity_echo_detected.emit()
+        return result
+
+    def cancel_detect_echo(self):
+        """Cancel detection mode and restore the current selection state."""
+        if self._detect_echo_original_clip is None:
+            return
+        self._detect_echo_original_clip = None
+        self._detect_echo_result = None
+        self._lock_selection(False)
+        self.clear_all_selection()
+        self.entity_echo_detected.emit()
+
     # Only valid when the Overall plot is selected (enforced by the caller
     # via _OVERALL_ONLY_OPS). Each chosen source is a division-bounded
     # *segment* of some entity's Overall plot (not necessarily the whole
@@ -1410,13 +1459,19 @@ class EntityPlotView(QWidget):
         clip = self._entity.clip
         num_channels = clip.num_channels
         times = self._time_axis(clip.channels[0])
+        echo_channel_index = getattr(self._entity, "echo_channel_index", None)
 
         if num_channels > 1:
             for i, channel in enumerate(clip.channels):
                 color = _CHANNEL_COLORS[i % len(_CHANNEL_COLORS)]
+                channel_label = "Echo (detected)" if i == echo_channel_index else f"Channel {i + 1}"
+                if i == echo_channel_index:
+                    label = QLabel(channel_label)
+                    label.setStyleSheet("font-weight: 600; color: #ffb74d;")
+                    layout.addWidget(label)
                 player = WaveformPlayer(
                     times=times,
-                    series=[(channel.samples, color, f"Ch {i + 1}")],
+                    series=[(channel.samples, color, channel_label)],
                     sample_rate=channel.sample_rate,
                     audio_data=channel.samples.astype(np.float32),
                     group=self._group,
@@ -1431,9 +1486,16 @@ class EntityPlotView(QWidget):
                 self._players.append(player)
 
         overall_series = [
-            (channel.samples, _CHANNEL_COLORS[i % len(_CHANNEL_COLORS)], f"Ch {i + 1}")
+            (
+                channel.samples,
+                _CHANNEL_COLORS[i % len(_CHANNEL_COLORS)],
+                "Echo (detected)" if i == echo_channel_index else f"Channel {i + 1}",
+            )
             for i, channel in enumerate(clip.channels)
         ]
+        overall_label = QLabel("Overall")
+        overall_label.setStyleSheet("font-weight: 600;")
+        layout.addWidget(overall_label)
         overall_player = WaveformPlayer(
             times=times,
             series=overall_series,

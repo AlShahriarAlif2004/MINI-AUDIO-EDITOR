@@ -254,11 +254,15 @@ class Discrete_Signal:
         """
         other = other.resample(self.sample_rate)
 
-        # Use FFT-based convolution for efficiency
-        self_fft = np.fft.fft(self.samples, n=len(self.samples) + len(other.samples) - 1)
-        other_fft = np.fft.fft(other.samples, n=len(self.samples) + len(other.samples) - 1)
-        
-        result_samples = np.fft.ifft(self_fft * other_fft).real
+        output_size = len(self.samples) + len(other.samples) - 1
+        self_padded = np.zeros(output_size, dtype=float)
+        other_padded = np.zeros(output_size, dtype=float)
+        self_padded[:len(self.samples)] = self.samples
+        other_padded[:len(other.samples)] = other.samples
+
+        self_fft = BluesteinFFT.fft(self_padded)
+        other_fft = BluesteinFFT.fft(other_padded)
+        result_samples = BluesteinFFT.ifft(self_fft * other_fft).real
         
         # The start index of the convolution result
         result_start_index = self.start_index + other.start_index
@@ -506,3 +510,71 @@ class Discrete_Signal:
         result = self.convolution(h_signal)
 
         return result
+
+    def detect_echo(self, min_delay=0.08, max_delay=0.5, min_confidence=0.2):
+        """Return (delay_seconds, decay, confidence) for the strongest echo-like lag.
+
+        Echo detection is implemented in the cepstrum domain, which is much more
+        robust than raw autocorrelation for single-tone or nearly periodic audio.
+        A true reflected copy creates a distinct peak at the echo delay, while the
+        signal's fundamental pitch usually appears at a much shorter quefrency and is
+        ignored by the search window.
+        """
+        if self.sample_rate <= 0 or len(self.samples) < 8:
+            return (0.0, 0.0, 0.0)
+
+        samples = np.asarray(self.samples, dtype=float)
+        samples = np.nan_to_num(samples)
+        if np.allclose(samples, 0.0):
+            return (0.0, 0.0, 0.0)
+
+        centered = samples - np.mean(samples)
+        if np.max(np.abs(centered)) < 1e-8:
+            return (0.0, 0.0, 0.0)
+
+        min_lag = max(1, int(round(min_delay * self.sample_rate)))
+        max_lag = min(len(centered) // 2, int(round(max_delay * self.sample_rate)))
+        if max_lag <= min_lag:
+            return (0.0, 0.0, 0.0)
+
+        window = np.hanning(len(centered))
+        windowed = centered * window
+        cepstrum = BluesteinFFT.cepstrum(windowed)
+
+        # Restrict the search to positive quefrencies that correspond to the echo delay.
+        cepstrum = np.maximum(cepstrum, 0.0)
+        windowed_cepstrum = cepstrum[min_lag:max_lag + 1]
+        if windowed_cepstrum.size == 0:
+            return (0.0, 0.0, 0.0)
+
+        best_index = int(np.argmax(windowed_cepstrum))
+        best_lag = best_index + min_lag
+        best_score = float(windowed_cepstrum[best_index])
+        if best_score <= min_confidence:
+            return (0.0, 0.0, 0.0)
+
+        decay = float(np.clip(best_score / max(np.max(windowed_cepstrum), 1e-9), 0.0, 1.0))
+        return (best_lag / self.sample_rate, decay, float(np.clip(best_score, 0.0, 1.0)))
+
+    def extract_delayed_component(self, delay, amplitude=None):
+        """Return the delayed signal component for an echo delay."""
+        delay_samples = int(round(float(delay) * self.sample_rate))
+        extracted = np.zeros(len(self.samples), dtype=float)
+        if delay_samples <= 0 or delay_samples >= len(self.samples):
+            return Discrete_Signal(extracted, self.sample_rate, self.start_index)
+
+        source = np.asarray(self.samples, dtype=float)
+        delayed = np.zeros_like(source)
+        delayed[delay_samples:] = source[:-delay_samples]
+
+        if amplitude is None:
+            centered_source = source - np.mean(source)
+            centered_delayed = delayed - np.mean(delayed)
+            denominator = float(np.dot(centered_delayed, centered_delayed))
+            amplitude = 0.0 if denominator <= 1e-12 else float(
+                np.dot(centered_source, centered_delayed) / denominator
+            )
+
+        amplitude = float(np.clip(amplitude, 0.0, 1.0))
+        extracted = delayed * amplitude
+        return Discrete_Signal(extracted, self.sample_rate, self.start_index)

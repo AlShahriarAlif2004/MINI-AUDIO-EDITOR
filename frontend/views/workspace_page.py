@@ -429,6 +429,9 @@ class WorkspacePage(QWidget):
              begin="begin_echo", apply="apply_echo", cancel="cancel_echo",
              rebuild_signal="entity_echo_added", factor=False, needs_dialog=False,
              preview="update_echo_preview"),
+        dict(key="echo_detect", label="Detect Echo",
+             begin="begin_detect_echo", apply="apply_detect_echo", cancel="cancel_detect_echo",
+             rebuild_signal="entity_echo_detected", factor=False, needs_dialog=False),
     ]
 
     new_workspace_requested = Signal()
