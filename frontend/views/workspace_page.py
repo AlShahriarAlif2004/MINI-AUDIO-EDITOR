@@ -1,6 +1,7 @@
-from PySide6.QtCore import Qt, Signal
-from PySide6.QtGui import QDoubleValidator, QIntValidator
+from PySide6.QtCore import Qt, QTimer, Signal
+from PySide6.QtGui import QColor, QDoubleValidator, QIntValidator, QLinearGradient, QPainter, QPen
 from PySide6.QtWidgets import (
+    QApplication,
     QDialog,
     QFileDialog,
     QHBoxLayout,
@@ -350,6 +351,89 @@ class _OpEntry:
 # WorkspacePage
 # ---------------------------------------------------------------------------
 
+class _Spinner(QWidget):
+    """Small rotating-arc busy indicator, advanced by a QTimer tick."""
+
+    def __init__(self, parent=None, diameter=48):
+        super().__init__(parent)
+        self.setFixedSize(diameter, diameter)
+        self._angle = 0
+        self._timer = QTimer(self)
+        self._timer.timeout.connect(self._advance)
+
+    def start(self):
+        self._angle = 0
+        self._timer.start(30)
+
+    def stop(self):
+        self._timer.stop()
+
+    def _advance(self):
+        self._angle = (self._angle + 45) % 360
+        self.update()
+
+    def paintEvent(self, event):
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.Antialiasing)
+        pen = QPen(QColor("white"))
+        pen.setWidth(4)
+        pen.setCapStyle(Qt.RoundCap)
+        painter.setPen(pen)
+        rect = self.rect().adjusted(4, 4, -4, -4)
+        painter.translate(rect.center())
+        painter.rotate(self._angle)
+        painter.translate(-rect.center())
+        painter.drawArc(rect, 0, 270 * 16)
+        painter.end()
+
+
+class _BusyOverlay(QWidget):
+    """Full-page bluish, semi-transparent veil shown while a slow,
+    synchronous backend call (repeated noise-removal passes) runs on
+    the GUI thread. It doesn't make the app responsive -- everything
+    underneath is still blocked -- it just makes that visible instead
+    of the window looking frozen, as long as the caller pumps the
+    event loop (QApplication.processEvents()) while the work runs."""
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setAttribute(Qt.WA_TransparentForMouseEvents)
+        self.setVisible(False)
+
+        layout = QVBoxLayout(self)
+        layout.setAlignment(Qt.AlignCenter)
+
+        self._spinner = _Spinner(self)
+        layout.addWidget(self._spinner, alignment=Qt.AlignCenter)
+
+        self._label = QLabel("REMOVING NOISE")
+        self._label.setStyleSheet(
+            "color: white; font-weight: 600; font-size: 14px; letter-spacing: 1px;"
+        )
+        self._label.setAlignment(Qt.AlignCenter)
+        layout.addWidget(self._label)
+
+    def show_message(self, text):
+        self._label.setText(text)
+        self.setGeometry(self.parentWidget().rect())
+        self.raise_()
+        self.setVisible(True)
+        self._spinner.start()
+
+    def hide_overlay(self):
+        self._spinner.stop()
+        self.setVisible(False)
+
+    def paintEvent(self, event):
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.Antialiasing)
+        gradient = QLinearGradient(0, 0, self.width(), self.height())
+        gradient.setColorAt(0.0, QColor(30, 41, 110, 110))
+        gradient.setColorAt(1.0, QColor(90, 50, 150, 110))
+        painter.fillRect(self.rect(), gradient)
+        painter.end()
+
+
 class WorkspacePage(QWidget):
     """VSCode-like workspace editor shell."""
 
@@ -441,9 +525,15 @@ class WorkspacePage(QWidget):
         self._mode = "file"
         self._ops: dict[str, _OpEntry] = {}   # populated in _build_ui
         self._build_ui()
+        self._busy_overlay = _BusyOverlay(self)
         self._update_sidebar_for_workspace()
         self._playback_group = PlaybackGroup.get_instance()
         self._playback_group.active_changed.connect(self._on_playback_active_changed)
+
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        if self._busy_overlay.isVisible():
+            self._busy_overlay.setGeometry(self.rect())
 
     def _create_folder(self):
         self._create_folder_in(self._target_folder())
@@ -1257,7 +1347,10 @@ class WorkspacePage(QWidget):
                 source_entity, source_channel = source_dialog.selected_entity_channel()
                 if source_entity is None:
                     return
+                self._busy_overlay.show_message("REMOVING NOISE")
+                QApplication.processEvents()
                 began = view.begin_noise_removal_from_entity(source_entity, source_channel)
+                self._busy_overlay.hide_overlay()
                 if began:
                     entry.apply_btn.setText("Apply")
             else:
@@ -1340,7 +1433,10 @@ class WorkspacePage(QWidget):
         view = entry.active_view
 
         if entry.apply_btn.text() == "Filter":
+            self._busy_overlay.show_message("REMOVING NOISE")
+            QApplication.processEvents()
             view.filter_noise()
+            self._busy_overlay.hide_overlay()
             entry.apply_btn.setText("Apply")
         else:
             self._collapse_op_ui(key)

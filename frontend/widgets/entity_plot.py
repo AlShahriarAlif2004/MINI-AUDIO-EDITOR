@@ -1,7 +1,7 @@
 import numpy as np
 from PySide6.QtCore import Signal
 from PySide6.QtWidgets import (
-    QWidget, QVBoxLayout, QHBoxLayout, QLabel, QScrollArea,
+    QApplication, QWidget, QVBoxLayout, QHBoxLayout, QLabel, QScrollArea,
     QPushButton, QStackedWidget,
 )
 
@@ -13,6 +13,12 @@ from frontend.widgets.waveform_player import PlaybackGroup, WaveformPlayer
 
 
 _CHANNEL_COLORS = ["#4fc3f7", "#ff8a65", "#81c784", "#ba68c8", "#ffd54f", "#a1887f"]
+
+# Spectral subtraction leaves residual noise after a single pass; running
+# the same subtraction again on its own output measurably cleans it up
+# further. This is how many passes are run automatically instead of the
+# user re-triggering Filter by hand.
+_NOISE_REMOVAL_ITERATIONS = 10
 
 class _SegmentCanvas(QWidget):
     """Container that holds the per-channel/overall plots. A click that
@@ -424,10 +430,12 @@ class EntityPlotView(QWidget):
         self._noise_original_clip = clip
 
         filtered = clip
-        for ch_idx in range(clip.num_channels):
-            filtered = filtered.apply(
-                "remove_noise", channel=ch_idx, noise_reference=noise_signal
-            )
+        for _ in range(_NOISE_REMOVAL_ITERATIONS):
+            for ch_idx in range(clip.num_channels):
+                filtered = filtered.apply(
+                    "remove_noise", channel=ch_idx, noise_reference=noise_signal
+                )
+            QApplication.processEvents()
         self._noise_filtered_clip = filtered
 
         for player in self._players:
@@ -487,8 +495,10 @@ class EntityPlotView(QWidget):
         end_idx = clip.get_index(end)
 
         filtered = clip
-        for ch_idx in range(clip.num_channels):
-            filtered = filtered.apply("remove_noise", start_idx, end_idx, channel=ch_idx)
+        for _ in range(_NOISE_REMOVAL_ITERATIONS):
+            for ch_idx in range(clip.num_channels):
+                filtered = filtered.apply("remove_noise", start_idx, end_idx, channel=ch_idx)
+            QApplication.processEvents()
         self._noise_filtered_clip = filtered
 
         overall.exit_noise_range_mode()
