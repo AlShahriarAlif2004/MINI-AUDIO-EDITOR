@@ -1,6 +1,6 @@
 import numpy as np
 
-from backend.fft_algorithms import BluesteinFFT
+from backend.fft_algorithms import BluesteinFFT, CooleyTukeyFFT, _next_power_of_two
 
 class Discrete_Signal:
     """
@@ -255,10 +255,18 @@ class Discrete_Signal:
         other = other.resample(self.sample_rate)
 
         # Use FFT-based convolution for efficiency
-        self_fft = np.fft.fft(self.samples, n=len(self.samples) + len(other.samples) - 1)
-        other_fft = np.fft.fft(other.samples, n=len(self.samples) + len(other.samples) - 1)
-        
-        result_samples = np.fft.ifft(self_fft * other_fft).real
+
+        min_size = len(self.samples) + len(other.samples) - 1
+        output_size = _next_power_of_two(min_size)
+
+        self_padded = np.zeros(output_size, dtype=float)
+        other_padded = np.zeros(output_size, dtype=float)
+        self_padded[:len(self.samples)] = self.samples
+        other_padded[:len(other.samples)] = other.samples
+
+        self_fft = CooleyTukeyFFT.fft(self_padded)
+        other_fft = CooleyTukeyFFT.fft(other_padded)
+        result_samples = CooleyTukeyFFT.ifft(self_fft * other_fft).real[:min_size]
         
         # The start index of the convolution result
         result_start_index = self.start_index + other.start_index
