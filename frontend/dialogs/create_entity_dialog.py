@@ -115,7 +115,7 @@ class CreateEntityDialog(QDialog):
             self,
             "Select Audio File",
             "",
-            "Audio Files (*.wav *.mp3);;All Files (*)",
+            "Audio Files (*.wav *.mp3 *.ogg);;All Files (*)",
         )
         if path:
             self._file_edit.setText(path)

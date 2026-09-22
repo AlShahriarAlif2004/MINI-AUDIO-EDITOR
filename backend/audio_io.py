@@ -96,3 +96,29 @@ class MP3IO(AudioClipIO):
         )
 
         audio.export(path, format="mp3", bitrate=bitrate)
+
+class OggIO(AudioClipIO):
+    """
+    OGG Vorbis support via soundfile (libsndfile), which handles
+    OGG natively — no extra tools required.
+    """
+
+    @staticmethod
+    def load(path) -> AudioClip:
+        data, sample_rate = sf.read(path, dtype="float64", always_2d=True)
+
+        channels = []
+        for c in range(data.shape[1]):
+            channels.append(
+                Discrete_Signal(data[:, c], sample_rate, start_index=0)
+            )
+
+        return AudioClip(channels, name=None)
+
+    @staticmethod
+    def unload(clip: AudioClip, path, quality: float = 0.7):
+        """quality: 0.0 (worst) to 1.0 (best), default 0.7 ≈ good balance."""
+        stacked = np.stack([ch.samples for ch in clip.channels], axis=1)
+        stacked = np.clip(stacked, -1.0, 1.0)
+
+        sf.write(path, stacked, clip.sample_rate, format="ogg", subtype="vorbis")

@@ -20,7 +20,7 @@ from PySide6.QtWidgets import (
 )
 
 from backend.workspace_model import Entity, Folder, Workspace
-from backend.audio_io import WavIO, MP3IO
+from backend.audio_io import WavIO, MP3IO, OggIO
 from frontend.dialogs.create_entity_dialog import CreateEntityDialog
 from frontend.dialogs.create_folder_dialog import CreateFolderDialog
 from frontend.dialogs.concatenate_dialog import ConcatenateDialog
@@ -692,12 +692,15 @@ class WorkspacePage(QWidget):
         format_dialog = DownloadFormatDialog(self)
         if format_dialog.exec() != QDialog.DialogCode.Accepted:
             return
-        file_format = format_dialog.selected_format()   # "wav" or "mp3"
+        file_format = format_dialog.selected_format()   # "wav", "mp3", or "ogg"
 
         if file_format == "mp3":
             default_name = f"{entity.name}.mp3"
             file_filter = "MP3 Files (*.mp3)"
-        elif file_format == "wav":
+        elif file_format == "ogg":
+            default_name = f"{entity.name}.ogg"
+            file_filter = "OGG Files (*.ogg)"
+        else:
             default_name = f"{entity.name}.wav"
             file_filter = "WAV Files (*.wav)"
 
@@ -715,6 +718,8 @@ class WorkspacePage(QWidget):
         try:
             if file_format == "mp3":
                 MP3IO.unload(entity.clip, path)
+            elif file_format == "ogg":
+                OggIO.unload(entity.clip, path)
             else:
                 WavIO.unload(entity.clip, path)
         except (ValueError, OSError) as exc:
@@ -1509,14 +1514,18 @@ class WorkspacePage(QWidget):
         old_widget   = self._content_stack.widget(widget_index)
         was_current  = (self._tab_bar.currentIndex() == index)
 
-        # Check if echo is active on old widget
+        # Check if echo is active on old widget (only editors built with
+        # editor_type="echo" register an "echo" op at all -- e.g. the
+        # noise/filtering editor never does, so this must not assume the
+        # key exists).
         echo_active = False
         echo_params_input = None
         echo_original_clip = None
         echo_parameters = None
-        if old_widget is self._ops["echo"].active_view:
+        echo_entry = self._ops.get("echo")
+        if echo_entry is not None and old_widget is echo_entry.active_view:
             echo_active = True
-            echo_params_input = self._ops["echo"].echo_parameters_input
+            echo_params_input = echo_entry.echo_parameters_input
             echo_original_clip = old_widget._echo_original_clip.copy()
             echo_parameters = old_widget._echo_parameters
 
@@ -1529,7 +1538,7 @@ class WorkspacePage(QWidget):
         
         # If echo was active, restore the connection to the new view
         if echo_active and echo_params_input is not None:
-            entry = self._ops["echo"]
+            entry = echo_entry
             entry.active_view = entity_view
             entry.active = True
             entity_view._echo_original_clip = echo_original_clip

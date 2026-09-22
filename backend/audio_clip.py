@@ -115,7 +115,7 @@ class AudioClip:
 
     @staticmethod
     def load(path):
-        from backend.audio_io import WavIO, MP3IO  # deferred import breaks the cycle
+        from backend.audio_io import WavIO, MP3IO, OggIO  # deferred import breaks the cycle
 
         ext = path.rsplit(".", 1)[-1].lower()
 
@@ -123,6 +123,8 @@ class AudioClip:
             clip = WavIO.load(path)
         elif ext == "mp3":
             clip = MP3IO.load(path)
+        elif ext == "ogg":
+            clip = OggIO.load(path)
         else:
             raise ValueError(f"Unsupported audio format: .{ext}")
 
@@ -130,7 +132,7 @@ class AudioClip:
         return clip
 
     def unload(self, file_type, directory=""):
-        from backend.audio_io import WavIO, MP3IO  # deferred import breaks the cycle
+        from backend.audio_io import WavIO, MP3IO, OggIO  # deferred import breaks the cycle
 
         if self.name is None:
             raise ValueError("AudioClip has no name; set clip.name before unloading.")
@@ -143,5 +145,7 @@ class AudioClip:
             WavIO.unload(self, path)
         elif ext == "mp3":
             MP3IO.unload(self, path)
+        elif ext == "ogg":
+            OggIO.unload(self, path)
         else:
             raise ValueError(f"Unsupported audio format: .{ext}")
