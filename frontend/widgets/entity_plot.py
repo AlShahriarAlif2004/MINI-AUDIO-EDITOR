@@ -633,7 +633,7 @@ class EntityPlotView(QWidget):
         if key == "noise":
             # For noise window: show only Noise Reference
             label = QLabel("Noise Reference")
-            label.setStyleSheet("font-size: 13px; font-weight: 600;")
+            label.setStyleSheet("font-size: 15px; font-weight: 600;")
             layout.addWidget(label)
 
             series, audio = self._channels_to_series_and_audio(prev_channels, only_index)
@@ -660,7 +660,7 @@ class EntityPlotView(QWidget):
                 series, audio = self._channels_to_series_and_audio(channels, only_index)
 
                 label = QLabel(title)
-                label.setStyleSheet("font-size: 13px; font-weight: 600;")
+                label.setStyleSheet("font-size: 15px; font-weight: 600;")
                 layout.addWidget(label)
 
                 player = WaveformPlayer(
@@ -692,7 +692,7 @@ class EntityPlotView(QWidget):
         layout.setSpacing(8)
 
         label = QLabel("Noise Reference")
-        label.setStyleSheet("font-size: 13px; font-weight: 600;")
+        label.setStyleSheet("font-size: 15px; font-weight: 600;")
         layout.addWidget(label)
 
         player = WaveformPlayer(
@@ -1433,6 +1433,7 @@ class EntityPlotView(QWidget):
                     entity=self._entity,
                     channel_index=i,
                     is_driver=False,
+                    title=f"Channel {i + 1}",
                 )
                 layout.addWidget(player)
                 player.marker_added.connect(self.entity_modified.emit)
@@ -1453,6 +1454,7 @@ class EntityPlotView(QWidget):
             entity=self._entity,
             channel_index=None,
             is_driver=True,
+            title="Overall",
         )
         layout.addWidget(overall_player)
         overall_player.marker_added.connect(self.entity_modified.emit)

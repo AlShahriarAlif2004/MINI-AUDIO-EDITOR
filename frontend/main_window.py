@@ -20,14 +20,20 @@ class MainWindow(QMainWindow):
         self.setCentralWidget(self.stack)
 
         self.home_page = HomePage()
-        self.workspace_page = WorkspacePage()
+        self.workspace_page = WorkspacePage(editor_type="editor")
         self.voice_recognition_page = VoiceRecognitionPage()
+        self.echo_page = WorkspacePage(editor_type="echo")
+        self.noise_page = WorkspacePage(editor_type="noise")
         self.stack.addWidget(self.home_page)
         self.stack.addWidget(self.workspace_page)
         self.stack.addWidget(self.voice_recognition_page)
+        self.stack.addWidget(self.echo_page)
+        self.stack.addWidget(self.noise_page)
 
         self.home_page.editor_mode_requested.connect(self._on_editor_mode)
         self.home_page.voice_recognition_mode_requested.connect(self._on_voice_recognition_mode)
+        self.home_page.echo_mode_requested.connect(self._on_echo_mode)
+        self.home_page.noise_removal_mode_requested.connect(self._on_noise_removal_mode)
 
         # Both editor pages share the same File > New/Open/Exit handlers —
         # _active_editor_page tracks which one is currently on screen.
@@ -39,6 +45,14 @@ class MainWindow(QMainWindow):
         self.voice_recognition_page.open_workspace_requested.connect(self._on_open_workspace)
         self.voice_recognition_page.exit_requested.connect(self._on_exit_workspace)
 
+        self.echo_page.new_workspace_requested.connect(self._on_new_workspace)
+        self.echo_page.open_workspace_requested.connect(self._on_open_workspace)
+        self.echo_page.exit_requested.connect(self._on_exit_workspace)
+
+        self.noise_page.new_workspace_requested.connect(self._on_new_workspace)
+        self.noise_page.open_workspace_requested.connect(self._on_open_workspace)
+        self.noise_page.exit_requested.connect(self._on_exit_workspace)
+
     def _on_editor_mode(self):
         """Enter the (full Edit/Tool) workspace editor with nothing
         loaded yet — the sidebar shows its 'No Workspace' placeholder
@@ -49,6 +63,14 @@ class MainWindow(QMainWindow):
         """Enter Voice Recognition mode with nothing loaded yet — same
         empty-state placeholder, File-menu-only shell."""
         self._enter_empty_editor(self.voice_recognition_page)
+
+    def _on_echo_mode(self):
+        """Enter the Echo workspace editor."""
+        self._enter_empty_editor(self.echo_page)
+
+    def _on_noise_removal_mode(self):
+        """Enter the Noise Removal workspace editor."""
+        self._enter_empty_editor(self.noise_page)
 
     def _enter_empty_editor(self, page):
         if not self._confirm_leave_workspace():

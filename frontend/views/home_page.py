@@ -11,6 +11,8 @@ class HomePage(QWidget):
 
     editor_mode_requested = Signal()
     voice_recognition_mode_requested = Signal()
+    echo_mode_requested = Signal()
+    noise_removal_mode_requested = Signal()
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -27,14 +29,20 @@ class HomePage(QWidget):
 
         editor_btn = QPushButton("Editor Mode")
         voice_btn = QPushButton("Voice Recognition Mode")
+        echo_btn = QPushButton("Echo Mode")
+        noise_btn = QPushButton("Noise Removal Mode")
 
-        for btn in (editor_btn, voice_btn):
+        for btn in (editor_btn, voice_btn, echo_btn, noise_btn):
             btn.setFixedWidth(220)
             btn.setFixedHeight(40)
 
         editor_btn.clicked.connect(self.editor_mode_requested.emit)
         voice_btn.clicked.connect(self.voice_recognition_mode_requested.emit)
+        echo_btn.clicked.connect(self.echo_mode_requested.emit)
+        noise_btn.clicked.connect(self.noise_removal_mode_requested.emit)
 
         layout.addWidget(title)
         layout.addWidget(editor_btn, alignment=Qt.AlignCenter)
         layout.addWidget(voice_btn, alignment=Qt.AlignCenter)
+        layout.addWidget(echo_btn, alignment=Qt.AlignCenter)
+        layout.addWidget(noise_btn, alignment=Qt.AlignCenter)

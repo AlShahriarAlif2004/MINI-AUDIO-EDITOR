@@ -519,10 +519,11 @@ class WorkspacePage(QWidget):
     open_workspace_requested = Signal()
     exit_requested = Signal()
 
-    def __init__(self, parent=None):
+    def __init__(self, parent=None, editor_type="editor"):
         super().__init__(parent)
         self._workspace: Workspace | None = None
         self._mode = "file"
+        self._editor_type = editor_type
         self._ops: dict[str, _OpEntry] = {}   # populated in _build_ui
         self._build_ui()
         self._busy_overlay = _BusyOverlay(self)
@@ -757,7 +758,8 @@ class WorkspacePage(QWidget):
         self._tool_btn.clicked.connect(self._on_tool_button_clicked)
 
         top_bar.addWidget(self._file_btn)
-        top_bar.addWidget(self._edit_btn)
+        if self._editor_type == "editor":
+            top_bar.addWidget(self._edit_btn)
         top_bar.addWidget(self._tool_btn)
         top_bar.addStretch()
         root_layout.addLayout(top_bar)
@@ -862,11 +864,19 @@ class WorkspacePage(QWidget):
         tool_options_layout.setContentsMargins(4, 4, 4, 4)
         tool_options_layout.setSpacing(6)
 
-        _TOOL_SECTIONS = [
-            ("General Tools", ["Delete Divisor"]),
-            ("Filtering Tools", ["Noise Removal"]),
-            ("Echo Tools", ["Add Echo", "Detect Echo"]),
-        ]
+        if self._editor_type == "echo":
+            _TOOL_SECTIONS = [
+                ("Echo Tools", ["Add Echo", "Detect Echo"]),
+            ]
+        elif self._editor_type == "noise":
+            _TOOL_SECTIONS = [
+                ("Filtering Tools", ["Noise Removal"]),
+            ]
+        else:
+            _TOOL_SECTIONS = [
+                ("General Tools", ["Delete Divisor"]),
+            ]
+
         _tool_specs_by_label = {spec["label"]: spec for spec in self._TOOL_OP_SPECS}
 
         self._tool_buttons: dict[str, QPushButton] = {}
