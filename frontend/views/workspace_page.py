@@ -513,6 +513,14 @@ class WorkspacePage(QWidget):
              begin="begin_echo", apply="apply_echo", cancel="cancel_echo",
              rebuild_signal="entity_echo_added", factor=False, needs_dialog=False,
              preview="update_echo_preview"),
+        # Detect Echo doesn't fit the generic single-shot Apply/Cancel shape
+        # either: it starts as Analyze/Cancel, and once Analyze runs its
+        # (read-only) blind-detection algorithm, Analyze is hidden and
+        # Cancel becomes OK. See _build_detect_echo_panel/
+        # _on_detect_echo_analyze_clicked/_on_detect_echo_cancel_clicked.
+        dict(key="detectecho", label="Detect Echo",
+             begin="begin_detect_echo", apply="apply_detect_echo", cancel="cancel_detect_echo",
+             rebuild_signal="entity_echo_detected", factor=False, needs_dialog=False),
     ]
 
     new_workspace_requested = Signal()
@@ -905,6 +913,8 @@ class WorkspacePage(QWidget):
                     # Echo panel with three parameter inputs
                     # Default delay will be set dynamically in begin_echo
                     panel, apply_btn, cancel_btn, echo_input = self._build_echo_panel(1.0)
+                elif spec.get("key") == "detectecho":
+                    panel, apply_btn, cancel_btn, echo_input = self._build_detect_echo_panel()
                 elif spec.get("custom_panel"):
                     panel, apply_btn, cancel_btn, echo_input = self._build_noise_panel()
                     echo_input = None
@@ -920,7 +930,10 @@ class WorkspacePage(QWidget):
 
                 key = spec["key"]
                 btn.clicked.connect(lambda checked=False, k=key: self._on_op_clicked(k))
-                if spec.get("custom_panel"):
+                if spec.get("key") == "detectecho":
+                    apply_btn.clicked.connect(lambda checked=False, k=key: self._on_detect_echo_analyze_clicked(k))
+                    cancel_btn.clicked.connect(lambda checked=False, k=key: self._on_detect_echo_cancel_clicked(k))
+                elif spec.get("custom_panel"):
                     apply_btn.clicked.connect(lambda checked=False, k=key: self._on_noise_action_clicked(k))
                     cancel_btn.clicked.connect(lambda checked=False, k=key: self._on_noise_cancel_clicked(k))
                 else:
@@ -1062,6 +1075,23 @@ class WorkspacePage(QWidget):
 
         panel.setVisible(False)
         return panel, apply_btn, cancel_btn, echo_input
+
+    def _build_detect_echo_panel(self):
+        """Detect Echo's panel: starts as Analyze/Cancel. Once Analyze
+        has run, the Analyze button is hidden and Cancel is relabeled OK
+        (see _on_detect_echo_analyze_clicked) -- either button always
+        just closes the panel and restores the previous view, since
+        detection never modifies the entity's actual clip."""
+        panel = QWidget()
+        layout = QHBoxLayout(panel)
+        layout.setContentsMargins(16, 0, 0, 0)
+        layout.setSpacing(6)
+        analyze_btn = QPushButton("Analyze")
+        cancel_btn = QPushButton("Cancel")
+        layout.addWidget(analyze_btn)
+        layout.addWidget(cancel_btn)
+        panel.setVisible(False)
+        return panel, analyze_btn, cancel_btn, None
 
     # ------------------------------------------------------------------
     # Mode switching
@@ -1308,7 +1338,11 @@ class WorkspacePage(QWidget):
             except TypeError:
                 pass
             entry.echo_parameters_slot = None
-        if entry.spec.get("custom_panel"):
+        if entry.spec.get("key") == "detectecho":
+            entry.apply_btn.setVisible(True)
+            entry.apply_btn.setText("Analyze")
+            entry.cancel_btn.setText("Cancel")
+        elif entry.spec.get("custom_panel"):
             entry.apply_btn.setText("Filter")
         self._refresh_tab_bar_lock()
 
@@ -1464,6 +1498,30 @@ class WorkspacePage(QWidget):
         view = entry.active_view
         self._collapse_op_ui(key)
         view.cancel_noise_removal()
+
+    # ------------------------------------------------------------------
+    # Detect Echo's two-stage panel (Analyze/Cancel -> OK)
+    # ------------------------------------------------------------------
+
+    def _on_detect_echo_analyze_clicked(self, key: str):
+        entry = self._ops[key]
+        if not entry.active or entry.active_view is None:
+            return
+        view = entry.active_view
+        self._busy_overlay.show_message("ANALYZING ECHO")
+        QApplication.processEvents()
+        view.analyze_echo()
+        self._busy_overlay.hide_overlay()
+        entry.apply_btn.setVisible(False)
+        entry.cancel_btn.setText("OK")
+
+    def _on_detect_echo_cancel_clicked(self, key: str):
+        entry = self._ops[key]
+        if not entry.active or entry.active_view is None:
+            return
+        view = entry.active_view
+        self._collapse_op_ui(key)
+        view.cancel_detect_echo()
 
     # ------------------------------------------------------------------
     # Entity-view factory / tab lifecycle

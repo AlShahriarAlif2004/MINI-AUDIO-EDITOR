@@ -46,6 +46,10 @@ class EntityPlotView(QWidget):
     entity_divisor_deleted = Signal()
     entity_noise_removed = Signal()
     entity_echo_added = Signal()
+    entity_echo_detected = Signal()   # never emitted -- Detect Echo is read-only,
+                                       # this exists only so the rebuild-signal
+                                       # framework (see _OP_SPECS handling in
+                                       # WorkspacePage) has something to connect to
     segment_selected = Signal(object, object, float, float)
     segment_deselected = Signal()
     """
@@ -92,6 +96,15 @@ class EntityPlotView(QWidget):
         
         self._echo_original_clip = None      # clip snapshot before echo is applied
         self._echo_parameters = None         # (occurrence, delay, decay) tuple
+
+        self._detect_echo_active = False     # True once "Detect Echo" panel is open
+        self._detect_echo_analyzed = False   # True once Analyze has been run
+        self._detect_echo_result = None      # dict from Discrete_Signal.detect_echo()
+        self._detect_echo_tab_widget = None  # container inserted above the normal players
+        self._detect_echo_tab_stack = None
+        self._detect_echo_tab_buttons = {}
+        self._detect_echo_tab_pages = {}
+        self._detect_echo_preview_players = []
 
         self._noise_removal_active = False   # True for either phase (selection or filtered)
         self._noise_filtered = False         # True once Filter has been clicked
@@ -1268,6 +1281,203 @@ class EntityPlotView(QWidget):
         """Reset echo-related state variables."""
         self._echo_original_clip = None
         self._echo_parameters = None
+
+    # ------------------------------------------------------------------
+    # Detect Echo
+    # ------------------------------------------------------------------
+    # Read-only tool: unlike every other Tool operation, nothing here
+    # ever touches self._entity.clip. Clicking "Detect Echo" only opens
+    # the Analyze/Cancel panel -- the plots stay exactly as they are
+    # (begin_detect_echo does nothing visible). Analyze is the step that
+    # actually runs the blind-detection algorithm and swaps the content
+    # area to the Source/Analysis tab strip, mirroring the Noise Removal
+    # tab-strip pattern (_build_noise_tabs) but read-only: Source shows
+    # the averaged signal (y[n]) as-is, Analysis shows the three
+    # estimated parameters plus the recovered pre-echo signal (x[n]).
+    # Both the Cancel-before-Analyze button and the OK-after-Analyze
+    # button end up calling cancel_detect_echo() -- there is nothing to
+    # "apply" here, since detection never modifies the entity.
+
+    def begin_detect_echo(self) -> bool:
+        """Arm Detect Echo mode. The visible plots are untouched until
+        Analyze is actually clicked (see analyze_echo)."""
+        if self._detect_echo_active:
+            return False
+
+        self._detect_echo_active = True
+        self._detect_echo_analyzed = False
+        self._detect_echo_result = None
+        self._lock_selection(True)
+        return True
+
+    def analyze_echo(self):
+        """Run the blind echo-detection algorithm on the entity's
+        sample-averaged signal and switch the content area to the
+        Source/Analysis tab strip."""
+        if not self._detect_echo_active or self._detect_echo_analyzed:
+            return
+
+        source_signal = self._entity.clip.average_channel_signal()
+        result = source_signal.detect_echo()
+
+        self._detect_echo_result = result
+        self._detect_echo_analyzed = True
+
+        for player in self._players:
+            player.setVisible(False)
+
+        self._build_detect_echo_tabs(source_signal, result)
+
+    def apply_detect_echo(self):
+        """Detect Echo never modifies the entity -- OK behaves exactly
+        like Cancel, just closing the panel and restoring the previous
+        view."""
+        self.cancel_detect_echo()
+
+    def cancel_detect_echo(self):
+        """Closes the panel from either phase: before Analyze (nothing
+        to tear down beyond the lock) or after (tear down the tab strip
+        and restore the normal plots)."""
+        if not self._detect_echo_active:
+            return
+
+        if self._detect_echo_analyzed:
+            self._teardown_detect_echo_tabs()
+            self._restore_normal_players()
+        else:
+            self._lock_selection(False)
+
+        self._reset_detect_echo_state()
+
+    def _reset_detect_echo_state(self):
+        self._detect_echo_active = False
+        self._detect_echo_analyzed = False
+        self._detect_echo_result = None
+
+    def _build_detect_echo_tabs(self, source_signal, result):
+        tabs = [("Source", "source"), ("Analysis", "analysis")]
+
+        container = QWidget()
+        outer = QVBoxLayout(container)
+        outer.setContentsMargins(0, 0, 0, 0)
+        outer.setSpacing(8)
+
+        tab_row = QHBoxLayout()
+        tab_row.setSpacing(6)
+        stack = QStackedWidget()
+
+        self._detect_echo_tab_buttons = {}
+        self._detect_echo_tab_pages = {}
+        self._detect_echo_preview_players = []
+
+        for label, key in tabs:
+            btn = QPushButton(label)
+            btn.setCheckable(True)
+            btn.clicked.connect(lambda checked=False, k=key: self._select_detect_echo_tab(k))
+            tab_row.addWidget(btn)
+            self._detect_echo_tab_buttons[key] = btn
+
+            page = self._build_detect_echo_tab_page(key, source_signal, result)
+            stack.addWidget(page)
+            self._detect_echo_tab_pages[key] = page
+
+        tab_row.addStretch()
+        outer.addLayout(tab_row)
+        outer.addWidget(stack)
+
+        self._detect_echo_tab_stack = stack
+        self._detect_echo_tab_widget = container
+        self._content_layout.insertWidget(0, container)
+
+        self._select_detect_echo_tab("source")
+
+    def _select_detect_echo_tab(self, key):
+        for k, btn in self._detect_echo_tab_buttons.items():
+            btn.setChecked(k == key)
+        self._detect_echo_tab_stack.setCurrentWidget(self._detect_echo_tab_pages[key])
+
+    def _build_detect_echo_tab_page(self, key, source_signal, result):
+        page = QWidget()
+        layout = QVBoxLayout(page)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(8)
+
+        if key == "source":
+            times = self._time_axis(source_signal)
+            player = WaveformPlayer(
+                times=times,
+                series=[(source_signal.samples, _CHANNEL_COLORS[0], "Average")],
+                sample_rate=source_signal.sample_rate,
+                audio_data=source_signal.samples.astype(np.float32),
+                group=self._group,
+                entity=self._entity,
+                channel_index=None,
+                is_driver=False,
+                show_markers=False,
+                show_clip_button=False,
+            )
+            player.set_tool_mode(True)
+            layout.addWidget(player)
+            self._detect_echo_preview_players.append(player)
+            return page
+
+        # key == "analysis"
+        occurrence = result["occurrence"]
+        delay = result["delay"]
+        decay = result["decay"]
+        recovered = result["recovered"]
+
+        fields = [
+            ("Occurrence", str(occurrence)),
+            ("Delay", f"{delay:.4f} s"),
+            ("Decay", f"{decay:.4f}"),
+        ]
+        for name, value in fields:
+            row = QHBoxLayout()
+            row.setSpacing(6)
+            name_label = QLabel(f"{name}:")
+            name_label.setStyleSheet("font-weight: 600;")
+            value_label = QLabel(value)
+            row.addWidget(name_label)
+            row.addStretch()
+            row.addWidget(value_label)
+            layout.addLayout(row)
+
+        title = QLabel("Base Signal")
+        title.setStyleSheet("font-size: 15px; font-weight: 600; margin-top: 8px;")
+        layout.addWidget(title)
+
+        times = self._time_axis(recovered)
+        player = WaveformPlayer(
+            times=times,
+            series=[(recovered.samples, _CHANNEL_COLORS[1], "Base Signal")],
+            sample_rate=recovered.sample_rate,
+            audio_data=recovered.samples.astype(np.float32),
+            group=self._group,
+            entity=self._entity,
+            channel_index=None,
+            is_driver=False,
+            show_markers=False,
+            show_clip_button=False,
+        )
+        player.set_tool_mode(True)
+        layout.addWidget(player)
+        self._detect_echo_preview_players.append(player)
+
+        return page
+
+    def _teardown_detect_echo_tabs(self):
+        if self._detect_echo_tab_widget is None:
+            return
+        for player in self._detect_echo_preview_players:
+            player.force_idle()
+        self._content_layout.removeWidget(self._detect_echo_tab_widget)
+        self._detect_echo_tab_widget.deleteLater()
+        self._detect_echo_tab_widget = None
+        self._detect_echo_tab_stack = None
+        self._detect_echo_tab_buttons = {}
+        self._detect_echo_tab_pages = {}
+        self._detect_echo_preview_players = []
     # Only valid when the Overall plot is selected (enforced by the caller
     # via _OVERALL_ONLY_OPS). Each chosen source is a division-bounded
     # *segment* of some entity's Overall plot (not necessarily the whole
@@ -1477,6 +1687,7 @@ class EntityPlotView(QWidget):
         self.cancel_fade_in()
         self.cancel_fade_out()
         self.cancel_echo()
+        self.cancel_detect_echo()
         self.cancel_concatenate()
         for player in self._players:
             player.force_idle()

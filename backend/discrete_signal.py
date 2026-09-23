@@ -514,3 +514,181 @@ class Discrete_Signal:
         result = self.convolution(h_signal)
 
         return result
+
+    def detect_echo(self, max_occurrence=12, min_delay_seconds=0.005):
+        """
+        Blind estimation of the echo effect echo() applies: the impulse
+        response is assumed to be the same constant-spacing, geometric-
+        decay model --
+
+            h[n] = sum_{i=0}^{occurrence-1} r^i * delta[n - i*D],  r = 1 - decay
+
+        -- so that recovering (occurrence, delay, decay) from y[n] alone
+        is a well-posed, parametric problem instead of a generically
+        unsolvable one (arbitrary h[n] blind deconvolution has infinitely
+        many solutions). This is still an *estimate*: it assumes the
+        pre-echo signal x[n] is broadband/generic, not itself periodic or
+        sparse at the same spacing as the echo.
+
+        Steps (dominant cost is the FFT/IFFT pairs, so O(n log n)):
+          1. Y = FFT(y)
+          2. Autocorrelation (Wiener-Khinchin: IFFT(|Y|^2))
+             -> candidate echo spacing D
+          3. Real cepstrum c = IFFT(log|Y|)
+             -> echo structure shows up as peaks at D, 2D, 3D, ...
+          4. Least-squares fit of log(m * c[mD]) = m * log(r)
+             -> decay rate r                                       (O(k))
+          5. Threshold the cepstrum peaks against the strongest one
+             -> occurrence count                                   (O(k))
+          6. Recursive cancellation using the geometric-series identity
+             for H(z):
+                 x[n] = y[n] - r*y[n-D] + r^occurrence * x[n - occurrence*D]
+             -> recovers the pre-echo signal x[n]                  (O(n))
+
+        Returns a dict:
+          {
+            "occurrence": int,              # matches echo()'s occurrence
+            "delay":      float,            # seconds, matches echo()'s delay
+            "decay":      float,            # 0.0 - 1.0, matches echo()'s decay
+            "recovered":  Discrete_Signal,  # the estimated x[n]
+          }
+        """
+        y = self.samples.astype(np.float64)
+        n = len(y)
+
+        if n < 4:
+            return {
+                "occurrence": 1,
+                "delay": min_delay_seconds,
+                "decay": 0.0,
+                "recovered": self.copy(),
+            }
+
+        # ---- 1 & 2: autocorrelation (linear, via zero-padded FFT) to
+        # find candidate echo spacings. Padding to >= 2n-1 avoids the
+        # wraparound a plain circular autocorrelation would have.
+        pad_len = _next_power_of_two(2 * n - 1)
+        y_padded = np.zeros(pad_len, dtype=np.float64)
+        y_padded[:n] = y
+        spectrum_padded = BluesteinFFT.fft(y_padded)
+        power = np.abs(spectrum_padded) ** 2
+        autocorr = BluesteinFFT.ifft(power).real
+
+        min_lag = max(1, int(round(min_delay_seconds * self.sample_rate)))
+        max_lag = max(min_lag + 1, n // 2)
+        window = autocorr[min_lag:max_lag]
+
+        # Several candidate spacings (local maxima of the autocorrelation,
+        # not just its single global peak) get tried below -- x[n]'s own
+        # periodicity can otherwise out-rank the real echo spacing.
+        candidate_lags = [
+            min_lag + i for i in range(1, len(window) - 1)
+            if window[i] > window[i - 1] and window[i] >= window[i + 1]
+        ]
+        if not candidate_lags:
+            candidate_lags = [min_lag + int(np.argmax(window))] if len(window) else [min_lag]
+        candidate_lags.sort(key=lambda lag: autocorr[lag], reverse=True)
+        candidate_lags = candidate_lags[:6]
+
+        # ---- 3: real cepstrum of y itself (magnitude only -- avoids the
+        # phase-unwrapping issues a complex cepstrum would run into).
+        spectrum = BluesteinFFT.fft(y)
+        log_magnitude = np.log(np.maximum(np.abs(spectrum), 1e-12))
+        cepstrum = BluesteinFFT.ifft(log_magnitude).real
+        abs_cepstrum = np.abs(cepstrum)
+
+        # ---- 4 & 5: for each candidate spacing D, walk c[D], c[2D], ...
+        # and keep only the *consecutive* run starting at m=1 whose
+        # values clear a significance threshold set from the cepstrum's
+        # own typical magnitude *elsewhere* (not from these peaks
+        # themselves, which would be circular). The candidate producing
+        # the longest well-fit run wins; its slope gives the decay rate.
+        best = None   # (score, D, k, r)
+
+        for delay_samples in candidate_lags:
+            if delay_samples <= 0:
+                continue
+            max_m = min(max_occurrence - 1, (n - 1) // delay_samples)
+            if max_m < 1:
+                continue
+
+            mask = np.ones(n, dtype=bool)
+            for m in range(1, max_m + 1):
+                idx = m * delay_samples
+                if idx < n:
+                    mask[max(0, idx - 1):min(n, idx + 2)] = False
+            baseline_pool = abs_cepstrum[mask] if mask.any() else abs_cepstrum
+            baseline = float(np.median(baseline_pool)) + 1e-9
+            threshold = baseline * 3.0
+
+            xs, ys = [], []
+            for m in range(1, max_m + 1):
+                idx = m * delay_samples
+                if idx >= n:
+                    break
+                value = cepstrum[idx]
+                if value <= threshold:
+                    break
+                product = m * value
+                if product <= 1e-10:
+                    break
+                xs.append(float(m))
+                ys.append(float(np.log(product)))
+
+            if not xs:
+                continue
+
+            xs_arr = np.asarray(xs)
+            ys_arr = np.asarray(ys)
+            slope = float(np.sum(xs_arr * ys_arr) / np.sum(xs_arr * xs_arr))
+            r_candidate = min(max(float(np.exp(slope)), 0.0), 0.999)
+
+            if len(xs) > 1:
+                predicted = slope * xs_arr
+                ss_res = float(np.sum((ys_arr - predicted) ** 2))
+                ss_tot = float(np.sum((ys_arr - ys_arr.mean()) ** 2)) + 1e-9
+                fit_quality = 1.0 - ss_res / ss_tot
+            else:
+                fit_quality = 0.5   # a single peak can't show a trend either way
+
+            score = len(xs) + fit_quality
+            if best is None or score > best[0]:
+                best = (score, delay_samples, len(xs), r_candidate)
+
+        if best is None:
+            # No candidate spacing showed a credible, above-baseline echo
+            # pattern -- report "no echo detected" rather than a forced
+            # guess, and hand the signal back unchanged.
+            fallback_delay = candidate_lags[0] if candidate_lags else min_lag
+            return {
+                "occurrence": 1,
+                "delay": fallback_delay / self.sample_rate,
+                "decay": 0.0,
+                "recovered": self.copy(),
+            }
+
+        _, delay_samples, k, r = best
+        occurrence = max(1, min(k + 1, max_occurrence))
+
+        # ---- 6: recursive cancellation -- reuses the geometric-series
+        # identity for H(z) that echo()'s impulse response satisfies, so
+        # each sample costs O(1) regardless of how large occurrence is.
+        x = np.zeros(n, dtype=np.float64)
+        r_pow_occurrence = r ** occurrence
+        far_lag = occurrence * delay_samples
+        for i in range(n):
+            value = y[i]
+            if i - delay_samples >= 0:
+                value -= r * y[i - delay_samples]
+            if i - far_lag >= 0:
+                value += r_pow_occurrence * x[i - far_lag]
+            x[i] = value
+
+        recovered = Discrete_Signal(x, self.sample_rate, self.start_index)
+
+        return {
+            "occurrence": occurrence,
+            "delay": delay_samples / self.sample_rate,
+            "decay": round(1.0 - r, 6),
+            "recovered": recovered,
+        }
