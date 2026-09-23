@@ -684,7 +684,15 @@ class Discrete_Signal:
                 value += r_pow_occurrence * x[i - far_lag]
             x[i] = value
 
-        recovered = Discrete_Signal(x, self.sample_rate, self.start_index)
+        # echo() convolves the original x[n] (length d) with an impulse
+        # response of length (occurrence-1)*delay_samples + 1, so
+        # len(y) = d + (occurrence-1)*delay_samples. x[n] is therefore
+        # shorter than y[n] by exactly (occurrence-1)*delay_samples --
+        # everything the recursion produces past that point is trailing
+        # echo structure it didn't fully cancel, not real signal, and
+        # keeping it is what made the recovered audio repeat.
+        base_length = max(1, n - (occurrence - 1) * delay_samples)
+        recovered = Discrete_Signal(x[:base_length], self.sample_rate, self.start_index)
 
         return {
             "occurrence": occurrence,
