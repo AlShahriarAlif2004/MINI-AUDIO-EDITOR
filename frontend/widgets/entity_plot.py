@@ -92,6 +92,9 @@ class EntityPlotView(QWidget):
                                        # this exists only so the rebuild-signal
                                        # framework (see _OP_SPECS handling in
                                        # WorkspacePage) has something to connect to
+    entity_frequency_domain_shown = Signal()   # never emitted -- Show Frequency
+                                       # Domain never modifies the entity either,
+                                       # same reasoning as entity_echo_detected above
     segment_selected = Signal(object, object, float, float)
     segment_deselected = Signal()
     """
@@ -164,6 +167,7 @@ class EntityPlotView(QWidget):
 
         self._frequency_domain_available = False   # Frequency Mode's "Show Frequency Domain" tool
         self._spectrum_page = None                 # built lazily, on first switch to it
+        self._freqdomain_active = False            # True while the tool's panel is open
 
         self._build_ui()
 
@@ -1791,13 +1795,43 @@ class EntityPlotView(QWidget):
         return bar
 
     def set_frequency_domain_available(self, enabled: bool):
-        """Called by WorkspacePage when Frequency Mode's 'Show Frequency
-        Domain' tool is toggled on/off. Off means: hide the toggle bar
-        and fall back to the normal, always-available time-domain view."""
+        """Reveal (or hide) the Time Domain / Frequency Domain toggle
+        bar. Off falls back to the normal, always-available time-domain
+        view -- used only as a safety net; nothing currently turns this
+        back off once Show Frequency Domain has revealed it."""
         self._frequency_domain_available = enabled
         self._domain_toggle_bar.setVisible(enabled)
         if not enabled:
             self._show_time_domain()
+
+    # ---- Frequency Mode's "Show Frequency Domain" tool: begin (arm) /
+    # show (compute + reveal, the slow step) / close (dismiss the
+    # panel). Mirrors Detect Echo's begin/analyze/cancel shape, except
+    # closing never undoes anything -- the toggle bar it reveals is a
+    # view it adds, not a preview it needs to roll back. ----
+
+    def begin_frequency_domain(self) -> bool:
+        if self._freqdomain_active:
+            return False
+        self._freqdomain_active = True
+        return True
+
+    def show_frequency_domain(self):
+        """The actual X[k] computation happens here (inside
+        _build_spectrum_ui, via _channel_spectrum) -- this is the step
+        WorkspacePage wraps in its busy-overlay spinner."""
+        if not self._freqdomain_active:
+            return
+        self.set_frequency_domain_available(True)
+        self._show_frequency_domain()
+
+    def close_frequency_domain(self):
+        """Dismisses the tool panel. The toggle bar (and whichever
+        domain is currently selected) is left exactly as-is, whether
+        this is an early Cancel (nothing was ever shown) or the final
+        OK after Show (something was)."""
+        self._freqdomain_active = False
+        self.set_frequency_domain_available(False)
 
     def _show_time_domain(self):
         self._time_domain_btn.setChecked(True)
