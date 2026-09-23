@@ -716,3 +716,38 @@ class Discrete_Signal:
             "decay": round(1.0 - r, 6),
             "recovered": recovered,
         }
+
+    def equalize(self, k: int, new_xk: complex) -> "Discrete_Signal":
+        """
+        Replace the DFT coefficient X[k] (and the conjugate mirror bin
+        X[N-k] so the reconstructed signal stays real) with `new_xk`,
+        then IFFT-reconstruct and return a new Discrete_Signal.
+
+        Parameters
+        ----------
+        k       : bin index, 0 <= k < N (N = len(self.samples))
+        new_xk  : new complex coefficient value for bin k
+
+        If k == 0 or k == N/2 (DC and Nyquist), the imaginary part of
+        new_xk is forced to zero to preserve a real-valued output.
+        """
+        spectrum = BluesteinFFT.fft(self.samples.astype(np.float64))
+        n = len(spectrum)
+
+        k = int(k)
+        if not (0 <= k < n):
+            raise ValueError(f"k={k} is out of range [0, {n-1}]")
+
+        # Bins where imaginary part must be zero (DC and Nyquist)
+        if k == 0 or (n % 2 == 0 and k == n // 2):
+            new_xk = complex(new_xk.real, 0.0)
+
+        spectrum[k] = new_xk
+
+        # Maintain Hermitian symmetry so IFFT yields a real signal.
+        mirror = (n - k) % n
+        if mirror != k:
+            spectrum[mirror] = np.conj(new_xk)
+
+        reconstructed = BluesteinFFT.ifft(spectrum).real
+        return Discrete_Signal(reconstructed, self.sample_rate, self.start_index)

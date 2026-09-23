@@ -95,6 +95,7 @@ class EntityPlotView(QWidget):
     entity_frequency_domain_shown = Signal()   # never emitted -- Show Frequency
                                        # Domain never modifies the entity either,
                                        # same reasoning as entity_echo_detected above
+    entity_equalizer_applied = Signal()  # emitted when equalizer Apply commits
     segment_selected = Signal(object, object, float, float)
     segment_deselected = Signal()
     """
@@ -168,6 +169,11 @@ class EntityPlotView(QWidget):
         self._frequency_domain_available = False   # Frequency Mode's "Show Frequency Domain" tool
         self._spectrum_page = None                 # built lazily, on first switch to it
         self._freqdomain_active = False            # True while the tool's panel is open
+
+        self._equalizer_active = False             # True while the Equalizer tool panel is open
+        self._equalizer_original_clip = None       # clip snapshot saved at begin_equalizer
+        self._equalizer_k = None                   # last-found FFT bin index
+        self._equalizer_coefficients = None        # list[complex] – one per channel at bin k
 
         self._build_ui()
 
@@ -1551,6 +1557,105 @@ class EntityPlotView(QWidget):
         self._detect_echo_tab_buttons = {}
         self._detect_echo_tab_pages = {}
         self._detect_echo_preview_players = []
+
+    # ------------------------------------------------------------------
+    # Equalizer
+    # ------------------------------------------------------------------
+    # Tool operation: lets the user find X[k] for a given frequency, edit
+    # the per-channel coefficients, see the spectrum graph update in real
+    # time, and then commit (Apply) or revert (Cancel).
+
+    def begin_equalizer(self) -> bool:
+        """Arm the Equalizer tool. Saves a clip snapshot so Cancel can
+        restore it, then locks segment selection while the panel is open."""
+        if self._equalizer_active:
+            return False
+        self._equalizer_active = True
+        self._equalizer_original_clip = self._entity.clip.copy()
+        self._equalizer_k = None
+        self._equalizer_coefficients = None
+        self._lock_selection(True)
+        return True
+
+    def find_equalizer_coefficients(self, k: int) -> list:
+        """Compute FFT for every channel and return the list of X[k]
+        complex coefficients (one per channel). k is clamped to
+        [0, N-1] where N = len of the first channel's samples.
+        Returns an empty list if the equalizer is not armed."""
+        if not self._equalizer_active:
+            return []
+        clip = self._entity.clip  # use the current (possibly modified) clip
+        coefficients = []
+        for ch in clip.channels:
+            _, spectrum = ch.fft()
+            n = len(spectrum)
+            safe_k = max(0, min(k, n - 1))
+            coefficients.append(complex(spectrum[safe_k]))
+        self._equalizer_k = k
+        self._equalizer_coefficients = list(coefficients)
+        return coefficients
+
+    def update_equalizer_preview(self, k: int, coefficients: list):
+        """Apply the edited X[k] coefficients to each channel via the
+        equalize() signal-processing method and emit the rebuild signal
+        so the spectrum graph refreshes instantaneously.
+        coefficients: list[complex], one per channel."""
+        if not self._equalizer_active or self._equalizer_original_clip is None:
+            return
+
+        self._equalizer_k = k
+        self._equalizer_coefficients = list(coefficients)
+
+        # Start from the *original* clip so edits don't accumulate.
+        base_clip = self._equalizer_original_clip
+        new_channels = []
+        for ch_idx, ch in enumerate(base_clip.channels):
+            coeff = coefficients[ch_idx] if ch_idx < len(coefficients) else 0.0
+            try:
+                new_ch = ch.equalize(k, coeff)
+            except Exception:
+                new_ch = ch.copy()
+            new_channels.append(new_ch)
+
+        from backend.audio_clip import AudioClip  # local import avoids circular
+        modified_clip = AudioClip(new_channels, name=base_clip.name)
+        self._entity.clip = modified_clip
+
+        # Refresh the spectrum graph in the right-side view.
+        # Re-computing a full equalize every keystroke is fast enough:
+        # Bluestein FFT + IFFT pair on typical audio is O(N log N).
+        self.entity_equalizer_applied.emit()
+
+    def apply_equalizer(self):
+        """Commit the current (equalized) clip to the entity permanently."""
+        if not self._equalizer_active:
+            return
+        # self._entity.clip already holds the equalized version;
+        # nothing more to do except clean up state.
+        self._reset_equalizer_state()
+        self._lock_selection(False)
+        self.clear_all_selection()
+        self.entity_modified.emit()
+        self.entity_equalizer_applied.emit()
+
+    def cancel_equalizer(self):
+        """Revert to the original clip (before Equalizer was opened)."""
+        if not self._equalizer_active:
+            return
+        if self._equalizer_original_clip is not None:
+            self._entity.clip = self._equalizer_original_clip
+        self._reset_equalizer_state()
+        self._lock_selection(False)
+        self.clear_all_selection()
+        # Notify the graph view so it re-draws the restored data.
+        self.entity_equalizer_applied.emit()
+
+    def _reset_equalizer_state(self):
+        self._equalizer_active = False
+        self._equalizer_original_clip = None
+        self._equalizer_k = None
+        self._equalizer_coefficients = None
+
     # Only valid when the Overall plot is selected (enforced by the caller
     # via _OVERALL_ONLY_OPS). Each chosen source is a division-bounded
     # *segment* of some entity's Overall plot (not necessarily the whole
@@ -1908,6 +2013,7 @@ class EntityPlotView(QWidget):
         self.cancel_echo()
         self.cancel_detect_echo()
         self.cancel_concatenate()
+        self.cancel_equalizer()
         for player in self._players:
             player.force_idle()
         self.clear_all_selection()
