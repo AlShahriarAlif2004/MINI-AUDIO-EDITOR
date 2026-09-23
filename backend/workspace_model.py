@@ -210,10 +210,12 @@ class Workspace:
 
         entities = self._collect_entities()
 
-        # write/refresh audio assets (always stored internally as WAV)
+        # write/refresh audio assets (internally as 32-bit float WAV so that
+        # sample values beyond ±1.0 — e.g. after vertical scale > 1.0 — are
+        # preserved exactly and the plot autoscales correctly on reopen).
         for entity in entities:
             asset_path = os.path.join(assets_dir, f"{entity.id}.wav")
-            WavIO.unload(entity.clip, asset_path)
+            WavIO.unload_internal(entity.clip, asset_path)
 
         # remove orphaned asset files (entities deleted since last save)
         valid_filenames = {f"{entity.id}.wav" for entity in entities}

@@ -39,16 +39,39 @@ class WavIO(AudioClipIO):
         return AudioClip(channels, name=None)
 
     @staticmethod
-    def unload(clip: AudioClip, path, sample_width=2):
-        if sample_width not in WavIO._SUBTYPE_BY_WIDTH:
-            raise ValueError(f"Unsupported WAV sample width: {sample_width} bytes")
+    def unload(clip: AudioClip, path, sample_width=2, clip_values=True):
+        """Write clip to *path* as WAV.
 
-        subtype = WavIO._SUBTYPE_BY_WIDTH[sample_width]
+        clip_values=True  (default) clamps samples to ±1.0 and writes with
+                          the PCM subtype matching *sample_width* — suitable
+                          for user-facing export where hard clipping is the
+                          expected behaviour of audio formats.
 
+        clip_values=False  skips clamping and writes with the 32-bit IEEE
+                           float subtype, which fully preserves sample values
+                           outside ±1.0 — used for lossless workspace-internal
+                           storage so that vertically-scaled audio survives the
+                           save/reload round-trip without data loss.
+        """
         stacked = np.stack([ch.samples for ch in clip.channels], axis=1)
-        stacked = np.clip(stacked, -1.0, 1.0)
+
+        if clip_values:
+            if sample_width not in WavIO._SUBTYPE_BY_WIDTH:
+                raise ValueError(f"Unsupported WAV sample width: {sample_width} bytes")
+            subtype = WavIO._SUBTYPE_BY_WIDTH[sample_width]
+            stacked = np.clip(stacked, -1.0, 1.0)
+        else:
+            # 32-bit float WAV: no clipping, full numeric range preserved.
+            subtype = "FLOAT"
 
         sf.write(path, stacked, clip.sample_rate, subtype=subtype)
+
+    @staticmethod
+    def unload_internal(clip: AudioClip, path):
+        """Workspace-internal save: 32-bit float WAV, no clipping.
+        Preserves sample values beyond ±1.0 exactly so that editing
+        operations (e.g. vertical scale) survive workspace close/reopen."""
+        WavIO.unload(clip, path, clip_values=False)
 
 class MP3IO(AudioClipIO):
     """
