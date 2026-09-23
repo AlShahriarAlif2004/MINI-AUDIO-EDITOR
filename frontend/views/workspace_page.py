@@ -521,6 +521,11 @@ class WorkspacePage(QWidget):
         dict(key="detectecho", label="Detect Echo",
              begin="begin_detect_echo", apply="apply_detect_echo", cancel="cancel_detect_echo",
              rebuild_signal="entity_echo_detected", factor=False, needs_dialog=False),
+        # Show Frequency Domain doesn't fit the Apply/Cancel shape either --
+        # it's a plain on/off toggle that switches every open (and future)
+        # entity tab between its normal Time Domain view and a read-only
+        # X[k] Frequency Domain view. See _on_tool_toggle_clicked.
+        dict(key="freqdomain", label="Show Frequency Domain", toggle=True),
     ]
 
     new_workspace_requested = Signal()
@@ -532,6 +537,7 @@ class WorkspacePage(QWidget):
         self._workspace: Workspace | None = None
         self._mode = "file"
         self._editor_type = editor_type
+        self._frequency_domain_enabled = False   # Frequency Mode's toggle state
         self._ops: dict[str, _OpEntry] = {}   # populated in _build_ui
         self._build_ui()
         self._busy_overlay = _BusyOverlay(self)
@@ -885,6 +891,13 @@ class WorkspacePage(QWidget):
             _TOOL_SECTIONS = [
                 ("Filtering Tools", ["Noise Removal"]),
             ]
+        elif self._editor_type == "frequency":
+            _TOOL_SECTIONS = [
+                # "Equalizer" has no matching _TOOL_OP_SPECS entry, so it
+                # stays a plain disabled placeholder (see the `if spec is
+                # None: continue` below) -- deactivated, as intended.
+                ("Frequency Tools", ["Show Frequency Domain", "Equalizer"]),
+            ]
         else:
             _TOOL_SECTIONS = [
                 ("General Tools", ["Delete Divisor"]),
@@ -907,6 +920,16 @@ class WorkspacePage(QWidget):
                 self._tool_buttons[label] = btn
 
                 if spec is None:
+                    continue
+
+                if spec.get("toggle"):
+                    # No panel, no Apply/Cancel, no _OpEntry -- just a
+                    # plain checkable on/off button.
+                    btn.setCheckable(True)
+                    key = spec["key"]
+                    btn.clicked.connect(
+                        lambda checked, k=key: self._on_tool_toggle_clicked(k, checked)
+                    )
                     continue
 
                 if spec.get("key") == "echo":
@@ -1289,6 +1312,20 @@ class WorkspacePage(QWidget):
         for label, btn in self._tool_buttons.items():
             btn.setEnabled(has_selected_tab and label in implemented_labels)
 
+    def _on_tool_toggle_clicked(self, key: str, checked: bool):
+        """Handles every plain on/off tool button (currently just 'Show
+        Frequency Domain'). Applies to every open entity tab at once,
+        and is remembered so tabs opened afterwards start in the same
+        state -- see _make_entity_view."""
+        if key == "freqdomain":
+            self._frequency_domain_enabled = checked
+            btn = self._tool_buttons["Show Frequency Domain"]
+            btn.setStyleSheet(self._SELECTED_OPTION_STYLE if checked else "")
+            for i in range(1, self._content_stack.count()):
+                widget = self._content_stack.widget(i)
+                if hasattr(widget, "set_frequency_domain_available"):
+                    widget.set_frequency_domain_available(checked)
+
     def _on_segment_selected(self, entity, channel_index, start, end):
         # Update label to include the time range
         label_text = "Overall" if channel_index is None else f"Channel {channel_index + 1}"
@@ -1537,6 +1574,7 @@ class WorkspacePage(QWidget):
             signal.connect(lambda entity=entity: self._rebuild_entity_tab(entity))
         entity_view.set_edit_mode(self._mode == "edit")
         entity_view.set_tool_mode(self._mode == "tool")
+        entity_view.set_frequency_domain_available(self._frequency_domain_enabled)
         return entity_view
 
     def _open_entity_tab(self, entity: Entity):

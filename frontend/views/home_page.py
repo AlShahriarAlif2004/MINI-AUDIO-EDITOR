@@ -77,6 +77,7 @@ class HomePage(QWidget):
     voice_recognition_mode_requested = Signal()
     echo_mode_requested = Signal()
     noise_removal_mode_requested = Signal()
+    frequency_mode_requested = Signal()
 
     # (icon, label, signal-attr-name, accent color)
     _MODE_CARDS = [
@@ -84,6 +85,7 @@ class HomePage(QWidget):
         ("\U0001F399\ufe0f", "Voice Recognition", "voice_recognition_mode_requested", "#7ED9A6"),
         ("\U0001F501", "Echo Mode", "echo_mode_requested", "#F2A65A"),
         ("\U0001F9F9", "Noise Removal", "noise_removal_mode_requested", "#E56B8C"),
+        ("\U0001F4CA", "Frequency Mode", "frequency_mode_requested", "#9575CD"),
     ]
 
     def __init__(self, parent=None):

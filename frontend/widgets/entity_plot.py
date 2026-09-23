@@ -1,4 +1,5 @@
 import numpy as np
+import pyqtgraph as pg
 from PySide6.QtCore import Qt, Signal
 from PySide6.QtWidgets import (
     QApplication, QWidget, QVBoxLayout, QHBoxLayout, QLabel, QScrollArea,
@@ -31,6 +32,47 @@ class _SegmentCanvas(QWidget):
     def mousePressEvent(self, event):
         self.clicked_empty.emit()
         super().mousePressEvent(event)
+
+
+class _SpectrumPlot(QWidget):
+    """
+    Read-only magnitude-spectrum plot: |X[k]| vs frequency, up to the
+    Nyquist frequency. Frequency Mode never plays audio, so unlike
+    WaveformPlayer this has no playback controls, playhead, or
+    selection/editing machinery at all -- it just draws curves.
+    """
+
+    def __init__(self, series, title, parent=None):
+        """series -- list of (frequencies, magnitudes, color, label)
+        tuples, drawn in order on the same axes. A single entry for a
+        per-channel plot; two entries (Ch 1 then Ch 2) for the stereo
+        'Overall' spectrum, with Ch 2 layered on top of Ch 1."""
+        super().__init__(parent)
+
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(4)
+
+        title_lbl = QLabel(title)
+        title_lbl.setStyleSheet("font-size: 15px; font-weight: 600; padding: 4px;")
+        layout.addWidget(title_lbl)
+
+        plot = pg.PlotWidget()
+        plot.setBackground(None)
+        plot.showGrid(x=True, y=True, alpha=0.3)
+        plot.setLabel("bottom", "Frequency", "Hz")
+        plot.setLabel("left", "|X[k]|")
+        plot.setMouseEnabled(x=False, y=False)
+        plot.setMinimumHeight(150)
+
+        if len(series) > 1:
+            plot.addLegend()
+
+        for freqs, magnitudes, color, label in series:
+            plot.plot(freqs, magnitudes, pen=pg.mkPen(color=color, width=1), name=label)
+
+        layout.addWidget(plot)
+
 
 class EntityPlotView(QWidget):
 
@@ -119,6 +161,9 @@ class EntityPlotView(QWidget):
         self._noise_tab_buttons = {}
         self._noise_tab_pages = {}
         self._noise_preview_players = []     # every WaveformPlayer built for the tab strip
+
+        self._frequency_domain_available = False   # Frequency Mode's "Show Frequency Domain" tool
+        self._spectrum_page = None                 # built lazily, on first switch to it
 
         self._build_ui()
 
@@ -1640,10 +1685,16 @@ class EntityPlotView(QWidget):
     def _build_ui(self):
         outer_layout = QVBoxLayout(self)
         outer_layout.setContentsMargins(0, 0, 0, 0)
+        outer_layout.setSpacing(0)
+
+        outer_layout.addWidget(self._build_domain_toggle_bar())
+
+        self._domain_stack = QStackedWidget()
+        outer_layout.addWidget(self._domain_stack)
 
         scroll = QScrollArea()
         scroll.setWidgetResizable(True)
-        outer_layout.addWidget(scroll)
+        self._domain_stack.addWidget(scroll)   # index 0: Time Domain (always built)
 
         container = _SegmentCanvas()
         layout = QVBoxLayout(container)
@@ -1699,6 +1750,116 @@ class EntityPlotView(QWidget):
         layout.addStretch()
         scroll.setWidget(container)
         self._content_layout = layout
+
+    # ------------------------------------------------------------------
+    # Frequency Mode: Time Domain / Frequency Domain toggle
+    # ------------------------------------------------------------------
+
+    _DOMAIN_BTN_STYLE = """
+        QPushButton:checked {
+            background-color: #2f81f7;
+            color: white;
+            font-weight: 600;
+        }
+    """
+
+    def _build_domain_toggle_bar(self):
+        """Time Domain / Frequency Domain buttons. Hidden by default --
+        made visible only once Frequency Mode's 'Show Frequency Domain'
+        tool is switched on (see set_frequency_domain_available)."""
+        bar = QWidget()
+        row = QHBoxLayout(bar)
+        row.setContentsMargins(12, 8, 12, 8)
+        row.setSpacing(8)
+
+        self._time_domain_btn = QPushButton("Time Domain")
+        self._freq_domain_btn = QPushButton("Frequency Domain")
+        for btn in (self._time_domain_btn, self._freq_domain_btn):
+            btn.setCheckable(True)
+            btn.setStyleSheet(self._DOMAIN_BTN_STYLE)
+
+        self._time_domain_btn.setChecked(True)
+        self._time_domain_btn.clicked.connect(self._show_time_domain)
+        self._freq_domain_btn.clicked.connect(self._show_frequency_domain)
+
+        row.addWidget(self._time_domain_btn)
+        row.addWidget(self._freq_domain_btn)
+        row.addStretch()
+
+        bar.setVisible(False)
+        self._domain_toggle_bar = bar
+        return bar
+
+    def set_frequency_domain_available(self, enabled: bool):
+        """Called by WorkspacePage when Frequency Mode's 'Show Frequency
+        Domain' tool is toggled on/off. Off means: hide the toggle bar
+        and fall back to the normal, always-available time-domain view."""
+        self._frequency_domain_available = enabled
+        self._domain_toggle_bar.setVisible(enabled)
+        if not enabled:
+            self._show_time_domain()
+
+    def _show_time_domain(self):
+        self._time_domain_btn.setChecked(True)
+        self._freq_domain_btn.setChecked(False)
+        self._domain_stack.setCurrentIndex(0)
+
+    def _show_frequency_domain(self):
+        if self._spectrum_page is None:
+            self._spectrum_page = self._build_spectrum_ui()
+            self._domain_stack.addWidget(self._spectrum_page)   # index 1
+        # Frequency Domain has no play button -- stop anything playing
+        # in the time-domain view before leaving it.
+        for player in self._players:
+            player.force_idle()
+        self._time_domain_btn.setChecked(False)
+        self._freq_domain_btn.setChecked(True)
+        self._domain_stack.setCurrentIndex(1)
+
+    @staticmethod
+    def _channel_spectrum(channel):
+        """(frequencies, magnitudes) for one channel, kept to 0..Nyquist
+        -- the upper half of a real signal's DFT just mirrors the lower
+        half, so it adds nothing worth plotting."""
+        frequencies, spectrum = channel.fft()
+        half = len(frequencies) // 2 + 1
+        return frequencies[:half], np.abs(spectrum[:half])
+
+    def _build_spectrum_ui(self):
+        """One X[k] plot per channel, plus an 'Overall' plot with every
+        channel's X[k] drawn on the same axes (channel 1 first, channel
+        2 layered on top of it, matching the time-domain Overall plot's
+        own channel ordering)."""
+        container = QWidget()
+        layout = QVBoxLayout(container)
+        layout.setContentsMargins(12, 12, 12, 12)
+        layout.setSpacing(16)
+
+        clip = self._entity.clip
+        channel_spectra = [self._channel_spectrum(ch) for ch in clip.channels]
+
+        if clip.num_channels > 1:
+            for i, (frequencies, magnitudes) in enumerate(channel_spectra):
+                color = _CHANNEL_COLORS[i % len(_CHANNEL_COLORS)]
+                plot = _SpectrumPlot(
+                    [(frequencies, magnitudes, color, f"Ch {i + 1}")],
+                    title=f"Channel {i + 1}",
+                )
+                layout.addWidget(plot)
+
+        overall_series = [
+            (frequencies, magnitudes, _CHANNEL_COLORS[i % len(_CHANNEL_COLORS)], f"Ch {i + 1}")
+            for i, (frequencies, magnitudes) in enumerate(channel_spectra)
+        ]
+        overall_plot = _SpectrumPlot(overall_series, title="Overall")
+        layout.addWidget(overall_plot)
+
+        layout.addStretch()
+
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setWidget(container)
+        return scroll
 
     def shutdown(self):
         self.cancel_trim()

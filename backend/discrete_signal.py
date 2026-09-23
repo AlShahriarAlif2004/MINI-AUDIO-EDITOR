@@ -273,6 +273,22 @@ class Discrete_Signal:
         
         return Discrete_Signal(result_samples, self.sample_rate, result_start_index)
 
+    def fft(self):
+        """
+        Discrete Fourier transform X[k] of this signal, via the
+        length-preserving Bluestein transform (works for any signal
+        length, not just a power of two -- unlike CooleyTukeyFFT).
+
+        Returns (frequencies, spectrum):
+          frequencies -- 1-D array, length N, the frequency in Hz of
+                         each bin k (k * sample_rate / N).
+          spectrum    -- 1-D complex array, X[k], same length as samples.
+        """
+        spectrum = BluesteinFFT.fft(self.samples)
+        n = len(spectrum)
+        frequencies = np.arange(n) * (self.sample_rate / n)
+        return frequencies, spectrum
+
     def fade_in(self, start_index=None, end_index=None):
         if start_index is None:
             start_index = self.start_index
