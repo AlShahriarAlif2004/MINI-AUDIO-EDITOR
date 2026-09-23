@@ -1,5 +1,5 @@
 import numpy as np
-from PySide6.QtCore import Signal
+from PySide6.QtCore import Qt, Signal
 from PySide6.QtWidgets import (
     QApplication, QWidget, QVBoxLayout, QHBoxLayout, QLabel, QScrollArea,
     QPushButton, QStackedWidget,
@@ -1432,16 +1432,40 @@ class EntityPlotView(QWidget):
             ("Delay", f"{delay:.4f} s"),
             ("Decay", f"{decay:.4f}"),
         ]
-        for name, value in fields:
-            row = QHBoxLayout()
-            row.setSpacing(6)
-            name_label = QLabel(f"{name}:")
-            name_label.setStyleSheet("font-weight: 600;")
-            value_label = QLabel(value)
-            row.addWidget(name_label)
-            row.addStretch()
-            row.addWidget(value_label)
-            layout.addLayout(row)
+
+        header_row = QHBoxLayout()
+        header_row.setSpacing(6)
+
+        labels_column = QVBoxLayout()
+        labels_column.setSpacing(4)
+        for name, _ in fields:
+            label_row = QHBoxLayout()
+            label_row.setSpacing(0)
+            name_label = QLabel(name)
+            name_label.setStyleSheet("font-size: 15px; font-weight: 600;")
+            name_label.setFixedWidth(95)
+            name_label.setAlignment(Qt.AlignLeft | Qt.AlignVCenter)
+            colon_label = QLabel(":")
+            colon_label.setStyleSheet("font-size: 15px; font-weight: 600;")
+            label_row.addWidget(name_label)
+            label_row.addWidget(colon_label)
+            labels_column.addLayout(label_row)
+        header_row.addLayout(labels_column)
+
+        header_row.addSpacing(24)
+
+        summary_column = QVBoxLayout()
+        summary_column.setSpacing(4)
+        summary_column.setAlignment(Qt.AlignLeft)
+        for _, value in fields:
+            summary_label = QLabel(value)
+            summary_label.setAlignment(Qt.AlignLeft)
+            summary_label.setStyleSheet("font-size: 20px; font-weight: 700;")
+            summary_column.addWidget(summary_label)
+        header_row.addLayout(summary_column)
+
+        header_row.addStretch()
+        layout.addLayout(header_row)
 
         title = QLabel("Base Signal")
         title.setStyleSheet("font-size: 15px; font-weight: 600; margin-top: 8px;")
