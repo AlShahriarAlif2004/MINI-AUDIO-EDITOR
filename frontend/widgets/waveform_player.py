@@ -4,7 +4,7 @@ import numpy as np
 import pyqtgraph as pg
 import sounddevice as sd
 from PySide6.QtCore import QObject, QTimer, Signal, Qt
-from PySide6.QtWidgets import QWidget, QVBoxLayout, QHBoxLayout, QPushButton, QSizePolicy
+from PySide6.QtWidgets import QWidget, QVBoxLayout, QHBoxLayout, QPushButton, QSizePolicy, QLabel
 
 
 _HALF_WINDOW_SECONDS = 3.0   # visible seconds on each side of the playhead while playing
@@ -410,6 +410,7 @@ class WaveformPlayer(QWidget):
         is_driver: bool = False,
         show_markers: bool = True,
         show_clip_button: bool = True,
+        title: str = None,
         parent=None,
     ):
         super().__init__(parent)
@@ -422,6 +423,7 @@ class WaveformPlayer(QWidget):
         self._channel_index = channel_index
         self._show_markers = show_markers
         self._show_clip_button = show_clip_button
+        self._title = title
 
         self._start_time = float(times[0]) if len(times) else 0.0
         self._end_time = float(times[-1]) if len(times) else 0.0
@@ -497,6 +499,11 @@ class WaveformPlayer(QWidget):
         layout = QVBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
         layout.setSpacing(4)
+
+        if hasattr(self, "_title") and self._title:
+            title_lbl = QLabel(self._title)
+            title_lbl.setStyleSheet("font-size: 15px; font-weight: 600; padding: 4px;")
+            layout.addWidget(title_lbl)
 
         self._plot = _DraggablePlotWidget(self)
         self._plot.on_drag_start = self._on_drag_start

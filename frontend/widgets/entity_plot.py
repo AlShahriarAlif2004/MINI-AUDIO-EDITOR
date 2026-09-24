@@ -1,5 +1,6 @@
 import numpy as np
-from PySide6.QtCore import Signal
+import pyqtgraph as pg
+from PySide6.QtCore import Qt, Signal
 from PySide6.QtWidgets import (
     QApplication, QWidget, QVBoxLayout, QHBoxLayout, QLabel, QScrollArea,
     QPushButton, QStackedWidget,
@@ -32,6 +33,47 @@ class _SegmentCanvas(QWidget):
         self.clicked_empty.emit()
         super().mousePressEvent(event)
 
+
+class _SpectrumPlot(QWidget):
+    """
+    Read-only magnitude-spectrum plot: |X[k]| vs frequency, up to the
+    Nyquist frequency. Frequency Mode never plays audio, so unlike
+    WaveformPlayer this has no playback controls, playhead, or
+    selection/editing machinery at all -- it just draws curves.
+    """
+
+    def __init__(self, series, title, parent=None):
+        """series -- list of (frequencies, magnitudes, color, label)
+        tuples, drawn in order on the same axes. A single entry for a
+        per-channel plot; two entries (Ch 1 then Ch 2) for the stereo
+        'Overall' spectrum, with Ch 2 layered on top of Ch 1."""
+        super().__init__(parent)
+
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(4)
+
+        title_lbl = QLabel(title)
+        title_lbl.setStyleSheet("font-size: 15px; font-weight: 600; padding: 4px;")
+        layout.addWidget(title_lbl)
+
+        plot = pg.PlotWidget()
+        plot.setBackground(None)
+        plot.showGrid(x=True, y=True, alpha=0.3)
+        plot.setLabel("bottom", "Frequency", "Hz")
+        plot.setLabel("left", "|X[k]|")
+        plot.setMouseEnabled(x=False, y=False)
+        plot.setMinimumHeight(150)
+
+        if len(series) > 1:
+            plot.addLegend()
+
+        for freqs, magnitudes, color, label in series:
+            plot.plot(freqs, magnitudes, pen=pg.mkPen(color=color, width=1), name=label)
+
+        layout.addWidget(plot)
+
+
 class EntityPlotView(QWidget):
 
     entity_modified = Signal()
@@ -46,6 +88,14 @@ class EntityPlotView(QWidget):
     entity_divisor_deleted = Signal()
     entity_noise_removed = Signal()
     entity_echo_added = Signal()
+    entity_echo_detected = Signal()   # never emitted -- Detect Echo is read-only,
+                                       # this exists only so the rebuild-signal
+                                       # framework (see _OP_SPECS handling in
+                                       # WorkspacePage) has something to connect to
+    entity_frequency_domain_shown = Signal()   # never emitted -- Show Frequency
+                                       # Domain never modifies the entity either,
+                                       # same reasoning as entity_echo_detected above
+    entity_equalizer_applied = Signal()  # emitted when equalizer Apply commits
     segment_selected = Signal(object, object, float, float)
     segment_deselected = Signal()
     """
@@ -93,6 +143,15 @@ class EntityPlotView(QWidget):
         self._echo_original_clip = None      # clip snapshot before echo is applied
         self._echo_parameters = None         # (occurrence, delay, decay) tuple
 
+        self._detect_echo_active = False     # True once "Detect Echo" panel is open
+        self._detect_echo_analyzed = False   # True once Analyze has been run
+        self._detect_echo_result = None      # dict from Discrete_Signal.detect_echo()
+        self._detect_echo_tab_widget = None  # container inserted above the normal players
+        self._detect_echo_tab_stack = None
+        self._detect_echo_tab_buttons = {}
+        self._detect_echo_tab_pages = {}
+        self._detect_echo_preview_players = []
+
         self._noise_removal_active = False   # True for either phase (selection or filtered)
         self._noise_filtered = False         # True once Filter has been clicked
         self._noise_from_entity = False      # True when the noise source is another entity's channel
@@ -106,6 +165,15 @@ class EntityPlotView(QWidget):
         self._noise_tab_buttons = {}
         self._noise_tab_pages = {}
         self._noise_preview_players = []     # every WaveformPlayer built for the tab strip
+
+        self._frequency_domain_available = False   # Frequency Mode's "Show Frequency Domain" tool
+        self._spectrum_page = None                 # built lazily, on first switch to it
+        self._freqdomain_active = False            # True while the tool's panel is open
+
+        self._equalizer_active = False             # True while the Equalizer tool panel is open
+        self._equalizer_original_clip = None       # clip snapshot saved at begin_equalizer
+        self._equalizer_k = None                   # last-found FFT bin index
+        self._equalizer_coefficients = None        # list[complex] – one per channel at bin k
 
         self._build_ui()
 
@@ -633,7 +701,7 @@ class EntityPlotView(QWidget):
         if key == "noise":
             # For noise window: show only Noise Reference
             label = QLabel("Noise Reference")
-            label.setStyleSheet("font-size: 13px; font-weight: 600;")
+            label.setStyleSheet("font-size: 15px; font-weight: 600;")
             layout.addWidget(label)
 
             series, audio = self._channels_to_series_and_audio(prev_channels, only_index)
@@ -660,7 +728,7 @@ class EntityPlotView(QWidget):
                 series, audio = self._channels_to_series_and_audio(channels, only_index)
 
                 label = QLabel(title)
-                label.setStyleSheet("font-size: 13px; font-weight: 600;")
+                label.setStyleSheet("font-size: 15px; font-weight: 600;")
                 layout.addWidget(label)
 
                 player = WaveformPlayer(
@@ -692,7 +760,7 @@ class EntityPlotView(QWidget):
         layout.setSpacing(8)
 
         label = QLabel("Noise Reference")
-        label.setStyleSheet("font-size: 13px; font-weight: 600;")
+        label.setStyleSheet("font-size: 15px; font-weight: 600;")
         layout.addWidget(label)
 
         player = WaveformPlayer(
@@ -1268,6 +1336,326 @@ class EntityPlotView(QWidget):
         """Reset echo-related state variables."""
         self._echo_original_clip = None
         self._echo_parameters = None
+
+    # ------------------------------------------------------------------
+    # Detect Echo
+    # ------------------------------------------------------------------
+    # Read-only tool: unlike every other Tool operation, nothing here
+    # ever touches self._entity.clip. Clicking "Detect Echo" only opens
+    # the Analyze/Cancel panel -- the plots stay exactly as they are
+    # (begin_detect_echo does nothing visible). Analyze is the step that
+    # actually runs the blind-detection algorithm and swaps the content
+    # area to the Source/Analysis tab strip, mirroring the Noise Removal
+    # tab-strip pattern (_build_noise_tabs) but read-only: Source shows
+    # the averaged signal (y[n]) as-is, Analysis shows the three
+    # estimated parameters plus the recovered pre-echo signal (x[n]).
+    # Both the Cancel-before-Analyze button and the OK-after-Analyze
+    # button end up calling cancel_detect_echo() -- there is nothing to
+    # "apply" here, since detection never modifies the entity.
+
+    def begin_detect_echo(self) -> bool:
+        """Arm Detect Echo mode. The visible plots are untouched until
+        Analyze is actually clicked (see analyze_echo)."""
+        if self._detect_echo_active:
+            return False
+
+        self._detect_echo_active = True
+        self._detect_echo_analyzed = False
+        self._detect_echo_result = None
+        self._lock_selection(True)
+        return True
+
+    def analyze_echo(self):
+        """Run the blind echo-detection algorithm on the entity's
+        sample-averaged signal and switch the content area to the
+        Source/Analysis tab strip."""
+        if not self._detect_echo_active or self._detect_echo_analyzed:
+            return
+
+        source_signal = self._entity.clip.average_channel_signal()
+        result = source_signal.detect_echo()
+
+        self._detect_echo_result = result
+        self._detect_echo_analyzed = True
+
+        for player in self._players:
+            player.setVisible(False)
+
+        self._build_detect_echo_tabs(source_signal, result)
+
+    def apply_detect_echo(self):
+        """Detect Echo never modifies the entity -- OK behaves exactly
+        like Cancel, just closing the panel and restoring the previous
+        view."""
+        self.cancel_detect_echo()
+
+    def cancel_detect_echo(self):
+        """Closes the panel from either phase: before Analyze (nothing
+        to tear down beyond the lock) or after (tear down the tab strip
+        and restore the normal plots)."""
+        if not self._detect_echo_active:
+            return
+
+        if self._detect_echo_analyzed:
+            self._teardown_detect_echo_tabs()
+            self._restore_normal_players()
+        else:
+            self._lock_selection(False)
+
+        self._reset_detect_echo_state()
+
+    def _reset_detect_echo_state(self):
+        self._detect_echo_active = False
+        self._detect_echo_analyzed = False
+        self._detect_echo_result = None
+
+    def _build_detect_echo_tabs(self, source_signal, result):
+        tabs = [("Source", "source"), ("Analysis", "analysis")]
+
+        container = QWidget()
+        outer = QVBoxLayout(container)
+        outer.setContentsMargins(0, 0, 0, 0)
+        outer.setSpacing(8)
+
+        tab_row = QHBoxLayout()
+        tab_row.setSpacing(6)
+        stack = QStackedWidget()
+
+        self._detect_echo_tab_buttons = {}
+        self._detect_echo_tab_pages = {}
+        self._detect_echo_preview_players = []
+
+        for label, key in tabs:
+            btn = QPushButton(label)
+            btn.setCheckable(True)
+            btn.clicked.connect(lambda checked=False, k=key: self._select_detect_echo_tab(k))
+            tab_row.addWidget(btn)
+            self._detect_echo_tab_buttons[key] = btn
+
+            page = self._build_detect_echo_tab_page(key, source_signal, result)
+            stack.addWidget(page)
+            self._detect_echo_tab_pages[key] = page
+
+        tab_row.addStretch()
+        outer.addLayout(tab_row)
+        outer.addWidget(stack)
+
+        self._detect_echo_tab_stack = stack
+        self._detect_echo_tab_widget = container
+        self._content_layout.insertWidget(0, container)
+
+        self._select_detect_echo_tab("source")
+
+    def _select_detect_echo_tab(self, key):
+        for k, btn in self._detect_echo_tab_buttons.items():
+            btn.setChecked(k == key)
+        self._detect_echo_tab_stack.setCurrentWidget(self._detect_echo_tab_pages[key])
+
+    def _build_detect_echo_tab_page(self, key, source_signal, result):
+        page = QWidget()
+        layout = QVBoxLayout(page)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(8)
+
+        if key == "source":
+            times = self._time_axis(source_signal)
+            player = WaveformPlayer(
+                times=times,
+                series=[(source_signal.samples, _CHANNEL_COLORS[0], "Average")],
+                sample_rate=source_signal.sample_rate,
+                audio_data=source_signal.samples.astype(np.float32),
+                group=self._group,
+                entity=self._entity,
+                channel_index=None,
+                is_driver=False,
+                show_markers=False,
+                show_clip_button=False,
+            )
+            player.set_tool_mode(True)
+            layout.addWidget(player)
+            self._detect_echo_preview_players.append(player)
+            return page
+
+        # key == "analysis"
+        occurrence = result["occurrence"]
+        delay = result["delay"]
+        decay = result["decay"]
+        recovered = result["recovered"]
+
+        fields = [
+            ("Occurrence", str(occurrence)),
+            ("Delay", f"{delay:.4f} s"),
+            ("Decay", f"{decay:.4f}"),
+        ]
+
+        header_row = QHBoxLayout()
+        header_row.setSpacing(6)
+
+        labels_column = QVBoxLayout()
+        labels_column.setSpacing(4)
+        for name, _ in fields:
+            label_row = QHBoxLayout()
+            label_row.setSpacing(0)
+            name_label = QLabel(name)
+            name_label.setStyleSheet("font-size: 15px; font-weight: 600;")
+            name_label.setFixedWidth(95)
+            name_label.setAlignment(Qt.AlignLeft | Qt.AlignVCenter)
+            colon_label = QLabel(":")
+            colon_label.setStyleSheet("font-size: 15px; font-weight: 600;")
+            label_row.addWidget(name_label)
+            label_row.addWidget(colon_label)
+            labels_column.addLayout(label_row)
+        header_row.addLayout(labels_column)
+
+        header_row.addSpacing(24)
+
+        summary_column = QVBoxLayout()
+        summary_column.setSpacing(4)
+        summary_column.setAlignment(Qt.AlignLeft)
+        for _, value in fields:
+            summary_label = QLabel(value)
+            summary_label.setAlignment(Qt.AlignLeft)
+            summary_label.setStyleSheet("font-size: 20px; font-weight: 700;")
+            summary_column.addWidget(summary_label)
+        header_row.addLayout(summary_column)
+
+        header_row.addStretch()
+        layout.addLayout(header_row)
+
+        title = QLabel("Base Signal")
+        title.setStyleSheet("font-size: 15px; font-weight: 600; margin-top: 8px;")
+        layout.addWidget(title)
+
+        times = self._time_axis(recovered)
+        player = WaveformPlayer(
+            times=times,
+            series=[(recovered.samples, _CHANNEL_COLORS[1], "Base Signal")],
+            sample_rate=recovered.sample_rate,
+            audio_data=recovered.samples.astype(np.float32),
+            group=self._group,
+            entity=self._entity,
+            channel_index=None,
+            is_driver=False,
+            show_markers=False,
+            show_clip_button=False,
+        )
+        player.set_tool_mode(True)
+        layout.addWidget(player)
+        self._detect_echo_preview_players.append(player)
+
+        return page
+
+    def _teardown_detect_echo_tabs(self):
+        if self._detect_echo_tab_widget is None:
+            return
+        for player in self._detect_echo_preview_players:
+            player.force_idle()
+        self._content_layout.removeWidget(self._detect_echo_tab_widget)
+        self._detect_echo_tab_widget.deleteLater()
+        self._detect_echo_tab_widget = None
+        self._detect_echo_tab_stack = None
+        self._detect_echo_tab_buttons = {}
+        self._detect_echo_tab_pages = {}
+        self._detect_echo_preview_players = []
+
+    # ------------------------------------------------------------------
+    # Equalizer
+    # ------------------------------------------------------------------
+    # Tool operation: lets the user find X[k] for a given frequency, edit
+    # the per-channel coefficients, see the spectrum graph update in real
+    # time, and then commit (Apply) or revert (Cancel).
+
+    def begin_equalizer(self) -> bool:
+        """Arm the Equalizer tool. Saves a clip snapshot so Cancel can
+        restore it, then locks segment selection while the panel is open."""
+        if self._equalizer_active:
+            return False
+        self._equalizer_active = True
+        self._equalizer_original_clip = self._entity.clip.copy()
+        self._equalizer_k = None
+        self._equalizer_coefficients = None
+        self._lock_selection(True)
+        return True
+
+    def find_equalizer_coefficients(self, k: int) -> list:
+        """Compute FFT for every channel and return the list of X[k]
+        complex coefficients (one per channel). k is clamped to
+        [0, N-1] where N = len of the first channel's samples.
+        Returns an empty list if the equalizer is not armed."""
+        if not self._equalizer_active:
+            return []
+        clip = self._entity.clip  # use the current (possibly modified) clip
+        coefficients = []
+        for ch in clip.channels:
+            _, spectrum = ch.fft()
+            n = len(spectrum)
+            safe_k = max(0, min(k, n - 1))
+            coefficients.append(complex(spectrum[safe_k]))
+        self._equalizer_k = k
+        self._equalizer_coefficients = list(coefficients)
+        return coefficients
+
+    def update_equalizer_preview(self, k: int, coefficients: list):
+        """Apply the edited X[k] coefficients to each channel via the
+        equalize() signal-processing method and emit the rebuild signal
+        so the spectrum graph refreshes instantaneously.
+        coefficients: list[complex], one per channel."""
+        if not self._equalizer_active or self._equalizer_original_clip is None:
+            return
+
+        self._equalizer_k = k
+        self._equalizer_coefficients = list(coefficients)
+
+        # Start from the *original* clip so edits don't accumulate.
+        base_clip = self._equalizer_original_clip
+        new_channels = []
+        for ch_idx, ch in enumerate(base_clip.channels):
+            coeff = coefficients[ch_idx] if ch_idx < len(coefficients) else 0.0
+            try:
+                new_ch = ch.equalize(k, coeff)
+            except Exception:
+                new_ch = ch.copy()
+            new_channels.append(new_ch)
+
+        from backend.audio_clip import AudioClip  # local import avoids circular
+        modified_clip = AudioClip(new_channels, name=base_clip.name)
+        self._entity.clip = modified_clip
+
+        # Refresh the spectrum graph in the right-side view.
+        # Re-computing a full equalize every keystroke is fast enough:
+        # Bluestein FFT + IFFT pair on typical audio is O(N log N).
+        self.entity_equalizer_applied.emit()
+
+    def apply_equalizer(self):
+        """Commit the current (equalized) clip to the entity permanently."""
+        if not self._equalizer_active:
+            return
+        # self._entity.clip already holds the equalized version;
+        # nothing more to do except clean up state.
+        self._reset_equalizer_state()
+        self._lock_selection(False)
+        self.clear_all_selection()
+        self.entity_modified.emit()
+        self.entity_equalizer_applied.emit()
+
+    def cancel_equalizer(self):
+        """Revert to the original clip (before Equalizer was opened)."""
+        if not self._equalizer_active:
+            return
+        if self._equalizer_original_clip is not None:
+            self._entity.clip = self._equalizer_original_clip
+        self._reset_equalizer_state()
+        self._lock_selection(False)
+        self.clear_all_selection()
+        # Notify the graph view so it re-draws the restored data.
+        self.entity_equalizer_applied.emit()
+
+    def _reset_equalizer_state(self):
+        self._equalizer_active = False
+        self._equalizer_original_clip = None
+        self._equalizer_k = None
+        self._equalizer_coefficients = None
+
     # Only valid when the Overall plot is selected (enforced by the caller
     # via _OVERALL_ONLY_OPS). Each chosen source is a division-bounded
     # *segment* of some entity's Overall plot (not necessarily the whole
@@ -1406,10 +1794,16 @@ class EntityPlotView(QWidget):
     def _build_ui(self):
         outer_layout = QVBoxLayout(self)
         outer_layout.setContentsMargins(0, 0, 0, 0)
+        outer_layout.setSpacing(0)
+
+        outer_layout.addWidget(self._build_domain_toggle_bar())
+
+        self._domain_stack = QStackedWidget()
+        outer_layout.addWidget(self._domain_stack)
 
         scroll = QScrollArea()
         scroll.setWidgetResizable(True)
-        outer_layout.addWidget(scroll)
+        self._domain_stack.addWidget(scroll)   # index 0: Time Domain (always built)
 
         container = _SegmentCanvas()
         layout = QVBoxLayout(container)
@@ -1433,6 +1827,7 @@ class EntityPlotView(QWidget):
                     entity=self._entity,
                     channel_index=i,
                     is_driver=False,
+                    title=f"Channel {i + 1}",
                 )
                 layout.addWidget(player)
                 player.marker_added.connect(self.entity_modified.emit)
@@ -1453,6 +1848,7 @@ class EntityPlotView(QWidget):
             entity=self._entity,
             channel_index=None,
             is_driver=True,
+            title="Overall",
         )
         layout.addWidget(overall_player)
         overall_player.marker_added.connect(self.entity_modified.emit)
@@ -1463,6 +1859,146 @@ class EntityPlotView(QWidget):
         layout.addStretch()
         scroll.setWidget(container)
         self._content_layout = layout
+
+    # ------------------------------------------------------------------
+    # Frequency Mode: Time Domain / Frequency Domain toggle
+    # ------------------------------------------------------------------
+
+    _DOMAIN_BTN_STYLE = """
+        QPushButton:checked {
+            background-color: #2f81f7;
+            color: white;
+            font-weight: 600;
+        }
+    """
+
+    def _build_domain_toggle_bar(self):
+        """Time Domain / Frequency Domain buttons. Hidden by default --
+        made visible only once Frequency Mode's 'Show Frequency Domain'
+        tool is switched on (see set_frequency_domain_available)."""
+        bar = QWidget()
+        row = QHBoxLayout(bar)
+        row.setContentsMargins(12, 8, 12, 8)
+        row.setSpacing(8)
+
+        self._time_domain_btn = QPushButton("Time Domain")
+        self._freq_domain_btn = QPushButton("Frequency Domain")
+        for btn in (self._time_domain_btn, self._freq_domain_btn):
+            btn.setCheckable(True)
+            btn.setStyleSheet(self._DOMAIN_BTN_STYLE)
+
+        self._time_domain_btn.setChecked(True)
+        self._time_domain_btn.clicked.connect(self._show_time_domain)
+        self._freq_domain_btn.clicked.connect(self._show_frequency_domain)
+
+        row.addWidget(self._time_domain_btn)
+        row.addWidget(self._freq_domain_btn)
+        row.addStretch()
+
+        bar.setVisible(False)
+        self._domain_toggle_bar = bar
+        return bar
+
+    def set_frequency_domain_available(self, enabled: bool):
+        """Reveal (or hide) the Time Domain / Frequency Domain toggle
+        bar. Off falls back to the normal, always-available time-domain
+        view -- used only as a safety net; nothing currently turns this
+        back off once Show Frequency Domain has revealed it."""
+        self._frequency_domain_available = enabled
+        self._domain_toggle_bar.setVisible(enabled)
+        if not enabled:
+            self._show_time_domain()
+
+    # ---- Frequency Mode's "Show Frequency Domain" tool: begin (arm) /
+    # show (compute + reveal, the slow step) / close (dismiss the
+    # panel). Mirrors Detect Echo's begin/analyze/cancel shape, except
+    # closing never undoes anything -- the toggle bar it reveals is a
+    # view it adds, not a preview it needs to roll back. ----
+
+    def begin_frequency_domain(self) -> bool:
+        if self._freqdomain_active:
+            return False
+        self._freqdomain_active = True
+        return True
+
+    def show_frequency_domain(self):
+        """The actual X[k] computation happens here (inside
+        _build_spectrum_ui, via _channel_spectrum) -- this is the step
+        WorkspacePage wraps in its busy-overlay spinner."""
+        if not self._freqdomain_active:
+            return
+        self.set_frequency_domain_available(True)
+        self._show_frequency_domain()
+
+    def close_frequency_domain(self):
+        """Dismisses the tool panel. The toggle bar (and whichever
+        domain is currently selected) is left exactly as-is, whether
+        this is an early Cancel (nothing was ever shown) or the final
+        OK after Show (something was)."""
+        self._freqdomain_active = False
+        self.set_frequency_domain_available(False)
+
+    def _show_time_domain(self):
+        self._time_domain_btn.setChecked(True)
+        self._freq_domain_btn.setChecked(False)
+        self._domain_stack.setCurrentIndex(0)
+
+    def _show_frequency_domain(self):
+        if self._spectrum_page is None:
+            self._spectrum_page = self._build_spectrum_ui()
+            self._domain_stack.addWidget(self._spectrum_page)   # index 1
+        # Frequency Domain has no play button -- stop anything playing
+        # in the time-domain view before leaving it.
+        for player in self._players:
+            player.force_idle()
+        self._time_domain_btn.setChecked(False)
+        self._freq_domain_btn.setChecked(True)
+        self._domain_stack.setCurrentIndex(1)
+
+    @staticmethod
+    def _channel_spectrum(channel):
+        """(frequencies, magnitudes) for one channel, kept to 0..Nyquist
+        -- the upper half of a real signal's DFT just mirrors the lower
+        half, so it adds nothing worth plotting."""
+        frequencies, spectrum = channel.fft()
+        half = len(frequencies) // 2 + 1
+        return frequencies[:half], np.abs(spectrum[:half])
+
+    def _build_spectrum_ui(self):
+        """One X[k] plot per channel, plus an 'Overall' plot with every
+        channel's X[k] drawn on the same axes (channel 1 first, channel
+        2 layered on top of it, matching the time-domain Overall plot's
+        own channel ordering)."""
+        container = QWidget()
+        layout = QVBoxLayout(container)
+        layout.setContentsMargins(12, 12, 12, 12)
+        layout.setSpacing(16)
+
+        clip = self._entity.clip
+        channel_spectra = [self._channel_spectrum(ch) for ch in clip.channels]
+
+        if clip.num_channels > 1:
+            for i, (frequencies, magnitudes) in enumerate(channel_spectra):
+                color = _CHANNEL_COLORS[i % len(_CHANNEL_COLORS)]
+                plot = _SpectrumPlot(
+                    [(frequencies, magnitudes, color, f"Ch {i + 1}")],
+                    title=f"Channel {i + 1}",
+                )
+                layout.addWidget(plot)
+
+        overall_series = [
+            (frequencies, magnitudes, _CHANNEL_COLORS[i % len(_CHANNEL_COLORS)], f"Ch {i + 1}")
+            for i, (frequencies, magnitudes) in enumerate(channel_spectra)
+        ]
+        overall_plot = _SpectrumPlot(overall_series, title="Overall")
+        layout.addWidget(overall_plot)
+
+        layout.addStretch()
+
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setWidget(container)
+        return scroll
 
     def shutdown(self):
         self.cancel_trim()
@@ -1475,7 +2011,9 @@ class EntityPlotView(QWidget):
         self.cancel_fade_in()
         self.cancel_fade_out()
         self.cancel_echo()
+        self.cancel_detect_echo()
         self.cancel_concatenate()
+        self.cancel_equalizer()
         for player in self._players:
             player.force_idle()
         self.clear_all_selection()

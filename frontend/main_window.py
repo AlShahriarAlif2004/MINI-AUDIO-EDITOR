@@ -1,3 +1,5 @@
+import os
+from PySide6.QtCore import QSettings
 from PySide6.QtGui import QCloseEvent
 from PySide6.QtWidgets import QMainWindow, QMessageBox, QStackedWidget
 
@@ -5,13 +7,14 @@ from backend.workspace_model import Workspace
 from frontend.views.home_page import HomePage
 from frontend.views.workspace_page import WorkspacePage
 from frontend.views.voice_recognition_page import VoiceRecognitionPage
-from frontend.workspace_io import create_workspace, open_workspace
+from frontend.workspace_io import create_workspace, open_workspace, sync_workspace_name
 
 
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
         self.setWindowTitle("Mini Audio Editor")
+        self.settings = QSettings("MiniAudioEditor", "Workspace")
 
         self._current_workspace: Workspace | None = None
         self._active_editor_page = None   # whichever of the two pages below is on screen
@@ -20,14 +23,23 @@ class MainWindow(QMainWindow):
         self.setCentralWidget(self.stack)
 
         self.home_page = HomePage()
-        self.workspace_page = WorkspacePage()
+        self.workspace_page = WorkspacePage(editor_type="editor")
         self.voice_recognition_page = VoiceRecognitionPage()
+        self.echo_page = WorkspacePage(editor_type="echo")
+        self.noise_page = WorkspacePage(editor_type="noise")
+        self.frequency_page = WorkspacePage(editor_type="frequency")
         self.stack.addWidget(self.home_page)
         self.stack.addWidget(self.workspace_page)
         self.stack.addWidget(self.voice_recognition_page)
+        self.stack.addWidget(self.echo_page)
+        self.stack.addWidget(self.noise_page)
+        self.stack.addWidget(self.frequency_page)
 
         self.home_page.editor_mode_requested.connect(self._on_editor_mode)
         self.home_page.voice_recognition_mode_requested.connect(self._on_voice_recognition_mode)
+        self.home_page.echo_mode_requested.connect(self._on_echo_mode)
+        self.home_page.noise_removal_mode_requested.connect(self._on_noise_removal_mode)
+        self.home_page.frequency_mode_requested.connect(self._on_frequency_mode)
 
         # Both editor pages share the same File > New/Open/Exit handlers —
         # _active_editor_page tracks which one is currently on screen.
@@ -39,26 +51,65 @@ class MainWindow(QMainWindow):
         self.voice_recognition_page.open_workspace_requested.connect(self._on_open_workspace)
         self.voice_recognition_page.exit_requested.connect(self._on_exit_workspace)
 
+        self.echo_page.new_workspace_requested.connect(self._on_new_workspace)
+        self.echo_page.open_workspace_requested.connect(self._on_open_workspace)
+        self.echo_page.exit_requested.connect(self._on_exit_workspace)
+
+        self.noise_page.new_workspace_requested.connect(self._on_new_workspace)
+        self.noise_page.open_workspace_requested.connect(self._on_open_workspace)
+        self.noise_page.exit_requested.connect(self._on_exit_workspace)
+
+        self.frequency_page.new_workspace_requested.connect(self._on_new_workspace)
+        self.frequency_page.open_workspace_requested.connect(self._on_open_workspace)
+        self.frequency_page.exit_requested.connect(self._on_exit_workspace)
+
     def _on_editor_mode(self):
-        """Enter the (full Edit/Tool) workspace editor with nothing
-        loaded yet — the sidebar shows its 'No Workspace' placeholder
-        until File > New or File > Open is used."""
-        self._enter_empty_editor(self.workspace_page)
+        """Enter the (full Edit/Tool) workspace editor. Tries to load the last workspace."""
+        self._enter_mode(self.workspace_page)
 
     def _on_voice_recognition_mode(self):
-        """Enter Voice Recognition mode with nothing loaded yet — same
-        empty-state placeholder, File-menu-only shell."""
-        self._enter_empty_editor(self.voice_recognition_page)
+        """Enter Voice Recognition mode. Tries to load the last workspace."""
+        self._enter_mode(self.voice_recognition_page)
 
-    def _enter_empty_editor(self, page):
+    def _on_echo_mode(self):
+        """Enter the Echo workspace editor. Tries to load the last workspace."""
+        self._enter_mode(self.echo_page)
+
+    def _on_noise_removal_mode(self):
+        """Enter the Noise Removal workspace editor. Tries to load the last workspace."""
+        self._enter_mode(self.noise_page)
+
+    def _on_frequency_mode(self):
+        """Enter the Frequency workspace editor. Tries to load the last workspace."""
+        self._enter_mode(self.frequency_page)
+
+    def _enter_mode(self, page):
         if not self._confirm_leave_workspace():
             return
 
-        self._current_workspace = None
         self._active_editor_page = page
-        page.clear_workspace()
-        self.stack.setCurrentWidget(page)
-        self.setWindowTitle("Mini Audio Editor")
+
+        last_workspace_path = self.settings.value("last_workspace")
+        workspace = None
+        if last_workspace_path and os.path.exists(last_workspace_path):
+            json_path = os.path.join(last_workspace_path, "workspace.json")
+            if os.path.isfile(json_path):
+                try:
+                    workspace = Workspace.load(last_workspace_path)
+                    sync_workspace_name(workspace)
+                except Exception:
+                    pass
+
+        if workspace:
+            self._current_workspace = workspace
+            page.set_workspace(workspace)
+            self.stack.setCurrentWidget(page)
+            self.setWindowTitle(f"Mini Audio Editor — {workspace.name}")
+        else:
+            self._current_workspace = None
+            page.clear_workspace()
+            self.stack.setCurrentWidget(page)
+            self.setWindowTitle("Mini Audio Editor")
 
     def _on_new_workspace(self):
         if not self._confirm_leave_workspace():
@@ -83,6 +134,9 @@ class MainWindow(QMainWindow):
 
     def _enter_workspace(self, workspace: Workspace):
         self._current_workspace = workspace
+        if workspace.path:
+            self.settings.setValue("last_workspace", workspace.path)
+            
         self._active_editor_page.set_workspace(workspace)
         self.stack.setCurrentWidget(self._active_editor_page)
         self.setWindowTitle(f"Mini Audio Editor — {workspace.name}")

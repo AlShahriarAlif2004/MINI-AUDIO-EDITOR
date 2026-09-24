@@ -126,3 +126,15 @@ class BluesteinFFT:
         # IDFT(X) = conj(DFT(conj(X))) / N -- reuses the forward chirp-z
         # transform instead of duplicating it with flipped twiddle signs.
         return np.conj(BluesteinFFT.fft(np.conj(spectrum))) / N
+
+    @staticmethod
+    def cepstrum(x):
+        """Compute the real cepstrum using the project's FFT APIs only."""
+        x = np.asarray(x, dtype=float)
+        if x.size == 0:
+            return np.array([], dtype=float)
+
+        spectrum = BluesteinFFT.fft(x)
+        log_mag = np.log(np.abs(spectrum) + 1e-12)
+        cepstrum = BluesteinFFT.ifft(log_mag).real
+        return cepstrum

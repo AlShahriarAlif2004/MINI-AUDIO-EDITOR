@@ -2,8 +2,11 @@ import os
 import json
 import uuid
 
+import numpy as np
+
 from backend.audio_clip import AudioClip
 from backend.audio_io import WavIO
+from backend.discrete_signal import Discrete_Signal
 
 
 class WorkspaceItem:
@@ -87,6 +90,17 @@ class Entity(WorkspaceItem):
             divisions=list(other.divisions),
             channel_markers={k: list(v) for k, v in other.channel_markers.items()},
         )
+
+    @classmethod
+    def from_recording(cls, samples, sample_rate, name):
+        """Build an Entity from raw mono samples captured via RecordingDialog."""
+        samples = np.asarray(samples, dtype=np.float64)
+        if samples.size == 0:
+            raise ValueError("Recording is empty; nothing to create an entity from.")
+
+        signal = Discrete_Signal(samples, sample_rate, start_index=0)
+        clip = AudioClip([signal], name=name)
+        return cls(name, clip, divisions=[])
 
     def get_segments(self):
         """Return list of (start_time, end_time) tuples covering the whole clip."""
@@ -196,10 +210,12 @@ class Workspace:
 
         entities = self._collect_entities()
 
-        # write/refresh audio assets (always stored internally as WAV)
+        # write/refresh audio assets (internally as 32-bit float WAV so that
+        # sample values beyond ±1.0 — e.g. after vertical scale > 1.0 — are
+        # preserved exactly and the plot autoscales correctly on reopen).
         for entity in entities:
             asset_path = os.path.join(assets_dir, f"{entity.id}.wav")
-            WavIO.unload(entity.clip, asset_path)
+            WavIO.unload_internal(entity.clip, asset_path)
 
         # remove orphaned asset files (entities deleted since last save)
         valid_filenames = {f"{entity.id}.wav" for entity in entities}

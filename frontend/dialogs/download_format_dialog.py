@@ -11,9 +11,9 @@ from PySide6.QtWidgets import (
 class DownloadFormatDialog(QDialog):
     """Ask the user which audio format to download an entity as.
 
-    WAV and MP3 are offered as radio buttons. They're placed in an
+    WAV, MP3, and OGG are offered as radio buttons. They're placed in an
     explicit QButtonGroup with exclusive=True so selecting one always
-    clears the other, regardless of how the layout around them changes
+    clears the others, regardless of how the layout around them changes
     later — not relying on Qt's implicit same-parent auto-exclusivity.
     """
 
@@ -31,15 +31,18 @@ class DownloadFormatDialog(QDialog):
 
         self._wav_radio = QRadioButton("WAV")
         self._mp3_radio = QRadioButton("MP3")
+        self._ogg_radio = QRadioButton("OGG")
         self._wav_radio.setChecked(True)
 
         self._format_group = QButtonGroup(self)
         self._format_group.setExclusive(True)
         self._format_group.addButton(self._wav_radio)
         self._format_group.addButton(self._mp3_radio)
+        self._format_group.addButton(self._ogg_radio)
 
         layout.addWidget(self._wav_radio)
         layout.addWidget(self._mp3_radio)
+        layout.addWidget(self._ogg_radio)
 
         buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
         buttons.accepted.connect(self.accept)
@@ -47,5 +50,9 @@ class DownloadFormatDialog(QDialog):
         layout.addWidget(buttons)
 
     def selected_format(self) -> str:
-        """Returns 'wav' or 'mp3'."""
-        return "mp3" if self._mp3_radio.isChecked() else "wav"
+        """Returns 'wav', 'mp3', or 'ogg'."""
+        if self._mp3_radio.isChecked():
+            return "mp3"
+        if self._ogg_radio.isChecked():
+            return "ogg"
+        return "wav"
