@@ -1,6 +1,7 @@
-from PySide6.QtCore import Qt, Signal
-from PySide6.QtGui import QDoubleValidator, QIntValidator
+from PySide6.QtCore import Qt, QTimer, Signal
+from PySide6.QtGui import QColor, QDoubleValidator, QIntValidator, QLinearGradient, QPainter, QPen
 from PySide6.QtWidgets import (
+    QApplication,
     QDialog,
     QFileDialog,
     QHBoxLayout,
@@ -10,6 +11,7 @@ from PySide6.QtWidgets import (
     QMenu,
     QMessageBox,
     QPushButton,
+    QScrollArea,
     QSplitter,
     QStackedWidget,
     QTabBar,
@@ -19,7 +21,7 @@ from PySide6.QtWidgets import (
 )
 
 from backend.workspace_model import Entity, Folder, Workspace
-from backend.audio_io import WavIO, MP3IO
+from backend.audio_io import WavIO, MP3IO, OggIO
 from frontend.dialogs.create_entity_dialog import CreateEntityDialog
 from frontend.dialogs.create_folder_dialog import CreateFolderDialog
 from frontend.dialogs.concatenate_dialog import ConcatenateDialog
@@ -350,6 +352,89 @@ class _OpEntry:
 # WorkspacePage
 # ---------------------------------------------------------------------------
 
+class _Spinner(QWidget):
+    """Small rotating-arc busy indicator, advanced by a QTimer tick."""
+
+    def __init__(self, parent=None, diameter=48):
+        super().__init__(parent)
+        self.setFixedSize(diameter, diameter)
+        self._angle = 0
+        self._timer = QTimer(self)
+        self._timer.timeout.connect(self._advance)
+
+    def start(self):
+        self._angle = 0
+        self._timer.start(30)
+
+    def stop(self):
+        self._timer.stop()
+
+    def _advance(self):
+        self._angle = (self._angle + 45) % 360
+        self.update()
+
+    def paintEvent(self, event):
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.Antialiasing)
+        pen = QPen(QColor("white"))
+        pen.setWidth(4)
+        pen.setCapStyle(Qt.RoundCap)
+        painter.setPen(pen)
+        rect = self.rect().adjusted(4, 4, -4, -4)
+        painter.translate(rect.center())
+        painter.rotate(self._angle)
+        painter.translate(-rect.center())
+        painter.drawArc(rect, 0, 270 * 16)
+        painter.end()
+
+
+class _BusyOverlay(QWidget):
+    """Full-page bluish, semi-transparent veil shown while a slow,
+    synchronous backend call (repeated noise-removal passes) runs on
+    the GUI thread. It doesn't make the app responsive -- everything
+    underneath is still blocked -- it just makes that visible instead
+    of the window looking frozen, as long as the caller pumps the
+    event loop (QApplication.processEvents()) while the work runs."""
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setAttribute(Qt.WA_TransparentForMouseEvents)
+        self.setVisible(False)
+
+        layout = QVBoxLayout(self)
+        layout.setAlignment(Qt.AlignCenter)
+
+        self._spinner = _Spinner(self)
+        layout.addWidget(self._spinner, alignment=Qt.AlignCenter)
+
+        self._label = QLabel("REMOVING NOISE")
+        self._label.setStyleSheet(
+            "color: white; font-weight: 600; font-size: 14px; letter-spacing: 1px;"
+        )
+        self._label.setAlignment(Qt.AlignCenter)
+        layout.addWidget(self._label)
+
+    def show_message(self, text):
+        self._label.setText(text)
+        self.setGeometry(self.parentWidget().rect())
+        self.raise_()
+        self.setVisible(True)
+        self._spinner.start()
+
+    def hide_overlay(self):
+        self._spinner.stop()
+        self.setVisible(False)
+
+    def paintEvent(self, event):
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.Antialiasing)
+        gradient = QLinearGradient(0, 0, self.width(), self.height())
+        gradient.setColorAt(0.0, QColor(30, 41, 110, 110))
+        gradient.setColorAt(1.0, QColor(90, 50, 150, 110))
+        painter.fillRect(self.rect(), gradient)
+        painter.end()
+
+
 class WorkspacePage(QWidget):
     """VSCode-like workspace editor shell."""
 
@@ -429,24 +514,51 @@ class WorkspacePage(QWidget):
              begin="begin_echo", apply="apply_echo", cancel="cancel_echo",
              rebuild_signal="entity_echo_added", factor=False, needs_dialog=False,
              preview="update_echo_preview"),
-        dict(key="echo_detect", label="Detect Echo",
+        # Detect Echo doesn't fit the generic single-shot Apply/Cancel shape
+        # either: it starts as Analyze/Cancel, and once Analyze runs its
+        # (read-only) blind-detection algorithm, Analyze is hidden and
+        # Cancel becomes OK. See _build_detect_echo_panel/
+        # _on_detect_echo_analyze_clicked/_on_detect_echo_cancel_clicked.
+        dict(key="detectecho", label="Detect Echo",
              begin="begin_detect_echo", apply="apply_detect_echo", cancel="cancel_detect_echo",
              rebuild_signal="entity_echo_detected", factor=False, needs_dialog=False),
+        # Show Frequency Domain doesn't fit the plain single Apply/Cancel
+        # shape either -- like Detect Echo, it starts as Show/Cancel, and
+        # once Show computes the X[k] spectra (the slow step, behind the
+        # busy overlay) Show is hidden and Cancel becomes OK. Unlike
+        # Detect Echo, OK never undoes anything: the Time Domain/Frequency
+        # Domain toggle it reveals on the entity view stays put. See
+        # _build_frequency_domain_panel/_on_freqdomain_show_clicked/
+        # _on_freqdomain_close_clicked.
+        dict(key="freqdomain", label="Show Frequency Domain",
+             begin="begin_frequency_domain", apply="show_frequency_domain", cancel="close_frequency_domain",
+             rebuild_signal="entity_frequency_domain_shown", factor=False, needs_dialog=False),
+        dict(key="equalizer", label="Equalizer",
+             begin="begin_equalizer", apply="apply_equalizer", cancel="cancel_equalizer",
+             rebuild_signal="entity_equalizer_applied", factor=False, needs_dialog=False,
+             custom_panel=True),
     ]
 
     new_workspace_requested = Signal()
     open_workspace_requested = Signal()
     exit_requested = Signal()
 
-    def __init__(self, parent=None):
+    def __init__(self, parent=None, editor_type="editor"):
         super().__init__(parent)
         self._workspace: Workspace | None = None
         self._mode = "file"
+        self._editor_type = editor_type
         self._ops: dict[str, _OpEntry] = {}   # populated in _build_ui
         self._build_ui()
+        self._busy_overlay = _BusyOverlay(self)
         self._update_sidebar_for_workspace()
         self._playback_group = PlaybackGroup.get_instance()
         self._playback_group.active_changed.connect(self._on_playback_active_changed)
+
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        if self._busy_overlay.isVisible():
+            self._busy_overlay.setGeometry(self.rect())
 
     def _create_folder(self):
         self._create_folder_in(self._target_folder())
@@ -604,12 +716,15 @@ class WorkspacePage(QWidget):
         format_dialog = DownloadFormatDialog(self)
         if format_dialog.exec() != QDialog.DialogCode.Accepted:
             return
-        file_format = format_dialog.selected_format()   # "wav" or "mp3"
+        file_format = format_dialog.selected_format()   # "wav", "mp3", or "ogg"
 
         if file_format == "mp3":
             default_name = f"{entity.name}.mp3"
             file_filter = "MP3 Files (*.mp3)"
-        elif file_format == "wav":
+        elif file_format == "ogg":
+            default_name = f"{entity.name}.ogg"
+            file_filter = "OGG Files (*.ogg)"
+        else:
             default_name = f"{entity.name}.wav"
             file_filter = "WAV Files (*.wav)"
 
@@ -627,6 +742,8 @@ class WorkspacePage(QWidget):
         try:
             if file_format == "mp3":
                 MP3IO.unload(entity.clip, path)
+            elif file_format == "ogg":
+                OggIO.unload(entity.clip, path)
             else:
                 WavIO.unload(entity.clip, path)
         except (ValueError, OSError) as exc:
@@ -670,7 +787,8 @@ class WorkspacePage(QWidget):
         self._tool_btn.clicked.connect(self._on_tool_button_clicked)
 
         top_bar.addWidget(self._file_btn)
-        top_bar.addWidget(self._edit_btn)
+        if self._editor_type == "editor":
+            top_bar.addWidget(self._edit_btn)
         top_bar.addWidget(self._tool_btn)
         top_bar.addStretch()
         root_layout.addLayout(top_bar)
@@ -775,11 +893,24 @@ class WorkspacePage(QWidget):
         tool_options_layout.setContentsMargins(4, 4, 4, 4)
         tool_options_layout.setSpacing(6)
 
-        _TOOL_SECTIONS = [
-            ("General Tools", ["Delete Divisor"]),
-            ("Filtering Tools", ["Noise Removal"]),
-            ("Echo Tools", ["Add Echo", "Detect Echo"]),
-        ]
+        if self._editor_type == "echo":
+            _TOOL_SECTIONS = [
+                ("Echo Tools", ["Add Echo", "Detect Echo"]),
+            ]
+        elif self._editor_type == "noise":
+            _TOOL_SECTIONS = [
+                ("Filtering Tools", ["Noise Removal"]),
+            ]
+        elif self._editor_type == "frequency":
+            _TOOL_SECTIONS = [
+                # Both are now fully implemented.
+                ("Frequency Tools", ["Show Frequency Domain", "Equalizer"]),
+            ]
+        else:
+            _TOOL_SECTIONS = [
+                ("General Tools", ["Delete Divisor"]),
+            ]
+
         _tool_specs_by_label = {spec["label"]: spec for spec in self._TOOL_OP_SPECS}
 
         self._tool_buttons: dict[str, QPushButton] = {}
@@ -803,6 +934,12 @@ class WorkspacePage(QWidget):
                     # Echo panel with three parameter inputs
                     # Default delay will be set dynamically in begin_echo
                     panel, apply_btn, cancel_btn, echo_input = self._build_echo_panel(1.0)
+                elif spec.get("key") == "detectecho":
+                    panel, apply_btn, cancel_btn, echo_input = self._build_detect_echo_panel()
+                elif spec.get("key") == "freqdomain":
+                    panel, apply_btn, cancel_btn, echo_input = self._build_frequency_domain_panel()
+                elif spec.get("key") == "equalizer":
+                    panel, apply_btn, cancel_btn, echo_input = self._build_equalizer_panel()
                 elif spec.get("custom_panel"):
                     panel, apply_btn, cancel_btn, echo_input = self._build_noise_panel()
                     echo_input = None
@@ -818,7 +955,16 @@ class WorkspacePage(QWidget):
 
                 key = spec["key"]
                 btn.clicked.connect(lambda checked=False, k=key: self._on_op_clicked(k))
-                if spec.get("custom_panel"):
+                if spec.get("key") == "detectecho":
+                    apply_btn.clicked.connect(lambda checked=False, k=key: self._on_detect_echo_analyze_clicked(k))
+                    cancel_btn.clicked.connect(lambda checked=False, k=key: self._on_detect_echo_cancel_clicked(k))
+                elif spec.get("key") == "freqdomain":
+                    apply_btn.clicked.connect(lambda checked=False, k=key: self._on_freqdomain_show_clicked(k))
+                    cancel_btn.clicked.connect(lambda checked=False, k=key: self._on_freqdomain_close_clicked(k))
+                elif spec.get("key") == "equalizer":
+                    apply_btn.clicked.connect(lambda checked=False, k=key: self._on_equalizer_find_clicked(k))
+                    cancel_btn.clicked.connect(lambda checked=False, k=key: self._on_equalizer_cancel_clicked(k))
+                elif spec.get("custom_panel"):
                     apply_btn.clicked.connect(lambda checked=False, k=key: self._on_noise_action_clicked(k))
                     cancel_btn.clicked.connect(lambda checked=False, k=key: self._on_noise_cancel_clicked(k))
                 else:
@@ -960,6 +1106,107 @@ class WorkspacePage(QWidget):
 
         panel.setVisible(False)
         return panel, apply_btn, cancel_btn, echo_input
+
+    def _build_detect_echo_panel(self):
+        """Detect Echo's panel: starts as Analyze/Cancel. Once Analyze
+        has run, the Analyze button is hidden and Cancel is relabeled OK
+        (see _on_detect_echo_analyze_clicked) -- either button always
+        just closes the panel and restores the previous view, since
+        detection never modifies the entity's actual clip."""
+        panel = QWidget()
+        layout = QHBoxLayout(panel)
+        layout.setContentsMargins(16, 0, 0, 0)
+        layout.setSpacing(6)
+        analyze_btn = QPushButton("Analyze")
+        cancel_btn = QPushButton("Cancel")
+        layout.addWidget(analyze_btn)
+        layout.addWidget(cancel_btn)
+        panel.setVisible(False)
+        return panel, analyze_btn, cancel_btn, None
+
+    def _build_frequency_domain_panel(self):
+        """Show Frequency Domain's panel: starts as Show/Cancel. Once
+        Show has computed the X[k] spectra, the Show button is hidden
+        and Cancel is relabeled OK (see _on_freqdomain_show_clicked) --
+        either button just closes the panel; OK additionally leaves the
+        Time Domain/Frequency Domain toggle it revealed in place."""
+        panel = QWidget()
+        layout = QHBoxLayout(panel)
+        layout.setContentsMargins(16, 0, 0, 0)
+        layout.setSpacing(6)
+        show_btn = QPushButton("Show")
+        cancel_btn = QPushButton("Cancel")
+        layout.addWidget(show_btn)
+        layout.addWidget(cancel_btn)
+        panel.setVisible(False)
+        return panel, show_btn, cancel_btn, None
+
+    def _build_equalizer_panel(self):
+        """Equalizer's panel: two phases controlled by the same two buttons.
+
+        Phase 1 (Find):
+            Frequency: [input]
+            k = — (computed display)
+            [Find]  [Cancel]
+
+        Phase 2 (Coefficient editor, shown after Find):
+            A scroll area with one Real/Imag pair per channel.
+            [Apply]  [Cancel]
+
+        The panel widget holds a QVBoxLayout; the coefficient scroll area is
+        added/removed programmatically by the handler methods so it lives
+        entirely in Python-level state (_equalizer_coeff_scroll, etc.).
+        """
+        # Persistent references so handlers can access them
+        self._equalizer_coeff_scroll = None   # QScrollArea; created on Find
+        self._equalizer_coeff_inputs = []     # list of (real_edit, imag_edit) per channel
+
+        panel = QWidget()
+        layout = QVBoxLayout(panel)
+        layout.setContentsMargins(16, 4, 0, 4)
+        layout.setSpacing(6)
+
+        # ---- Frequency row ------------------------------------------------
+        freq_row = QHBoxLayout()
+        freq_row.setSpacing(6)
+        freq_label = QLabel("Frequency (Hz):")
+        freq_label.setFixedWidth(110)
+        self._equalizer_freq_edit = QLineEdit("0")
+        self._equalizer_freq_edit.setFixedWidth(90)
+        self._equalizer_freq_edit.setFixedHeight(26)
+        self._equalizer_freq_edit.setAlignment(Qt.AlignRight)
+        freq_validator = QDoubleValidator(0.0, 9_999_999.0, 2)
+        freq_validator.setNotation(QDoubleValidator.StandardNotation)
+        self._equalizer_freq_edit.setValidator(freq_validator)
+        freq_row.addWidget(freq_label)
+        freq_row.addWidget(self._equalizer_freq_edit)
+        freq_row.addStretch()
+        layout.addLayout(freq_row)
+
+        # ---- k display row ------------------------------------------------
+        k_row = QHBoxLayout()
+        k_row.setSpacing(6)
+        self._equalizer_k_label = QLabel("k = \u2014")
+        self._equalizer_k_label.setStyleSheet("font-style: italic; color: palette(dark);")
+        k_row.addWidget(self._equalizer_k_label)
+        k_row.addStretch()
+        layout.addLayout(k_row)
+
+        # Connect freq edit to live k update
+        self._equalizer_freq_edit.textEdited.connect(self._on_equalizer_freq_changed)
+
+        # ---- Find / Cancel buttons ----------------------------------------
+        btn_row = QHBoxLayout()
+        btn_row.setSpacing(6)
+        find_btn  = QPushButton("Find")
+        cancel_btn = QPushButton("Cancel")
+        btn_row.addWidget(find_btn)
+        btn_row.addWidget(cancel_btn)
+        layout.addLayout(btn_row)
+
+        # The "apply" btn slot in _OpEntry is repurposed as "Find" here.
+        panel.setVisible(False)
+        return panel, find_btn, cancel_btn, None
 
     # ------------------------------------------------------------------
     # Mode switching
@@ -1206,7 +1453,33 @@ class WorkspacePage(QWidget):
             except TypeError:
                 pass
             entry.echo_parameters_slot = None
-        if entry.spec.get("custom_panel"):
+        if entry.spec.get("key") == "detectecho":
+            entry.apply_btn.setVisible(True)
+            entry.apply_btn.setText("Analyze")
+            entry.cancel_btn.setText("Cancel")
+        elif entry.spec.get("key") == "freqdomain":
+            entry.apply_btn.setVisible(True)
+            entry.apply_btn.setText("Show")
+            entry.cancel_btn.setText("Cancel")
+        elif entry.spec.get("key") == "equalizer":
+            entry.apply_btn.setVisible(True)
+            entry.apply_btn.setText("Find")
+            entry.cancel_btn.setText("Cancel")
+            # Also tear down the coefficient scroll area if present
+            if hasattr(self, "_equalizer_coeff_scroll") and self._equalizer_coeff_scroll is not None:
+                panel_layout = entry.panel.layout()
+                if panel_layout is not None:
+                    panel_layout.removeWidget(self._equalizer_coeff_scroll)
+                self._equalizer_coeff_scroll.hide()
+                self._equalizer_coeff_scroll.deleteLater()
+                self._equalizer_coeff_scroll = None
+                self._equalizer_coeff_inputs = []
+            # Reset freq label & edit
+            if hasattr(self, "_equalizer_k_label") and self._equalizer_k_label is not None:
+                self._equalizer_k_label.setText("k = \u2014")
+            if hasattr(self, "_equalizer_freq_edit") and self._equalizer_freq_edit is not None:
+                self._equalizer_freq_edit.setText("0")
+        elif entry.spec.get("custom_panel"):
             entry.apply_btn.setText("Filter")
         self._refresh_tab_bar_lock()
 
@@ -1260,7 +1533,10 @@ class WorkspacePage(QWidget):
                 source_entity, source_channel = source_dialog.selected_entity_channel()
                 if source_entity is None:
                     return
+                self._busy_overlay.show_message("REMOVING NOISE")
+                QApplication.processEvents()
                 began = view.begin_noise_removal_from_entity(source_entity, source_channel)
+                self._busy_overlay.hide_overlay()
                 if began:
                     entry.apply_btn.setText("Apply")
             else:
@@ -1343,7 +1619,10 @@ class WorkspacePage(QWidget):
         view = entry.active_view
 
         if entry.apply_btn.text() == "Filter":
+            self._busy_overlay.show_message("REMOVING NOISE")
+            QApplication.processEvents()
             view.filter_noise()
+            self._busy_overlay.hide_overlay()
             entry.apply_btn.setText("Apply")
         else:
             self._collapse_op_ui(key)
@@ -1356,6 +1635,223 @@ class WorkspacePage(QWidget):
         view = entry.active_view
         self._collapse_op_ui(key)
         view.cancel_noise_removal()
+
+    # ------------------------------------------------------------------
+    # Detect Echo's two-stage panel (Analyze/Cancel -> OK)
+    # ------------------------------------------------------------------
+
+    def _on_detect_echo_analyze_clicked(self, key: str):
+        entry = self._ops[key]
+        if not entry.active or entry.active_view is None:
+            return
+        view = entry.active_view
+        self._busy_overlay.show_message("ANALYZING ECHO")
+        QApplication.processEvents()
+        view.analyze_echo()
+        self._busy_overlay.hide_overlay()
+        entry.apply_btn.setVisible(False)
+        entry.cancel_btn.setText("OK")
+
+    def _on_detect_echo_cancel_clicked(self, key: str):
+        entry = self._ops[key]
+        if not entry.active or entry.active_view is None:
+            return
+        view = entry.active_view
+        self._collapse_op_ui(key)
+        view.cancel_detect_echo()
+
+    # ------------------------------------------------------------------
+    # Show Frequency Domain's two-stage panel (Show/Cancel -> OK)
+    # ------------------------------------------------------------------
+
+    def _on_freqdomain_show_clicked(self, key: str):
+        entry = self._ops[key]
+        if not entry.active or entry.active_view is None:
+            return
+        view = entry.active_view
+        self._busy_overlay.show_message("COMPUTING FREQUENCY DOMAIN")
+        QApplication.processEvents()
+        view.show_frequency_domain()
+        self._busy_overlay.hide_overlay()
+        entry.apply_btn.setVisible(False)
+        entry.cancel_btn.setText("OK")
+
+    def _on_freqdomain_close_clicked(self, key: str):
+        entry = self._ops[key]
+        if not entry.active or entry.active_view is None:
+            return
+        view = entry.active_view
+        self._collapse_op_ui(key)
+        view.close_frequency_domain()
+
+    # ------------------------------------------------------------------
+    # Equalizer: Find → coefficient editor → Apply/Cancel
+    # ------------------------------------------------------------------
+
+    def _equalizer_compute_k(self) -> tuple[int, float]:
+        """Compute k from the current frequency input and the active entity.
+        Returns (k, f_quantized) where f_quantized = k * fs / N."""
+        view = self._current_entity_view()
+        if view is None:
+            return 0, 0.0
+        clip = view.entity.clip
+        fs = clip.sample_rate
+        N = len(clip.channels[0].samples)
+        try:
+            f = float(self._equalizer_freq_edit.text())
+        except ValueError:
+            f = 0.0
+        # For a real signal, spectrum is only meaningful up to Nyquist (fs/2)
+        f = max(0.0, min(f, float(fs) / 2.0))
+        k = round(f * N / fs)
+        k = max(0, min(k, N - 1))
+        f_quantized = k * fs / N
+        return k, f_quantized
+
+    def _on_equalizer_freq_changed(self, text: str):
+        """Live-update the k display when the frequency text changes."""
+        entry = self._ops.get("equalizer")
+        if entry is None or not entry.active:
+            return
+        k, f_q = self._equalizer_compute_k()
+        self._equalizer_k_label.setText(
+            f"k = {k}   (f\u2090 = {f_q:.2f} Hz)"
+        )
+
+    def _on_equalizer_find_clicked(self, key: str):
+        """'Find' button: compute k, call view.find_equalizer_coefficients(k),
+        then transition the panel to Phase 2 (coefficient editor)."""
+        entry = self._ops.get(key)
+        if entry is None or not entry.active or entry.active_view is None:
+            return
+        view = entry.active_view
+
+        k, f_q = self._equalizer_compute_k()
+        self._equalizer_k_label.setText(f"k = {k}   (f\u2090 = {f_q:.2f} Hz)")
+
+        coefficients = view.find_equalizer_coefficients(k)
+        if not coefficients:
+            return
+
+        # Tear down any pre-existing coefficient scroll area
+        panel_layout = entry.panel.layout()
+        if self._equalizer_coeff_scroll is not None:
+            panel_layout.removeWidget(self._equalizer_coeff_scroll)
+            self._equalizer_coeff_scroll.hide()
+            self._equalizer_coeff_scroll.deleteLater()
+            self._equalizer_coeff_scroll = None
+        self._equalizer_coeff_inputs = []
+
+        # Build the coefficient scroll area
+        coeff_container = QWidget()
+        coeff_layout = QVBoxLayout(coeff_container)
+        coeff_layout.setContentsMargins(0, 0, 0, 0)
+        coeff_layout.setSpacing(6)
+
+        for ch_idx, coeff in enumerate(coefficients):
+            ch_label = QLabel(f"Ch {ch_idx + 1}  X[{k}]:")
+            ch_label.setStyleSheet("font-weight: 600; margin-top: 4px;")
+            coeff_layout.addWidget(ch_label)
+
+            real_row = QHBoxLayout()
+            real_label = QLabel("  Real:")
+            real_label.setFixedWidth(44)
+            real_edit = QLineEdit(f"{coeff.real:.6g}")
+            real_edit.setFixedHeight(24)
+            real_row.addWidget(real_label)
+            real_row.addWidget(real_edit)
+            coeff_layout.addLayout(real_row)
+
+            imag_row = QHBoxLayout()
+            imag_label = QLabel("  Imag:")
+            imag_label.setFixedWidth(44)
+            imag_edit = QLineEdit(f"{coeff.imag:.6g}")
+            imag_edit.setFixedHeight(24)
+            imag_row.addWidget(imag_label)
+            imag_row.addWidget(imag_edit)
+            coeff_layout.addLayout(imag_row)
+
+            self._equalizer_coeff_inputs.append((real_edit, imag_edit))
+
+            # Connect to live preview
+            real_edit.textEdited.connect(
+                lambda _text, k=k, key=key: self._on_equalizer_coeff_changed(k, key)
+            )
+            imag_edit.textEdited.connect(
+                lambda _text, k=k, key=key: self._on_equalizer_coeff_changed(k, key)
+            )
+
+        # Apply / Cancel buttons (second phase)
+        btn_row = QHBoxLayout()
+        apply_btn2 = QPushButton("Apply")
+        cancel_btn2 = QPushButton("Cancel")
+        apply_btn2.clicked.connect(lambda: self._on_equalizer_apply_clicked(key))
+        cancel_btn2.clicked.connect(lambda: self._on_equalizer_cancel_clicked(key))
+        btn_row.addWidget(apply_btn2)
+        btn_row.addWidget(cancel_btn2)
+        coeff_layout.addLayout(btn_row)
+
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setWidget(coeff_container)
+        scroll.setMaximumHeight(280)
+        self._equalizer_coeff_scroll = scroll
+
+        # Insert the scroll above the Find/Cancel button row.
+        # The layout is: freq_row, k_row, btn_row(Find/Cancel).
+        # We want the scroll between k_row (index 1) and btn_row (index 2).
+        panel_layout.insertWidget(2, scroll)
+
+        # Hide the original Find/Cancel buttons while in phase 2
+        entry.apply_btn.setVisible(False)
+        entry.cancel_btn.setVisible(False)
+
+    def _on_equalizer_coeff_changed(self, k: int, key: str):
+        """Parse all coefficient inputs and push a live preview update."""
+        entry = self._ops.get(key)
+        if entry is None or not entry.active or entry.active_view is None:
+            return
+        view = entry.active_view
+
+        coefficients = []
+        for real_edit, imag_edit in self._equalizer_coeff_inputs:
+            try:
+                r = float(real_edit.text())
+            except ValueError:
+                r = 0.0
+            try:
+                i = float(imag_edit.text())
+            except ValueError:
+                i = 0.0
+            coefficients.append(complex(r, i))
+
+        view.update_equalizer_preview(k, coefficients)
+
+    def _on_equalizer_apply_clicked(self, key: str):
+        """Commit the equalizer changes."""
+        entry = self._ops.get(key)
+        if entry is None or not entry.active or entry.active_view is None:
+            return
+        view = entry.active_view
+        self._collapse_op_ui(key)
+        view.apply_equalizer()
+
+    def _on_equalizer_cancel_clicked(self, key: str):
+        """Revert equalizer and close the panel."""
+        entry = self._ops.get(key)
+        if entry is None:
+            return
+        # Restore Find/Cancel visibility before collapse
+        if entry.apply_btn is not None:
+            entry.apply_btn.setVisible(True)
+        if entry.cancel_btn is not None:
+            entry.cancel_btn.setVisible(True)
+        if entry.active and entry.active_view is not None:
+            view = entry.active_view
+            self._collapse_op_ui(key)
+            view.cancel_equalizer()
+        else:
+            self._collapse_op_ui(key)
 
     # ------------------------------------------------------------------
     # Entity-view factory / tab lifecycle
@@ -1406,18 +1902,33 @@ class WorkspacePage(QWidget):
         old_widget   = self._content_stack.widget(widget_index)
         was_current  = (self._tab_bar.currentIndex() == index)
 
-        # Check if echo is active on old widget
+        # Check if echo is active on old widget (only editors built with
+        # editor_type="echo" register an "echo" op at all -- e.g. the
+        # noise/filtering editor never does, so this must not assume the
+        # key exists).
         echo_active = False
         echo_params_input = None
         echo_original_clip = None
         echo_parameters = None
-        if old_widget is self._ops["echo"].active_view:
+        echo_entry = self._ops.get("echo")
+        if echo_entry is not None and old_widget is echo_entry.active_view:
             echo_active = True
-            echo_params_input = self._ops["echo"].echo_parameters_input
+            echo_params_input = echo_entry.echo_parameters_input
             echo_original_clip = old_widget._echo_original_clip.copy()
             echo_parameters = old_widget._echo_parameters
 
-        self._collapse_ops_for_widget(old_widget, skip_keys={"echo"})
+        equalizer_active = False
+        eq_orig_clip = None
+        eq_k = None
+        eq_coeffs = None
+        equalizer_entry = self._ops.get("equalizer")
+        if equalizer_entry is not None and old_widget is equalizer_entry.active_view:
+            equalizer_active = True
+            eq_orig_clip = old_widget._equalizer_original_clip
+            eq_k = old_widget._equalizer_k
+            eq_coeffs = old_widget._equalizer_coefficients
+
+        self._collapse_ops_for_widget(old_widget, skip_keys={"echo", "equalizer"})
 
         self._content_stack.removeWidget(old_widget)
         old_widget.deleteLater()
@@ -1426,7 +1937,7 @@ class WorkspacePage(QWidget):
         
         # If echo was active, restore the connection to the new view
         if echo_active and echo_params_input is not None:
-            entry = self._ops["echo"]
+            entry = echo_entry
             entry.active_view = entity_view
             entry.active = True
             entity_view._echo_original_clip = echo_original_clip
@@ -1439,6 +1950,16 @@ class WorkspacePage(QWidget):
                     pass
             entry.echo_parameters_slot = lambda o, d, dc, k="echo": self._on_echo_parameters_changed(k, o, d, dc)
             echo_params_input.parameters_changed.connect(entry.echo_parameters_slot)
+            
+        if equalizer_active:
+            entry = equalizer_entry
+            entry.active_view = entity_view
+            entry.active = True
+            entity_view._equalizer_active = True
+            entity_view._equalizer_original_clip = eq_orig_clip
+            entity_view._equalizer_k = eq_k
+            entity_view._equalizer_coefficients = eq_coeffs
+            entity_view._lock_selection(True)
         
         self._content_stack.insertWidget(widget_index, entity_view)
         if was_current:

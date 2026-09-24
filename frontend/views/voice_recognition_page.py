@@ -18,7 +18,7 @@ from PySide6.QtWidgets import (
 )
 
 from backend.workspace_model import Entity, Folder, Workspace
-from backend.audio_io import WavIO, MP3IO
+from backend.audio_io import WavIO, MP3IO, OggIO
 from frontend.dialogs.create_entity_dialog import CreateEntityDialog
 from frontend.dialogs.create_folder_dialog import CreateFolderDialog
 from frontend.dialogs.download_format_dialog import DownloadFormatDialog
@@ -208,11 +208,14 @@ class VoiceRecognitionPage(QWidget):
         format_dialog = DownloadFormatDialog(self)
         if format_dialog.exec() != QDialog.DialogCode.Accepted:
             return
-        file_format = format_dialog.selected_format()   # "wav" or "mp3"
+        file_format = format_dialog.selected_format()   # "wav", "mp3", or "ogg"
 
         if file_format == "mp3":
             default_name = f"{entity.name}.mp3"
             file_filter = "MP3 Files (*.mp3)"
+        elif file_format == "ogg":
+            default_name = f"{entity.name}.ogg"
+            file_filter = "OGG Files (*.ogg)"
         else:
             default_name = f"{entity.name}.wav"
             file_filter = "WAV Files (*.wav)"
@@ -228,6 +231,8 @@ class VoiceRecognitionPage(QWidget):
         try:
             if file_format == "mp3":
                 MP3IO.unload(entity.clip, path)
+            elif file_format == "ogg":
+                OggIO.unload(entity.clip, path)
             else:
                 WavIO.unload(entity.clip, path)
         except (ValueError, OSError) as exc:

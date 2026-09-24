@@ -1,6 +1,6 @@
 import numpy as np
 
-from backend.fft_algorithms import BluesteinFFT
+from backend.fft_algorithms import BluesteinFFT, CooleyTukeyFFT, _next_power_of_two
 
 class Discrete_Signal:
     """
@@ -254,20 +254,40 @@ class Discrete_Signal:
         """
         other = other.resample(self.sample_rate)
 
-        output_size = len(self.samples) + len(other.samples) - 1
+        # Use FFT-based convolution for efficiency
+
+        min_size = len(self.samples) + len(other.samples) - 1
+        output_size = _next_power_of_two(min_size)
+
         self_padded = np.zeros(output_size, dtype=float)
         other_padded = np.zeros(output_size, dtype=float)
         self_padded[:len(self.samples)] = self.samples
         other_padded[:len(other.samples)] = other.samples
 
-        self_fft = BluesteinFFT.fft(self_padded)
-        other_fft = BluesteinFFT.fft(other_padded)
-        result_samples = BluesteinFFT.ifft(self_fft * other_fft).real
+        self_fft = CooleyTukeyFFT.fft(self_padded)
+        other_fft = CooleyTukeyFFT.fft(other_padded)
+        result_samples = CooleyTukeyFFT.ifft(self_fft * other_fft).real[:min_size]
         
         # The start index of the convolution result
         result_start_index = self.start_index + other.start_index
         
         return Discrete_Signal(result_samples, self.sample_rate, result_start_index)
+
+    def fft(self):
+        """
+        Discrete Fourier transform X[k] of this signal, via the
+        length-preserving Bluestein transform (works for any signal
+        length, not just a power of two -- unlike CooleyTukeyFFT).
+
+        Returns (frequencies, spectrum):
+          frequencies -- 1-D array, length N, the frequency in Hz of
+                         each bin k (k * sample_rate / N).
+          spectrum    -- 1-D complex array, X[k], same length as samples.
+        """
+        spectrum = BluesteinFFT.fft(self.samples)
+        n = len(spectrum)
+        frequencies = np.arange(n) * (self.sample_rate / n)
+        return frequencies, spectrum
 
     def fade_in(self, start_index=None, end_index=None):
         if start_index is None:
@@ -511,70 +531,223 @@ class Discrete_Signal:
 
         return result
 
-    def detect_echo(self, min_delay=0.08, max_delay=0.5, min_confidence=0.2):
-        """Return (delay_seconds, decay, confidence) for the strongest echo-like lag.
-
-        Echo detection is implemented in the cepstrum domain, which is much more
-        robust than raw autocorrelation for single-tone or nearly periodic audio.
-        A true reflected copy creates a distinct peak at the echo delay, while the
-        signal's fundamental pitch usually appears at a much shorter quefrency and is
-        ignored by the search window.
+    def detect_echo(self, max_occurrence=12, min_delay_seconds=0.005):
         """
-        if self.sample_rate <= 0 or len(self.samples) < 8:
-            return (0.0, 0.0, 0.0)
+        Blind estimation of the echo effect echo() applies: the impulse
+        response is assumed to be the same constant-spacing, geometric-
+        decay model --
 
-        samples = np.asarray(self.samples, dtype=float)
-        samples = np.nan_to_num(samples)
-        if np.allclose(samples, 0.0):
-            return (0.0, 0.0, 0.0)
+            h[n] = sum_{i=0}^{occurrence-1} r^i * delta[n - i*D],  r = 1 - decay
 
-        centered = samples - np.mean(samples)
-        if np.max(np.abs(centered)) < 1e-8:
-            return (0.0, 0.0, 0.0)
+        -- so that recovering (occurrence, delay, decay) from y[n] alone
+        is a well-posed, parametric problem instead of a generically
+        unsolvable one (arbitrary h[n] blind deconvolution has infinitely
+        many solutions). This is still an *estimate*: it assumes the
+        pre-echo signal x[n] is broadband/generic, not itself periodic or
+        sparse at the same spacing as the echo.
 
-        min_lag = max(1, int(round(min_delay * self.sample_rate)))
-        max_lag = min(len(centered) // 2, int(round(max_delay * self.sample_rate)))
-        if max_lag <= min_lag:
-            return (0.0, 0.0, 0.0)
+        Steps (dominant cost is the FFT/IFFT pairs, so O(n log n)):
+          1. Y = FFT(y)
+          2. Autocorrelation (Wiener-Khinchin: IFFT(|Y|^2))
+             -> candidate echo spacing D
+          3. Real cepstrum c = IFFT(log|Y|)
+             -> echo structure shows up as peaks at D, 2D, 3D, ...
+          4. Least-squares fit of log(m * c[mD]) = m * log(r)
+             -> decay rate r                                       (O(k))
+          5. Threshold the cepstrum peaks against the strongest one
+             -> occurrence count                                   (O(k))
+          6. Recursive cancellation using the geometric-series identity
+             for H(z):
+                 x[n] = y[n] - r*y[n-D] + r^occurrence * x[n - occurrence*D]
+             -> recovers the pre-echo signal x[n]                  (O(n))
 
-        window = np.hanning(len(centered))
-        windowed = centered * window
-        cepstrum = BluesteinFFT.cepstrum(windowed)
+        Returns a dict:
+          {
+            "occurrence": int,              # matches echo()'s occurrence
+            "delay":      float,            # seconds, matches echo()'s delay
+            "decay":      float,            # 0.0 - 1.0, matches echo()'s decay
+            "recovered":  Discrete_Signal,  # the estimated x[n]
+          }
+        """
+        y = self.samples.astype(np.float64)
+        n = len(y)
 
-        # Restrict the search to positive quefrencies that correspond to the echo delay.
-        cepstrum = np.maximum(cepstrum, 0.0)
-        windowed_cepstrum = cepstrum[min_lag:max_lag + 1]
-        if windowed_cepstrum.size == 0:
-            return (0.0, 0.0, 0.0)
+        if n < 4:
+            return {
+                "occurrence": 1,
+                "delay": min_delay_seconds,
+                "decay": 0.0,
+                "recovered": self.copy(),
+            }
 
-        best_index = int(np.argmax(windowed_cepstrum))
-        best_lag = best_index + min_lag
-        best_score = float(windowed_cepstrum[best_index])
-        if best_score <= min_confidence:
-            return (0.0, 0.0, 0.0)
+        # ---- 1 & 2: autocorrelation (linear, via zero-padded FFT) to
+        # find candidate echo spacings. Padding to >= 2n-1 avoids the
+        # wraparound a plain circular autocorrelation would have.
+        pad_len = _next_power_of_two(2 * n - 1)
+        y_padded = np.zeros(pad_len, dtype=np.float64)
+        y_padded[:n] = y
+        spectrum_padded = BluesteinFFT.fft(y_padded)
+        power = np.abs(spectrum_padded) ** 2
+        autocorr = BluesteinFFT.ifft(power).real
 
-        decay = float(np.clip(best_score / max(np.max(windowed_cepstrum), 1e-9), 0.0, 1.0))
-        return (best_lag / self.sample_rate, decay, float(np.clip(best_score, 0.0, 1.0)))
+        min_lag = max(1, int(round(min_delay_seconds * self.sample_rate)))
+        max_lag = max(min_lag + 1, n // 2)
+        window = autocorr[min_lag:max_lag]
 
-    def extract_delayed_component(self, delay, amplitude=None):
-        """Return the delayed signal component for an echo delay."""
-        delay_samples = int(round(float(delay) * self.sample_rate))
-        extracted = np.zeros(len(self.samples), dtype=float)
-        if delay_samples <= 0 or delay_samples >= len(self.samples):
-            return Discrete_Signal(extracted, self.sample_rate, self.start_index)
+        # Several candidate spacings (local maxima of the autocorrelation,
+        # not just its single global peak) get tried below -- x[n]'s own
+        # periodicity can otherwise out-rank the real echo spacing.
+        candidate_lags = [
+            min_lag + i for i in range(1, len(window) - 1)
+            if window[i] > window[i - 1] and window[i] >= window[i + 1]
+        ]
+        if not candidate_lags:
+            candidate_lags = [min_lag + int(np.argmax(window))] if len(window) else [min_lag]
+        candidate_lags.sort(key=lambda lag: autocorr[lag], reverse=True)
+        candidate_lags = candidate_lags[:6]
 
-        source = np.asarray(self.samples, dtype=float)
-        delayed = np.zeros_like(source)
-        delayed[delay_samples:] = source[:-delay_samples]
+        # ---- 3: real cepstrum of y itself (magnitude only -- avoids the
+        # phase-unwrapping issues a complex cepstrum would run into).
+        spectrum = BluesteinFFT.fft(y)
+        log_magnitude = np.log(np.maximum(np.abs(spectrum), 1e-12))
+        cepstrum = BluesteinFFT.ifft(log_magnitude).real
+        abs_cepstrum = np.abs(cepstrum)
 
-        if amplitude is None:
-            centered_source = source - np.mean(source)
-            centered_delayed = delayed - np.mean(delayed)
-            denominator = float(np.dot(centered_delayed, centered_delayed))
-            amplitude = 0.0 if denominator <= 1e-12 else float(
-                np.dot(centered_source, centered_delayed) / denominator
-            )
+        # ---- 4 & 5: for each candidate spacing D, walk c[D], c[2D], ...
+        # and keep only the *consecutive* run starting at m=1 whose
+        # values clear a significance threshold set from the cepstrum's
+        # own typical magnitude *elsewhere* (not from these peaks
+        # themselves, which would be circular). The candidate producing
+        # the longest well-fit run wins; its slope gives the decay rate.
+        best = None   # (score, D, k, r)
 
-        amplitude = float(np.clip(amplitude, 0.0, 1.0))
-        extracted = delayed * amplitude
-        return Discrete_Signal(extracted, self.sample_rate, self.start_index)
+        for delay_samples in candidate_lags:
+            if delay_samples <= 0:
+                continue
+            max_m = min(max_occurrence - 1, (n - 1) // delay_samples)
+            if max_m < 1:
+                continue
+
+            mask = np.ones(n, dtype=bool)
+            for m in range(1, max_m + 1):
+                idx = m * delay_samples
+                if idx < n:
+                    mask[max(0, idx - 1):min(n, idx + 2)] = False
+            baseline_pool = abs_cepstrum[mask] if mask.any() else abs_cepstrum
+            baseline = float(np.median(baseline_pool)) + 1e-9
+            threshold = baseline * 3.0
+
+            xs, ys = [], []
+            for m in range(1, max_m + 1):
+                idx = m * delay_samples
+                if idx >= n:
+                    break
+                value = cepstrum[idx]
+                if value <= threshold:
+                    break
+                product = m * value
+                if product <= 1e-10:
+                    break
+                xs.append(float(m))
+                ys.append(float(np.log(product)))
+
+            if not xs:
+                continue
+
+            xs_arr = np.asarray(xs)
+            ys_arr = np.asarray(ys)
+            slope = float(np.sum(xs_arr * ys_arr) / np.sum(xs_arr * xs_arr))
+            r_candidate = min(max(float(np.exp(slope)), 0.0), 0.999)
+
+            if len(xs) > 1:
+                predicted = slope * xs_arr
+                ss_res = float(np.sum((ys_arr - predicted) ** 2))
+                ss_tot = float(np.sum((ys_arr - ys_arr.mean()) ** 2)) + 1e-9
+                fit_quality = 1.0 - ss_res / ss_tot
+            else:
+                fit_quality = 0.5   # a single peak can't show a trend either way
+
+            score = len(xs) + fit_quality
+            if best is None or score > best[0]:
+                best = (score, delay_samples, len(xs), r_candidate)
+
+        if best is None:
+            # No candidate spacing showed a credible, above-baseline echo
+            # pattern -- report "no echo detected" rather than a forced
+            # guess, and hand the signal back unchanged.
+            fallback_delay = candidate_lags[0] if candidate_lags else min_lag
+            return {
+                "occurrence": 1,
+                "delay": fallback_delay / self.sample_rate,
+                "decay": 0.0,
+                "recovered": self.copy(),
+            }
+
+        _, delay_samples, k, r = best
+        occurrence = max(1, min(k + 1, max_occurrence))
+
+        # ---- 6: recursive cancellation -- reuses the geometric-series
+        # identity for H(z) that echo()'s impulse response satisfies, so
+        # each sample costs O(1) regardless of how large occurrence is.
+        x = np.zeros(n, dtype=np.float64)
+        r_pow_occurrence = r ** occurrence
+        far_lag = occurrence * delay_samples
+        for i in range(n):
+            value = y[i]
+            if i - delay_samples >= 0:
+                value -= r * y[i - delay_samples]
+            if i - far_lag >= 0:
+                value += r_pow_occurrence * x[i - far_lag]
+            x[i] = value
+
+        # echo() convolves the original x[n] (length d) with an impulse
+        # response of length (occurrence-1)*delay_samples + 1, so
+        # len(y) = d + (occurrence-1)*delay_samples. x[n] is therefore
+        # shorter than y[n] by exactly (occurrence-1)*delay_samples --
+        # everything the recursion produces past that point is trailing
+        # echo structure it didn't fully cancel, not real signal, and
+        # keeping it is what made the recovered audio repeat.
+        base_length = max(1, n - (occurrence - 1) * delay_samples)
+        recovered = Discrete_Signal(x[:base_length], self.sample_rate, self.start_index)
+
+        return {
+            "occurrence": occurrence,
+            "delay": delay_samples / self.sample_rate,
+            "decay": round(1.0 - r, 6),
+            "recovered": recovered,
+        }
+
+    def equalize(self, k: int, new_xk: complex) -> "Discrete_Signal":
+        """
+        Replace the DFT coefficient X[k] (and the conjugate mirror bin
+        X[N-k] so the reconstructed signal stays real) with `new_xk`,
+        then IFFT-reconstruct and return a new Discrete_Signal.
+
+        Parameters
+        ----------
+        k       : bin index, 0 <= k < N (N = len(self.samples))
+        new_xk  : new complex coefficient value for bin k
+
+        If k == 0 or k == N/2 (DC and Nyquist), the imaginary part of
+        new_xk is forced to zero to preserve a real-valued output.
+        """
+        spectrum = BluesteinFFT.fft(self.samples.astype(np.float64))
+        n = len(spectrum)
+
+        k = int(k)
+        if not (0 <= k < n):
+            raise ValueError(f"k={k} is out of range [0, {n-1}]")
+
+        # Bins where imaginary part must be zero (DC and Nyquist)
+        if k == 0 or (n % 2 == 0 and k == n // 2):
+            new_xk = complex(new_xk.real, 0.0)
+
+        spectrum[k] = new_xk
+
+        # Maintain Hermitian symmetry so IFFT yields a real signal.
+        mirror = (n - k) % n
+        if mirror != k:
+            spectrum[mirror] = np.conj(new_xk)
+
+        reconstructed = BluesteinFFT.ifft(spectrum).real
+        return Discrete_Signal(reconstructed, self.sample_rate, self.start_index)
