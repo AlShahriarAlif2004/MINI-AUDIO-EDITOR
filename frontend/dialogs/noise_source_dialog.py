@@ -61,6 +61,9 @@ class NoiseSourceDialog(QDialog):
         self._buttons = QDialogButtonBox(
             QDialogButtonBox.Ok | QDialogButtonBox.Cancel
         )
+        ok_btn = self._buttons.button(QDialogButtonBox.Ok)
+        ok_btn.setAutoDefault(False)
+        ok_btn.setDefault(False)
         self._buttons.accepted.connect(self._on_accept)
         self._buttons.rejected.connect(self.reject)
         layout.addWidget(self._buttons)

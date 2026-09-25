@@ -189,7 +189,7 @@ class VoiceEntityView(QWidget):
         self._set_dropdown_visible(False)
         self._sample_panel.setVisible(False)
         self._similarity_panel.setVisible(False)
-        self._sample_actions.setVisible(True)
+        self._sample_actions.setVisible(False)
         self._title_label.setVisible(True)
         self._plot_container.setVisible(True)
         self._refresh_button_styles()
@@ -201,7 +201,7 @@ class VoiceEntityView(QWidget):
             self._active_view = self.VIEW_SAMPLE
             self._sample_panel.setVisible(True)
             self._similarity_panel.setVisible(False)
-            self._sample_actions.setVisible(False)
+            self._sample_actions.setVisible(True)
             self._set_dropdown_visible(False)
             self._title_label.setVisible(True)
             self._plot_container.setVisible(True)
