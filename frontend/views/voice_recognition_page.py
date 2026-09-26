@@ -265,10 +265,22 @@ class VoiceRecognitionPage(QWidget):
         self._file_menu.addAction("Exit", self.exit_requested.emit)
 
         top_bar.addWidget(self._file_btn)
+
         top_bar.addStretch()   # no Edit / Tool buttons in Voice Recognition mode
-        root_layout.addLayout(top_bar)
+        self._mode_title_label = QLabel("Voice Recognition")
+        self._mode_title_label.setStyleSheet(
+            "color: #FFFFFF; font-weight: 700; font-size: 14px; background: transparent;"
+        )
+        top_bar.addWidget(self._mode_title_label)
+        top_bar.addStretch()
+
+        top_bar_widget = QWidget()
+        top_bar_widget.setLayout(top_bar)
+        top_bar_widget.setFixedHeight(32)
+        root_layout.addWidget(top_bar_widget)
 
         self._splitter = QSplitter(Qt.Horizontal)
+        root_layout.setStretchFactor(self._splitter, 1)
 
         # ---- sidebar ----
         sidebar = QWidget()

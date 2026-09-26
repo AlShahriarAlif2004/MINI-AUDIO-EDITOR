@@ -790,12 +790,30 @@ class WorkspacePage(QWidget):
         if self._editor_type == "editor":
             top_bar.addWidget(self._edit_btn)
         top_bar.addWidget(self._tool_btn)
+
         top_bar.addStretch()
-        root_layout.addLayout(top_bar)
+        _MODE_TITLES = {
+            "editor": "Editor Mode",
+            "echo": "Echo Mode",
+            "noise": "Noise Removal",
+            "frequency": "Frequency Mode",
+        }
+        self._mode_title_label = QLabel(_MODE_TITLES.get(self._editor_type, ""))
+        self._mode_title_label.setStyleSheet(
+            "color: #FFFFFF; font-weight: 700; font-size: 14px; background: transparent;"
+        )
+        top_bar.addWidget(self._mode_title_label)
+        top_bar.addStretch()
+
+        top_bar_widget = QWidget()
+        top_bar_widget.setLayout(top_bar)
+        top_bar_widget.setFixedHeight(32)
+        root_layout.addWidget(top_bar_widget)
 
         self._file_btn.setStyleSheet(self._SELECTED_BTN_STYLE)
 
         self._splitter = QSplitter(Qt.Horizontal)
+        root_layout.setStretchFactor(self._splitter, 1)
 
         # ---- sidebar ----
         sidebar = QWidget()
