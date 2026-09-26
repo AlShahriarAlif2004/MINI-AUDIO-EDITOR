@@ -1482,56 +1482,72 @@ class EntityPlotView(QWidget):
         decay = result["decay"]
         recovered = result["recovered"]
 
-        fields = [
-            ("Occurrence", str(occurrence)),
-            ("Delay", f"{delay:.4f} s"),
-            ("Decay", f"{decay:.4f}"),
-        ]
+        # An occurrence of 1 means no repeat was found at all, and an
+        # occurrence of 2 with a near-zero delay is indistinguishable from
+        # no echo (the "repeat" is just adjacent samples). In both cases
+        # the estimated parameters aren't meaningful, so report "no echo"
+        # instead and fall back to the source signal (not the recovered
+        # one -- there's nothing to recover) as the base signal.
+        no_echo_found = occurrence == 1 or (occurrence == 2 and delay < 0.08)
 
-        header_row = QHBoxLayout()
-        header_row.setSpacing(6)
+        if no_echo_found:
+            message = QLabel("System couldn't detect any echo in the provided audio clip.")
+            message.setStyleSheet("font-size: 15px; font-weight: 600;")
+            message.setWordWrap(True)
+            layout.addWidget(message)
+        else:
+            fields = [
+                ("Occurrence", str(occurrence)),
+                ("Delay", f"{delay:.4f} s"),
+                ("Decay", f"{decay:.4f}"),
+            ]
 
-        labels_column = QVBoxLayout()
-        labels_column.setSpacing(4)
-        for name, _ in fields:
-            label_row = QHBoxLayout()
-            label_row.setSpacing(0)
-            name_label = QLabel(name)
-            name_label.setStyleSheet("font-size: 15px; font-weight: 600;")
-            name_label.setFixedWidth(95)
-            name_label.setAlignment(Qt.AlignLeft | Qt.AlignVCenter)
-            colon_label = QLabel(":")
-            colon_label.setStyleSheet("font-size: 15px; font-weight: 600;")
-            label_row.addWidget(name_label)
-            label_row.addWidget(colon_label)
-            labels_column.addLayout(label_row)
-        header_row.addLayout(labels_column)
+            header_row = QHBoxLayout()
+            header_row.setSpacing(6)
 
-        header_row.addSpacing(24)
+            labels_column = QVBoxLayout()
+            labels_column.setSpacing(4)
+            for name, _ in fields:
+                label_row = QHBoxLayout()
+                label_row.setSpacing(0)
+                name_label = QLabel(name)
+                name_label.setStyleSheet("font-size: 15px; font-weight: 600;")
+                name_label.setFixedWidth(95)
+                name_label.setAlignment(Qt.AlignLeft | Qt.AlignVCenter)
+                colon_label = QLabel(":")
+                colon_label.setStyleSheet("font-size: 15px; font-weight: 600;")
+                label_row.addWidget(name_label)
+                label_row.addWidget(colon_label)
+                labels_column.addLayout(label_row)
+            header_row.addLayout(labels_column)
 
-        summary_column = QVBoxLayout()
-        summary_column.setSpacing(4)
-        summary_column.setAlignment(Qt.AlignLeft)
-        for _, value in fields:
-            summary_label = QLabel(value)
-            summary_label.setAlignment(Qt.AlignLeft)
-            summary_label.setStyleSheet("font-size: 20px; font-weight: 700;")
-            summary_column.addWidget(summary_label)
-        header_row.addLayout(summary_column)
+            header_row.addSpacing(24)
 
-        header_row.addStretch()
-        layout.addLayout(header_row)
+            summary_column = QVBoxLayout()
+            summary_column.setSpacing(4)
+            summary_column.setAlignment(Qt.AlignLeft)
+            for _, value in fields:
+                summary_label = QLabel(value)
+                summary_label.setAlignment(Qt.AlignLeft)
+                summary_label.setStyleSheet("font-size: 20px; font-weight: 700;")
+                summary_column.addWidget(summary_label)
+            header_row.addLayout(summary_column)
+
+            header_row.addStretch()
+            layout.addLayout(header_row)
 
         title = QLabel("Base Signal")
         title.setStyleSheet("font-size: 15px; font-weight: 600; margin-top: 8px;")
         layout.addWidget(title)
 
-        times = self._time_axis(recovered)
+        base_signal = source_signal if no_echo_found else recovered
+
+        times = self._time_axis(base_signal)
         player = WaveformPlayer(
             times=times,
-            series=[(recovered.samples, _CHANNEL_COLORS[1], "Base Signal")],
-            sample_rate=recovered.sample_rate,
-            audio_data=recovered.samples.astype(np.float32),
+            series=[(base_signal.samples, _CHANNEL_COLORS[1], "Base Signal")],
+            sample_rate=base_signal.sample_rate,
+            audio_data=base_signal.samples.astype(np.float32),
             group=self._group,
             entity=self._entity,
             channel_index=None,
