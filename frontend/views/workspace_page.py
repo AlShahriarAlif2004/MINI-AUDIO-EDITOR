@@ -1,5 +1,5 @@
 from PySide6.QtCore import Qt, QTimer, Signal
-from PySide6.QtGui import QColor, QDoubleValidator, QIntValidator, QLinearGradient, QPainter, QPen
+from PySide6.QtGui import QBrush, QColor, QDoubleValidator, QIntValidator, QLinearGradient, QPainter, QPen
 from PySide6.QtWidgets import (
     QApplication,
     QDialog,
@@ -560,6 +560,15 @@ class WorkspacePage(QWidget):
         if self._busy_overlay.isVisible():
             self._busy_overlay.setGeometry(self.rect())
 
+    def paintEvent(self, event):
+        """Dark gradient backdrop -- kept consistent with the home page."""
+        painter = QPainter(self)
+        gradient = QLinearGradient(0, 0, self.width(), self.height())
+        gradient.setColorAt(0.0, QColor("#0C0E13"))
+        gradient.setColorAt(1.0, QColor("#181D26"))
+        painter.fillRect(self.rect(), QBrush(gradient))
+        super().paintEvent(event)
+
     def _create_folder(self):
         self._create_folder_in(self._target_folder())
 
@@ -795,7 +804,7 @@ class WorkspacePage(QWidget):
         _MODE_TITLES = {
             "editor": "Editor Mode",
             "echo": "Echo Mode",
-            "noise": "Noise Removal",
+            "noise": "Noise Removal Mode",
             "frequency": "Frequency Mode",
         }
         self._mode_title_label = QLabel(_MODE_TITLES.get(self._editor_type, ""))

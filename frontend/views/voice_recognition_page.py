@@ -1,4 +1,5 @@
 from PySide6.QtCore import Qt, Signal
+from PySide6.QtGui import QBrush, QColor, QLinearGradient, QPainter
 from PySide6.QtWidgets import (
     QDialog,
     QFileDialog,
@@ -49,6 +50,15 @@ class VoiceRecognitionPage(QWidget):
         self._build_ui()
         self._update_sidebar_for_workspace()
         self._playback_group = PlaybackGroup.get_instance()
+
+    def paintEvent(self, event):
+        """Dark gradient backdrop -- kept consistent with the home page."""
+        painter = QPainter(self)
+        gradient = QLinearGradient(0, 0, self.width(), self.height())
+        gradient.setColorAt(0.0, QColor("#0C0E13"))
+        gradient.setColorAt(1.0, QColor("#181D26"))
+        painter.fillRect(self.rect(), QBrush(gradient))
+        super().paintEvent(event)
 
     # ------------------------------------------------------------------
     # Sidebar actions — New Folder / New Entity
@@ -267,7 +277,7 @@ class VoiceRecognitionPage(QWidget):
         top_bar.addWidget(self._file_btn)
 
         top_bar.addStretch()   # no Edit / Tool buttons in Voice Recognition mode
-        self._mode_title_label = QLabel("Voice Recognition")
+        self._mode_title_label = QLabel("Voice Recognition Mode")
         self._mode_title_label.setStyleSheet(
             "color: #FFFFFF; font-weight: 700; font-size: 14px; background: transparent;"
         )
